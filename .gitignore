@@ -1,0 +1,11 @@
+target/
+*.log
+*.txt
+tmp/
+*.old
+*.failed
+.DS_Store
+node_modules/
+.env
+debug/
+release/

@@ -1,0 +1,24 @@
+[package]
+name = "thegrid-node"
+version = "0.3.0"
+edition = "2021"
+description = "Headless node for The Grid network"
+
+[dependencies]
+thegrid-core = { path = "../thegrid-core" }
+thegrid-net  = { path = "../thegrid-net" }
+
+# Shared dependencies from workspace
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+log        = { workspace = true }
+chrono     = { workspace = true }
+tokio      = { workspace = true }
+
+# CLI specific
+env_logger = "0.11"
+hostname   = "0.4"
+dirs       = "5"
+ctrlc      = "3"

@@ -1,0 +1,35 @@
+[package]
+name        = "thegrid-net"
+version     = "0.1.0"
+edition     = "2021"
+description = "Tailscale API client, RDP launcher, and P2P agent server for THE GRID"
+
+[dependencies]
+thegrid-core = { path = "../thegrid-core" }
+
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+log         = { workspace = true }
+chrono      = { workspace = true }
+
+# HTTP client — blocking feature used in spawned threads (not in egui update loop)
+reqwest     = { version = "0.12", features = ["blocking", "json"] }
+
+# Multipart form for file uploads
+# (reqwest's blocking multipart)
+# Already included with reqwest — no separate dep needed.
+
+# Lightweight HTTP server for the local THE GRID agent
+# tiny_http chosen over axum/actix for minimal binary size and zero async overhead
+tiny_http   = "0.12"
+ascii       = "1.1"
+
+# Read clipboard contents on Windows
+# NOTE: clipboard is write-only from main.rs via thegrid-core::AppEvent;
+# the agent server receives clipboard payloads and sends them as events.
+# Direct clipboard write in the GUI crate via arboard.
+
+# System hostname
+hostname    = "0.3"

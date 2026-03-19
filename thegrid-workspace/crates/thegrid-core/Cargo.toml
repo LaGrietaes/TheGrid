@@ -1,0 +1,26 @@
+[package]
+name        = "thegrid-core"
+version     = "0.1.0"
+edition     = "2021"
+description = "Shared models, config persistence, and SQLite index layer for THE GRID"
+
+[dependencies]
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+anyhow      = { workspace = true }
+thiserror   = { workspace = true }
+log         = { workspace = true }
+chrono      = { workspace = true }
+
+# SQLite — 'bundled' compiles SQLite from source so users need no system install
+# FTS5 enables full-text search (Phase 3: content indexing)
+rusqlite    = { version = "0.31", features = ["bundled"] }
+
+# Platform-appropriate config/data directories (e.g. %APPDATA% on Windows)
+dirs        = "5"
+
+# ── Phase 2: Filesystem watcher ───────────────────────────────────────────────
+# notify-rs delivers OS-native file system events (inotify/FSEvents/ReadDirectoryChangesW)
+# 'debouncer-mini' wraps raw events to deduplicate rapid bursts (e.g. save storms)
+notify              = "6"
+notify-debouncer-mini = { version = "0.4", default-features = false }
