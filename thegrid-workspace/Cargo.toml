@@ -20,7 +20,7 @@ members = [
     "crates/thegrid-core",
     "crates/thegrid-net",
     "crates/thegrid-ai",
-    "crates/thegrid-gui",
+    "crates/thegrid-ai",
     "crates/thegrid-node",
 ]
 resolver = "2"
