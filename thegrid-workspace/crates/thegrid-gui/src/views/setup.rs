@@ -161,6 +161,16 @@ pub fn render(ui: &mut Ui, state: &mut SetupState, local_hostname: &str) -> bool
                                         );
                                     });
                             }
+
+                            ui.add_space(24.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("DEVELOPED BY LAGRIETA.ES")
+                                        .color(Colors::TEXT_MUTED)
+                                        .size(8.0)
+                                        .strong()
+                                );
+                            });
                         });
                 },
             );
