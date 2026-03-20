@@ -71,7 +71,7 @@ categories = ["Network", "Utility"]
 out-dir = "../../target/release/bundle"
 
 [[package.metadata.packager.binaries]]
-name = "thegrid"
+path = "../../target/release/thegrid.exe"
 main = true
 
 [package.metadata.packager.nsis]
