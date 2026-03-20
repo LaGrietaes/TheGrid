@@ -1,0 +1,22 @@
+{
+  "productName": "TheGrid",
+  "version": "0.1.0",
+  "description": "Secure Mesh Network and AI Terminal",
+  "authors": ["LaGrieta.es"],
+  "identifier": "com.lagrieta.thegrid",
+  "icon": [],
+  "copyright": "Copyright © 2026 LaGrieta.es",
+  "categories": ["Network", "Utility"],
+  "outDir": "target/release/bundle",
+  "package": [
+    {
+      "format": "nsis",
+      "binary": "target/release/thegrid.exe"
+    }
+  ],
+  "nsis": {
+    "installerName": "TheGrid_Setup",
+    "languages": ["English"],
+    "compression": "lzma"
+  }
+}
