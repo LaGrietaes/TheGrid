@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use thegrid_core::{AppEvent, Config, Database, FileWatcher};
-use thegrid_net::AgentServer;
+use thegrid_net::{AgentServer, TailscaleClient};
 
 fn main() -> Result<()> {
     // Initialize logging
@@ -14,10 +14,35 @@ fn main() -> Result<()> {
     log::info!("THE GRID Headless Node v{} starting", env!("CARGO_PKG_VERSION"));
 
     // 1. Load Config
-    let config = Config::load().unwrap_or_else(|e| {
+    let mut config = Config::load().unwrap_or_else(|e| {
         log::warn!("Failed to load config: {}. Using default.", e);
         Config::default()
     });
+
+    // Support environment variables for headless setup
+    if let Ok(key) = std::env::var("THEGRID_API_KEY") {
+        config.api_key = key;
+    }
+    if let Ok(name) = std::env::var("THEGRID_DEVICE_NAME") {
+        config.device_name = name;
+    }
+
+    // Support simple CLI arguments: --api-key <key> --device-name <name>
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--api-key" && i + 1 < args.len() {
+            config.api_key = args[i+1].clone();
+        }
+        if args[i] == "--device-name" && i + 1 < args.len() {
+            config.device_name = args[i+1].clone();
+        }
+    }
+
+    if config.device_name.is_empty() {
+        config.device_name = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "UNKNOWN-NODE".to_string());
+    }
 
     // 2. Open Database
     let db_path = dirs::config_dir()
@@ -42,12 +67,22 @@ fn main() -> Result<()> {
 
     // 3. Start Agent Server (Port 8080 by default)
     let transfers_dir = config.effective_transfers_dir();
-    AgentServer::new(
+    let mut agent = AgentServer::new(
         config.agent_port,
         config.api_key.clone(),
         transfers_dir.clone(),
         tx.clone()
-    ).spawn();
+    );
+
+    // If we have an API key, enable Tailscale trust bypass
+    if !config.api_key.trim().is_empty() {
+        if let Ok(ts_client) = TailscaleClient::new(config.api_key.clone()) {
+            log::info!("Tailscale trust enabled for authenticated nodes");
+            agent = agent.with_tailscale(Arc::new(ts_client));
+        }
+    }
+
+    agent.spawn();
 
     // 4. Start Filesystem Watcher
     let mut file_watcher = match FileWatcher::new(tx.clone()) {

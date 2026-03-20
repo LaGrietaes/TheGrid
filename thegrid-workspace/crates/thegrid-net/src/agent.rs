@@ -8,11 +8,15 @@ use ascii::AsciiStr;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+use std::sync::Arc;
+use crate::tailscale::TailscaleClient;
+
 pub struct AgentServer {
     port: u16,
     api_key: String,
     transfers_dir: PathBuf,
     event_tx: mpsc::Sender<AppEvent>,
+    ts_client: Option<Arc<TailscaleClient>>,
 }
 
 impl AgentServer {
@@ -22,11 +26,23 @@ impl AgentServer {
         transfers_dir: PathBuf,
         event_tx: mpsc::Sender<AppEvent>,
     ) -> Self {
-        Self { port, api_key, transfers_dir, event_tx }
+        Self { 
+            port, 
+            api_key, 
+            transfers_dir, 
+            event_tx,
+            ts_client: None,
+        }
+    }
+
+    pub fn with_tailscale(mut self, client: Arc<TailscaleClient>) -> Self {
+        self.ts_client = Some(client);
+        self
     }
 
     pub fn spawn(self) {
         let port = self.port;
+        // Move self into the thread — this is why we don't need Arc<Self>
         std::thread::Builder::new()
             .name("thegrid-agent".into())
             .spawn(move || {
@@ -58,11 +74,31 @@ impl AgentServer {
         log::debug!("Agent {} {}", method, url);
 
         if url != "/ping" {
+            let mut authorized = false;
+
+            // 1. Check for X-Grid-Key header
             let key = req.headers().iter()
                 .find(|h| h.field.as_str().eq_ignore_ascii_case(AsciiStr::from_ascii("X-Grid-Key").unwrap()))
                 .map(|h| h.value.as_str());
             
-            if key != Some(&self.api_key) {
+            if key == Some(&self.api_key) {
+                authorized = true;
+            }
+
+            // 2. If not authorized by key, check Tailscale trust
+            if !authorized {
+                if let Some(ts) = &self.ts_client {
+                    if let Some(remote_addr) = req.remote_addr() {
+                        let remote_ip = format!("{}", remote_addr.ip());
+                        if ts.is_ip_in_tailnet(&remote_ip) {
+                            log::info!("Agent: granting access to trusted tailnet node {}", remote_ip);
+                            authorized = true;
+                        }
+                    }
+                }
+            }
+            
+            if !authorized {
                 log::warn!("Agent: unauthorized access attempt from {:?}", req.remote_addr());
                 req.respond(Response::from_string(r#"{"error":"unauthorized"}"#)
                     .with_status_code(401)

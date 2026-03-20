@@ -205,12 +205,19 @@ impl TheGridApp {
 
         // ── Start agent server ────────────────────────────────────────────────
         let transfers_dir = config.effective_transfers_dir();
-        AgentServer::new(
+        let mut server = AgentServer::new(
             config.agent_port,
             config.api_key.clone(),
             transfers_dir.clone(),
             tx.clone()
-        ).spawn();
+        );
+
+        if !config.api_key.trim().is_empty() {
+            if let Ok(ts_client) = TailscaleClient::new(config.api_key.clone()) {
+                server = server.with_tailscale(Arc::new(ts_client));
+            }
+        }
+        server.spawn();
 
         // ── Start filesystem watcher ──────────────────────────────────────────
         let mut file_watcher = match FileWatcher::new(tx.clone()) {
