@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// All user-configurable settings for THE GRID.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Tailscale API key (tskey-api-...). Required to list devices.
     #[serde(default)]
@@ -28,6 +28,19 @@ pub struct Config {
     /// Directory where received files are saved
     #[serde(default)]
     pub transfers_dir: Option<PathBuf>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            device_name: String::new(),
+            rdp_username: String::new(),
+            agent_port: Self::default_agent_port(),
+            watch_paths: Vec::new(),
+            transfers_dir: None,
+        }
+    }
 }
 
 impl Config {
