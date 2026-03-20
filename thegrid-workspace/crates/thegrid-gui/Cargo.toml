@@ -74,6 +74,5 @@ path = "../../target/release/thegrid.exe"
 main = true
 
 [package.metadata.packager.nsis]
-installer-name = "TheGrid_Setup"
 languages = ["English"]
 compression = "lzma"
