@@ -133,7 +133,17 @@ fn main() -> Result<()> {
                 }
                 AppEvent::ClipboardReceived(entry) => {
                     log::info!("Clipboard received from {}: {}", entry.sender, entry.content);
-                    // In headless mode, we might just log it or save to a file
+                    
+                    // Attempt to set Termux clipboard if running on Android
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Err(e) = std::process::Command::new("termux-clipboard-set")
+                            .arg(&entry.content)
+                            .output() 
+                        {
+                            log::debug!("Failed to set termux clipboard (might not be Termux): {}", e);
+                        }
+                    }
                 }
                 AppEvent::FileReceived { name, size } => {
                     log::info!("File received: {} ({} bytes)", name, size);
