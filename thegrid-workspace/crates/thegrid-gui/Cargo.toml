@@ -58,3 +58,23 @@ strip       = true     # strip debug symbols — reduces binary size ~30%
 [profile.dev]
 # Faster incremental builds during development
 opt-level   = 1
+
+[package.metadata.packager]
+product-name = "TheGrid"
+version = "0.1.0"
+description = "Secure Mesh Network and AI Terminal"
+authors = ["LaGrieta.es"]
+identifier = "com.lagrieta.thegrid"
+icon = []
+copyright = "Copyright © 2026 LaGrieta.es"
+categories = ["Network", "Utility"]
+out-dir = "../../target/release/bundle"
+
+[[package.metadata.packager.binaries]]
+name = "thegrid"
+main = true
+
+[package.metadata.packager.nsis]
+installer-name = "TheGrid_Setup"
+languages = ["English"]
+compression = "lzma"
