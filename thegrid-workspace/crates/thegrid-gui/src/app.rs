@@ -209,7 +209,8 @@ impl TheGridApp {
             config.agent_port,
             config.api_key.clone(),
             transfers_dir.clone(),
-            tx.clone()
+            tx.clone(),
+            config.clone()
         );
 
         if !config.api_key.trim().is_empty() {
@@ -373,7 +374,7 @@ impl TheGridApp {
     fn spawn_send_file(&self, ip: String, path: PathBuf, queue_idx: usize) {
         let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
-        let sender = self.config.device_name.clone();
+        let _sender = self.config.device_name.clone();
         let tx     = self.event_tx.clone();
         std::thread::spawn(move || {
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -1082,7 +1083,15 @@ impl TheGridApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.add_space(12.0);
-                    ui.label(RichText::new(crate::icons::Glyphs::BRAND_HEX).color(Colors::GREEN).size(14.0));
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    let c = rect.center();
+                    let r = 6.0;
+                    let mut points = vec![];
+                    for i in 0..6 {
+                        let angle = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
+                        points.push(c + egui::vec2(r * angle.cos(), r * angle.sin()));
+                    }
+                    ui.painter().add(egui::Shape::convex_polygon(points, Color32::TRANSPARENT, egui::Stroke::new(1.5, Colors::GREEN)));
                     ui.add_space(6.0);
                     ui.label(RichText::new("THE GRID").color(Colors::GREEN).size(11.0).strong());
 
@@ -1123,44 +1132,72 @@ impl TheGridApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Close
-                        let close = ui.add(
-                            egui::Button::new(RichText::new("✕").size(11.0).color(Colors::TEXT_DIM))
-                                .fill(Color32::TRANSPARENT).frame(false)
-                                .min_size(egui::vec2(28.0, 28.0))
-                        );
-                        if close.hovered() {
-                            ui.painter().rect_filled(
-                                close.rect, egui::Rounding::ZERO, Color32::from_rgb(180, 20, 40)
-                            );
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 24.0), egui::Sense::click());
+                        let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
+                        if resp.hovered() {
+                            ui.painter().rect_filled(rect, egui::Rounding::ZERO, Color32::from_rgb(180, 20, 40));
                         }
-                        if close.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                        let c = rect.center();
+                        let e = 4.0;
+                        ui.painter().line_segment([c - egui::vec2(e, e), c + egui::vec2(e, e)], egui::Stroke::new(1.2, color));
+                        ui.painter().line_segment([c - egui::vec2(e, -e), c + egui::vec2(e, -e)], egui::Stroke::new(1.2, color));
+                        if resp.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
 
-                        if ui.add(egui::Button::new(RichText::new("□").size(11.0).color(Colors::TEXT_DIM))
-                            .fill(Color32::TRANSPARENT).frame(false).min_size(egui::vec2(28.0, 28.0))
-                        ).clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true)); }
+                        // Maximize
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 24.0), egui::Sense::click());
+                        let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
+                        if resp.hovered() {
+                            ui.painter().rect_filled(rect, egui::Rounding::ZERO, Colors::BORDER2);
+                        }
+                        let c = rect.center();
+                        let e = 4.0;
+                        ui.painter().rect_stroke(
+                            egui::Rect::from_center_size(c, egui::vec2(e * 2.0, e * 2.0)),
+                            egui::Rounding::ZERO,
+                            egui::Stroke::new(1.2, color)
+                        );
+                        if resp.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true)); }
 
-                        if ui.add(egui::Button::new(RichText::new("─").size(11.0).color(Colors::TEXT_DIM))
-                            .fill(Color32::TRANSPARENT).frame(false).min_size(egui::vec2(28.0, 28.0))
-                        ).clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
+                        // Minimize
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 24.0), egui::Sense::click());
+                        let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
+                        if resp.hovered() {
+                            ui.painter().rect_filled(rect, egui::Rounding::ZERO, Colors::BORDER2);
+                        }
+                        let c = rect.center();
+                        let e = 4.5;
+                        ui.painter().line_segment([c - egui::vec2(e, -e), c + egui::vec2(e, -e)], egui::Stroke::new(1.2, color));
+                        if resp.clicked() { ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)); }
 
                         ui.add_space(8.0);
 
-                        // Settings
-                        if ui.add(
-                            egui::Button::new(RichText::new("⚙").size(13.0).color(Colors::TEXT_DIM))
-                                .fill(Color32::TRANSPARENT).frame(false)
-                        ).on_hover_text("Settings  [Ctrl+,]").clicked() {
-                            let _ = self.event_tx.send(AppEvent::OpenSettings);
+                        // Settings Gear (Vector)
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                        let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
+                        let c = rect.center();
+                        // Draw gear
+                        ui.painter().circle_stroke(c, 4.0, egui::Stroke::new(1.2, color));
+                        for i in 0..8 {
+                            let angle = std::f32::consts::PI / 4.0 * i as f32;
+                            let p1 = c + egui::vec2(5.0 * angle.cos(), 5.0 * angle.sin());
+                            let p2 = c + egui::vec2(7.0 * angle.cos(), 7.0 * angle.sin());
+                            ui.painter().line_segment([p1, p2], egui::Stroke::new(1.2, color));
                         }
+                        if resp.clicked() { let _ = self.event_tx.send(AppEvent::OpenSettings); }
 
-                        // Search shortcut hint
                         ui.add_space(4.0);
-                        if ui.add(
-                            egui::Button::new(RichText::new(crate::icons::Glyphs::SEARCH).size(14.0).color(Colors::TEXT_DIM))
-                                .fill(Color32::TRANSPARENT).frame(false)
-                        ).on_hover_text("Search files  [Ctrl+F]").clicked() {
-                            let _ = self.event_tx.send(AppEvent::OpenSettings); // reuse signal
-                            // Handled via keyboard shortcut in update() — button just shows the hint
+
+                        // Search Magnifier (Vector)
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                        let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
+                        let c = rect.center() - egui::vec2(1.0, 1.0);
+                        ui.painter().circle_stroke(c, 4.0, egui::Stroke::new(1.2, color));
+                        ui.painter().line_segment(
+                            [c + egui::vec2(3.0, 3.0), c + egui::vec2(6.0, 6.0)],
+                            egui::Stroke::new(1.5, color)
+                        );
+                        if resp.clicked() { 
+                            // Handled via keyboard / event logic
                         }
 
                         ui.add_space(8.0);
@@ -1445,6 +1482,7 @@ impl eframe::App for TheGridApp {
                         device_clicked = crate::views::dashboard::render_device_panel(
                             ui,
                             &self.devices,
+                            &telemetry_snap,
                             self.selected_idx,
                             &mut self.device_filter,
                             &mut needs_refresh,
@@ -1541,8 +1579,10 @@ impl eframe::App for TheGridApp {
                     let mut new_config = self.config.clone();
                     new_config.api_key      = self.settings.api_key.clone();
                     new_config.device_name  = self.settings.device_name.clone();
+                    new_config.device_type  = self.settings.device_type.clone();
                     new_config.rdp_username = self.settings.rdp_username.clone();
                     new_config.agent_port   = self.settings.agent_port.parse().unwrap_or(47731);
+                    new_config.ai_model     = if self.settings.ai_model.trim().is_empty() { None } else { Some(self.settings.ai_model.clone()) };
                     new_config.watch_paths  = self.settings.watch_paths.iter()
                         .map(|s| PathBuf::from(s))
                         .collect();

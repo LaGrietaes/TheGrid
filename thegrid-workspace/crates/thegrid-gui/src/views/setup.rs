@@ -44,8 +44,26 @@ pub fn render(ui: &mut Ui, state: &mut SetupState, local_hostname: &str) -> bool
 
             // ── Header ─────────────────────────────────────────────────────────
             ui.horizontal(|ui| {
-                ui.label(RichText::new(crate::icons::Glyphs::BRAND_HEX).color(Colors::GREEN).size(18.0));
-                ui.add_space(8.0);
+                // Vector Hexagon Logo with Pulse
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                let c = rect.center();
+                let time = ui.input(|i| i.time);
+                let pulse = (time * 2.0).sin() as f32 * 0.1 + 0.9;
+                let r = 10.0 * pulse;
+                
+                let mut points = vec![];
+                for i in 0..6 {
+                    let angle = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
+                    points.push(c + egui::vec2(r * angle.cos(), r * angle.sin()));
+                }
+                ui.painter().add(egui::Shape::convex_polygon(
+                    points, 
+                    Color32::TRANSPARENT, 
+                    egui::Stroke::new(2.0, Colors::GREEN.linear_multiply(pulse))
+                ));
+                ui.ctx().request_repaint();
+
+                ui.add_space(12.0);
                 ui.label(RichText::new("THE GRID").color(Colors::GREEN).size(18.0).strong());
                 ui.add_space(8.0);
                 ui.label(RichText::new("v0.1.0").color(Colors::TEXT_MUTED).size(10.0));

@@ -64,7 +64,13 @@ fn configure_fonts(ctx: &Context) {
     //   fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "JetBrainsMono".to_owned());
     //   ctx.set_fonts(fonts);
 
-    // For now: override the default text style sizes to monospace at our scale
+    let mut fonts = egui::FontDefinitions::default();
+    
+    // Use default egui fonts (Hack for Monospace, Proportional for others)
+    // We don't need explicit fallbacks now that we use Vector graphics for all symbols.
+    ctx.set_fonts(fonts);
+
+    // Override the default text style sizes to monospace at our scale
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
         (egui::TextStyle::Small,       FontId::new(10.0, FontFamily::Monospace)),
@@ -231,4 +237,91 @@ pub fn status_dot(ui: &mut Ui, online: bool) {
 /// Horizontal rule styled as a terminal separator
 pub fn separator(ui: &mut Ui) {
     ui.add(egui::Separator::default().spacing(0.0));
+}
+
+pub enum IconType {
+    RDP,
+    Folder,
+    Network,
+    Pulse,
+    Desktop,
+    Laptop,
+    Server,
+}
+
+pub fn draw_vector_icon(ui: &mut Ui, rect: egui::Rect, icon: IconType, color: Color32) {
+    let c = rect.center();
+    let s = rect.width().min(rect.height()) * 0.45;
+    let stroke = egui::Stroke::new(1.5, color);
+
+    match icon {
+        IconType::RDP => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c - egui::vec2(s*0.2, s*0.2), egui::vec2(s*1.2, s*1.0)), egui::Rounding::ZERO, stroke);
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c + egui::vec2(s*0.2, s*0.2), egui::vec2(s*1.2, s*1.0)), egui::Rounding::ZERO, stroke);
+        }
+        IconType::Folder => {
+            let points = vec![
+                c + egui::vec2(-s, s*0.7),
+                c + egui::vec2(s, s*0.7),
+                c + egui::vec2(s, -s*0.4),
+                c + egui::vec2(s*0.3, -s*0.4),
+                c + egui::vec2(s*0.1, -s*0.7),
+                c + egui::vec2(-s, -s*0.7),
+            ];
+            ui.painter().add(egui::Shape::closed_line(points, stroke));
+        }
+        IconType::Network => {
+            ui.painter().circle_stroke(c + egui::vec2(0.0, -s*0.6), s*0.3, stroke);
+            ui.painter().circle_stroke(c + egui::vec2(-s*0.7, s*0.6), s*0.3, stroke);
+            ui.painter().circle_stroke(c + egui::vec2(s*0.7, s*0.6), s*0.3, stroke);
+            ui.painter().line_segment([c + egui::vec2(0.0, -s*0.3), c + egui::vec2(-s*0.4, s*0.3)], stroke);
+            ui.painter().line_segment([c + egui::vec2(0.0, -s*0.3), c + egui::vec2(s*0.4, s*0.3)], stroke);
+        }
+        IconType::Pulse => {
+            let points = vec![
+                c + egui::vec2(-s, 0.0),
+                c + egui::vec2(-s*0.5, 0.0),
+                c + egui::vec2(-s*0.3, -s),
+                c + egui::vec2(0.0, s),
+                c + egui::vec2(s*0.3, 0.0),
+                c + egui::vec2(s, 0.0),
+            ];
+            ui.painter().add(egui::Shape::line(points, stroke));
+        }
+        IconType::Desktop => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c - egui::vec2(0.0, s*0.2), egui::vec2(s*1.6, s*1.2)), egui::Rounding::ZERO, stroke);
+            ui.painter().line_segment([c + egui::vec2(-s*0.4, s*0.9), c + egui::vec2(s*0.4, s*0.9)], stroke);
+            ui.painter().line_segment([c + egui::vec2(0.0, s*0.4), c + egui::vec2(0.0, s*0.9)], stroke);
+        }
+        IconType::Laptop => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c - egui::vec2(0.0, s*0.3), egui::vec2(s*1.4, s*1.0)), egui::Rounding::ZERO, stroke);
+            ui.painter().line_segment([c + egui::vec2(-s, s*0.7), c + egui::vec2(s, s*0.7)], stroke);
+            ui.painter().line_segment([c + egui::vec2(-s*0.9, s*0.7), c + egui::vec2(-s, s*0.9)], stroke);
+            ui.painter().line_segment([c + egui::vec2(s*0.9, s*0.7), c + egui::vec2(s, s*0.9)], stroke);
+            ui.painter().line_segment([c + egui::vec2(-s, s*0.9), c + egui::vec2(s, s*0.9)], stroke);
+        }
+        IconType::Server => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*1.2, s*1.6)), egui::Rounding::ZERO, stroke);
+            ui.painter().line_segment([c + egui::vec2(-s*0.6, -s*0.3), c + egui::vec2(s*0.6, -s*0.3)], stroke);
+            ui.painter().line_segment([c + egui::vec2(-s*0.6, 0.3), c + egui::vec2(s*0.6, 0.3)], stroke);
+            ui.painter().circle_filled(c + egui::vec2(s*0.3, -s*0.6), 1.5, color);
+            ui.painter().circle_filled(c + egui::vec2(s*0.3, 0.6), 1.5, color);
+        }
+    }
+}
+
+/// Renders a terminal/device icon with a pulsing CRT phosphor glow effect.
+pub fn render_crt_icon(ui: &mut Ui, icon_type: IconType, size: f32, color: Color32) -> Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    
+    let time = ui.input(|i| i.time);
+    let pulse = ((time * 4.0).sin() as f32 * 0.15 + 0.85).max(0.1);
+    
+    // Draw the glow
+    draw_vector_icon(ui, rect, icon_type, color.linear_multiply(pulse * 0.4));
+    
+    // Force active repaint for the animation
+    ui.ctx().request_repaint();
+
+    response
 }

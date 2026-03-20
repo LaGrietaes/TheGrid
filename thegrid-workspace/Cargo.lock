@@ -4280,6 +4280,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sysinfo 0.30.13",
  "thegrid-core",
  "thiserror 1.0.69",
  "tiny_http",

@@ -3,7 +3,7 @@ use reqwest::blocking::Client;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use tiny_http::{Server, Response, Request};
-use thegrid_core::{AppEvent, models::*};
+use thegrid_core::{AppEvent, models::*, Config};
 use ascii::AsciiStr;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,6 +17,7 @@ pub struct AgentServer {
     transfers_dir: PathBuf,
     event_tx: mpsc::Sender<AppEvent>,
     ts_client: Option<Arc<TailscaleClient>>,
+    config: Config,
 }
 
 impl AgentServer {
@@ -25,6 +26,7 @@ impl AgentServer {
         api_key: String,
         transfers_dir: PathBuf,
         event_tx: mpsc::Sender<AppEvent>,
+        config: Config,
     ) -> Self {
         Self { 
             port, 
@@ -32,6 +34,7 @@ impl AgentServer {
             transfers_dir, 
             event_tx,
             ts_client: None,
+            config,
         }
     }
 
@@ -124,7 +127,7 @@ impl AgentServer {
         }
 
         if method == "GET" && url == "/telemetry" {
-            let telemetry = collect_telemetry();
+            let telemetry = collect_telemetry(&self.config);
             let json = serde_json::to_string(&telemetry).unwrap_or_default();
             req.respond(Response::from_string(json)
                 .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
@@ -308,8 +311,53 @@ impl AgentClient {
     }
 }
 
-fn collect_telemetry() -> NodeTelemetry {
-    NodeTelemetry::default()
+fn collect_telemetry(config: &Config) -> NodeTelemetry {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_all();
+    
+    let cpu_pct = sys.global_cpu_info().cpu_usage();
+    let ram_used = sys.used_memory();
+    let ram_total = sys.total_memory();
+    
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut disk_used = 0;
+    let mut disk_total = 0;
+    let mut drive_names = Vec::new();
+    
+    for disk in &disks {
+        disk_used += disk.total_space() - disk.available_space();
+        disk_total += disk.total_space();
+        drive_names.push(disk.name().to_string_lossy().into_owned());
+    }
+
+    let mut ai_models = Vec::new();
+    if let Some(m) = &config.ai_model {
+        if !m.is_empty() {
+            ai_models.push(m.clone());
+        }
+    }
+
+    let capabilities = DeviceCapabilities {
+        ai_models,
+        has_camera: true,        // Stubbed for now as agreed
+        has_microphone: true,    // Stubbed for now as agreed
+        has_speakers: true,      // Stubbed for now as agreed
+        drives: drive_names,
+        has_rdp: config.enable_rdp,
+        has_file_access: config.enable_file_access,
+    };
+
+    NodeTelemetry {
+        device_type: config.device_type.clone(),
+        cpu_pct,
+        ram_used,
+        ram_total,
+        disk_used,
+        disk_total,
+        cpu_temp: None,
+        is_ai_capable: !capabilities.ai_models.is_empty(),
+        capabilities,
+    }
 }
 
 fn urlencoding_decode(s: &str) -> String {

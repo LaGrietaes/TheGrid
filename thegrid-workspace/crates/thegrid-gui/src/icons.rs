@@ -16,9 +16,20 @@ impl Glyphs {
     pub const BRAND_HEX:    &'static str = "⬡";    // Hexagon (logo)
     pub const BRAND_HEX_F:  &'static str = "⬢";    // Filled Hexagon (AI)
 
+    // Devices
+    pub const DEV_DESKTOP:  &'static str = "🖥";
+    pub const DEV_LAPTOP:   &'static str = "💻";
+    pub const DEV_TABLET:   &'static str = "📱";
+    pub const DEV_PHONE:    &'static str = "📱";
+    pub const DEV_SERVER:   &'static str = "🖧";
+    pub const DEV_NAS:      &'static str = "🗄";
+    pub const DEV_BOARD:    &'static str = "▤";
+
     // UI Elements
     pub const DELETE:       &'static str = "✕";
     pub const CLOSE:        &'static str = "✕";
+    pub const MAXIMIZE:     &'static str = "□";
+    pub const MINIMIZE:     &'static str = "─";
     pub const SEARCH:       &'static str = "⌕";
     pub const REFRESH:      &'static str = "↻";
     pub const SCAN:         &'static str = "⚭";
@@ -82,5 +93,18 @@ pub fn ext_to_color(ext: Option<&str>) -> Color32 {
         Some("mp4") | Some("mov") => Colors::RED,
         Some("zip") | Some("rar") => Colors::AMBER,
         _ => Colors::TEXT_DIM,
+    }
+}
+
+/// Map device type string to a brutalist glyph.
+pub fn device_icon(typ: &str) -> &'static str {
+    match typ.to_lowercase().as_str() {
+        "laptop" => Glyphs::DEV_LAPTOP,
+        "tablet" => Glyphs::DEV_TABLET,
+        "smartphone" | "phone" => Glyphs::DEV_PHONE,
+        "server" => Glyphs::DEV_SERVER,
+        "nas" => Glyphs::DEV_NAS,
+        "board" => Glyphs::DEV_BOARD,
+        _ => Glyphs::DEV_DESKTOP,
     }
 }

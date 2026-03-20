@@ -86,6 +86,7 @@ pub struct DetailActions {
 pub fn render_device_panel(
     ui: &mut Ui,
     devices: &[TailscaleDevice],
+    telemetries: &std::collections::HashMap<String, thegrid_core::models::NodeTelemetry>,
     selected_idx: Option<usize>,
     filter: &mut String,
     needs_refresh: &mut bool,
@@ -105,15 +106,15 @@ pub fn render_device_panel(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Refresh button lives here — avoids the &self / &mut self conflict
                     // that plagued v0.1's titlebar implementation
-                    if ui.add(
-                        egui::Button::new(
-                            RichText::new(crate::icons::Glyphs::REFRESH).color(Colors::TEXT_DIM).size(13.0)
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .frame(false)
-                    )
-                    .on_hover_text("Refresh device list")
-                    .clicked() {
+                    // Refresh Vector Button
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
+                    let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
+                    let c = rect.center();
+                    ui.painter().circle_stroke(c, 4.5, egui::Stroke::new(1.2, color));
+                    // Arrow tip
+                    ui.painter().line_segment([c + egui::vec2(3.0, -3.0), c + egui::vec2(6.0, -5.0)], egui::Stroke::new(1.2, color));
+                    ui.painter().line_segment([c + egui::vec2(3.0, -3.0), c + egui::vec2(5.0, -1.0)], egui::Stroke::new(1.2, color));
+                    if resp.clicked() {
                         *needs_refresh = true;
                     }
                     ui.label(
@@ -132,7 +133,14 @@ pub fn render_device_panel(
         .inner_margin(egui::Margin::symmetric(12.0, 8.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("⌕").color(Colors::TEXT_MUTED).size(14.0));
+                // Vector Search Magnifier
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                let c = rect.center() - egui::vec2(1.0, 1.0);
+                ui.painter().circle_stroke(c, 3.5, egui::Stroke::new(1.0, Colors::TEXT_MUTED));
+                ui.painter().line_segment(
+                    [c + egui::vec2(2.5, 2.5), c + egui::vec2(5.0, 5.0)],
+                    egui::Stroke::new(1.2, Colors::TEXT_MUTED)
+                );
                 ui.add(
                     egui::TextEdit::singleline(filter)
                         .hint_text("FILTER NODES...")
@@ -195,7 +203,19 @@ pub fn render_device_panel(
                         }
                         ui.horizontal(|ui| {
                             theme::status_dot(ui, is_online);
-                            ui.add_space(4.0);
+                            ui.add_space(2.0);
+                            
+                            // Sidebar Row Vector Icon (using telemetry lookup)
+                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            let device_type = telemetries.get(&device.id).map(|t| t.device_type.as_str()).unwrap_or("Desktop");
+                            let icon_type = match device_type {
+                                "Laptop" => theme::IconType::Laptop,
+                                "Server" => theme::IconType::Server,
+                                _ => theme::IconType::Desktop,
+                            };
+                            theme::draw_vector_icon(ui, icon_rect, icon_type, if is_online { Colors::GREEN } else { Colors::TEXT_MUTED });
+                            
+                            ui.add_space(6.0);
                             ui.vertical(|ui| {
                                 ui.label(
                                     RichText::new(device.display_name().to_uppercase())
@@ -215,9 +235,9 @@ pub fn render_device_panel(
                     egui::Sense::click(),
                 );
                 if interact.hovered() && !is_selected {
-                    ui.painter().rect_filled(
+                    ui.painter().rect_stroke(
                         resp.rect, egui::Rounding::ZERO,
-                        Color32::from_rgba_premultiplied(255, 255, 255, 4),
+                        egui::Stroke::new(1.0, Colors::BORDER2),
                     );
                 }
                 if interact.clicked() { clicked = Some(idx); }
@@ -241,7 +261,13 @@ pub fn render_detail_panel(ui: &mut Ui, s: &mut DetailState) -> DetailActions {
         .inner_margin(egui::Margin::symmetric(24.0, 16.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("⬡").color(Colors::GREEN).size(28.0));
+                let device_type = s.telemetry.map(|t| t.device_type.as_str()).unwrap_or("Desktop");
+                let icon_type = match device_type {
+                    "Laptop" => theme::IconType::Laptop,
+                    "Server" => theme::IconType::Server,
+                    _ => theme::IconType::Desktop,
+                };
+                crate::theme::render_crt_icon(ui, icon_type, 28.0, Colors::GREEN);
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.label(
@@ -357,13 +383,13 @@ pub fn render_detail_panel(ui: &mut Ui, s: &mut DetailState) -> DetailActions {
 // All three tab functions now take `s: &mut DetailState`.
 fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
     ui.columns(3, |cols| {
-        if action_card(&mut cols[0], "⊞", "REMOTE DESKTOP", "Launch RDP session") {
+        if action_card(&mut cols[0], theme::IconType::RDP, "REMOTE DESKTOP", "Launch RDP session") {
             actions.launch_rdp = true;
         }
-        if action_card(&mut cols[1], "⊏⊐", "BROWSE FILES", "Open network share") {
+        if action_card(&mut cols[1], theme::IconType::Folder, "BROWSE FILES", "Open network share") {
             actions.browse_share = true;
         }
-        if action_card(&mut cols[2], "◉", "PING NODE", "Check THE GRID agent") {
+        if action_card(&mut cols[2], theme::IconType::Pulse, "PING NODE", "Check THE GRID agent") {
             actions.ping = true;
         }
     });
@@ -474,7 +500,7 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
     }
 }
 
-fn action_card(ui: &mut Ui, icon: &str, label: &str, sub: &str) -> bool {
+fn action_card(ui: &mut Ui, icon: theme::IconType, label: &str, sub: &str) -> bool {
     let resp = egui::Frame::none()
         .fill(Colors::BG_WIDGET)
         .stroke(egui::Stroke::new(1.0, Colors::BORDER))
@@ -482,7 +508,8 @@ fn action_card(ui: &mut Ui, icon: &str, label: &str, sub: &str) -> bool {
         .show(ui, |ui| {
             ui.set_min_size(egui::vec2(ui.available_width(), 80.0));
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new(icon).color(Colors::GREEN).size(20.0));
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                theme::draw_vector_icon(ui, rect, icon, Colors::GREEN);
                 ui.add_space(6.0);
                 ui.label(RichText::new(label).color(Colors::TEXT).size(9.0).strong());
                 ui.label(RichText::new(sub).color(Colors::TEXT_DIM).size(8.0));
@@ -511,9 +538,16 @@ fn render_files_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
     ui.columns(2, |cols| {
 
         // ── Send column ───────────────────────────────────────────────────────
-        cols[0].label(
-            RichText::new("⬆ SEND TO NODE").color(Colors::TEXT_DIM).size(9.0).strong()
-        );
+        // ── Send column (Vector Arrow) ─────────────────────────────────────────
+        cols[0].horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            let c = rect.center();
+            ui.painter().line_segment([c + egui::vec2(0.0, 5.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+            ui.painter().line_segment([c + egui::vec2(-3.0, -2.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+            ui.painter().line_segment([c + egui::vec2(3.0, -2.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+            ui.add_space(4.0);
+            ui.label(RichText::new("SEND TO NODE").color(Colors::TEXT_DIM).size(9.0).strong());
+        });
         cols[0].add_space(8.0);
 
         let hovering = cols[0].ctx().input(|i| !i.raw.hovered_files.is_empty());
@@ -530,7 +564,17 @@ fn render_files_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
             .show(&mut cols[0], |ui| {
                 ui.set_min_size(egui::vec2(ui.available_width(), 80.0));
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("⬡").color(Colors::TEXT_MUTED).size(20.0));
+                    // Vector Hexagon Placeholder
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                    let c = rect.center();
+                    let r = 10.0;
+                    let mut points = vec![];
+                    for i in 0..6 {
+                        let angle = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
+                        points.push(c + egui::vec2(r * angle.cos(), r * angle.sin()));
+                    }
+                    ui.painter().add(egui::Shape::convex_polygon(points, Color32::TRANSPARENT, egui::Stroke::new(1.5, Colors::TEXT_MUTED)));
+                    
                     ui.add_space(6.0);
                     ui.label(
                         RichText::new("DROP FILES HERE")
@@ -572,9 +616,16 @@ fn render_files_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
         }
 
         // ── Receive column ────────────────────────────────────────────────────
+        // ── Receive column (Vector Arrow) ──────────────────────────────────────
         cols[1].horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            let c = rect.center();
+            ui.painter().line_segment([c + egui::vec2(0.0, -5.0), c + egui::vec2(0.0, 5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+            ui.painter().line_segment([c + egui::vec2(-3.0, 2.0), c + egui::vec2(0.0, 5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+            ui.painter().line_segment([c + egui::vec2(3.0, 2.0), c + egui::vec2(0.0, 5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+            ui.add_space(4.0);
             ui.label(
-                RichText::new("⬇ RECEIVE FROM NODE")
+                RichText::new("RECEIVE FROM NODE")
                     .color(Colors::TEXT_DIM).size(9.0).strong()
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -811,6 +862,8 @@ pub struct SettingsState {
     pub rdp_username: String,
     pub agent_port:   String,
     pub watch_paths:  Vec<String>,
+    pub ai_model:     String,
+    pub device_type:  String,
     pub open:         bool,
 }
 
@@ -822,6 +875,8 @@ impl SettingsState {
             rdp_username: cfg.rdp_username.clone(),
             agent_port:   cfg.agent_port.to_string(),
             watch_paths:  cfg.watch_paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+            ai_model:     cfg.ai_model.clone().unwrap_or_default(),
+            device_type:  cfg.device_type.clone(),
             open:         false,
         }
     }
@@ -904,6 +959,20 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
                     modal_field(ui, "DEFAULT RDP USERNAME", &mut s.rdp_username, false, "e.g. Administrator");
                     ui.add_space(14.0);
                     modal_field(ui, "AGENT PORT",           &mut s.agent_port,   false, "47731");
+                    ui.add_space(14.0);
+                    modal_field(ui, "LOCAL AI MODEL",       &mut s.ai_model,     false, "e.g. llama3:8b");
+
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("DEVICE TYPE").color(Colors::TEXT_DIM).size(9.0).strong());
+                    ui.add_space(4.0);
+                    egui::ComboBox::from_id_source("device_type_combo")
+                        .width(ui.available_width())
+                        .selected_text(s.device_type.clone())
+                        .show_ui(ui, |ui| {
+                            for typ in ["Desktop", "Laptop", "Tablet", "Smartphone", "Server", "NAS", "Board"] {
+                                ui.selectable_value(&mut s.device_type, typ.to_string(), typ);
+                            }
+                        });
 
                     ui.add_space(14.0);
                     ui.label(RichText::new("WATCHED DIRECTORIES").color(Colors::TEXT_DIM).size(9.0).strong());
@@ -964,7 +1033,16 @@ pub fn render_empty_state(ui: &mut Ui) {
     let h = ui.available_height();
     ui.vertical_centered(|ui| {
         ui.add_space(h * 0.3);
-        ui.label(RichText::new("⬡").color(Colors::BORDER).size(48.0));
+        // Vector Hexagon
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::hover());
+        let c = rect.center();
+        let r = 20.0;
+        let mut points = vec![];
+        for i in 0..6 {
+            let angle = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
+            points.push(c + egui::vec2(r * angle.cos(), r * angle.sin()));
+        }
+        ui.painter().add(egui::Shape::convex_polygon(points, Color32::TRANSPARENT, egui::Stroke::new(2.0, Colors::BORDER)));
         ui.add_space(16.0);
         ui.label(
             RichText::new("SELECT A NODE TO ESTABLISH LINK")
@@ -1001,7 +1079,7 @@ pub fn render_detail_panel_with_timeline(
     ui:            &mut egui::Ui,
     s:             &mut DetailState,
     timeline:      &mut crate::views::timeline::TimelineState,
-    index_stats:   &thegrid_core::models::IndexStats,
+    _index_stats:   &thegrid_core::models::IndexStats,
 ) -> DetailActions {
     let mut actions = DetailActions::default();
     let is_online = s.device.is_likely_online();
@@ -1012,7 +1090,13 @@ pub fn render_detail_panel_with_timeline(
         .inner_margin(egui::Margin::symmetric(24.0, 14.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("⬡").color(Colors::GREEN).size(28.0));
+                let device_type = s.telemetry.map(|t| t.device_type.as_str()).unwrap_or("Desktop");
+                let icon_type = match device_type {
+                    "Laptop" => theme::IconType::Laptop,
+                    "Server" => theme::IconType::Server,
+                    _ => theme::IconType::Desktop,
+                };
+                crate::theme::render_crt_icon(ui, icon_type, 28.0, Colors::GREEN);
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.label(
@@ -1079,6 +1163,38 @@ pub fn render_detail_panel_with_timeline(
                     if telem.is_ai_capable {
                         ui.add_space(12.0);
                         ui.label(RichText::new(format!("AI NODE {}", crate::icons::Glyphs::BRAND_HEX_F)).color(Colors::GREEN).size(8.0).strong());
+                    }
+                });
+
+                ui.add_space(12.0);
+                ui.horizontal_wrapped(|ui| {
+                    if telem.capabilities.has_rdp {
+                        theme::status_badge(ui, "RDP", true);
+                        ui.add_space(4.0);
+                    }
+                    if telem.capabilities.has_file_access {
+                        theme::status_badge(ui, "FILE SHARES", true);
+                        ui.add_space(4.0);
+                    }
+                    if telem.capabilities.has_camera {
+                        theme::status_badge(ui, "CAMERA", true);
+                        ui.add_space(4.0);
+                    }
+                    if telem.capabilities.has_microphone {
+                        theme::status_badge(ui, "MIC", true);
+                        ui.add_space(4.0);
+                    }
+                    if telem.capabilities.has_speakers {
+                        theme::status_badge(ui, "AUDIO", true);
+                        ui.add_space(4.0);
+                    }
+                    for model in &telem.capabilities.ai_models {
+                        theme::status_badge(ui, &format!("AI: {}", model.to_uppercase()), true);
+                        ui.add_space(4.0);
+                    }
+                    if !telem.capabilities.drives.is_empty() {
+                        let drives_str = telem.capabilities.drives.join(", ");
+                        theme::status_badge(ui, &format!("DRIVES: {}", drives_str), true);
                     }
                 });
             } else {

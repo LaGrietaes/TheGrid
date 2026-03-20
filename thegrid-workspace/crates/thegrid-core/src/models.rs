@@ -141,6 +141,7 @@ impl FileSearchResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeTelemetry {
+    pub device_type: String,
     pub cpu_pct: f32,
     pub ram_used: u64,
     pub ram_total: u64,
@@ -148,6 +149,18 @@ pub struct NodeTelemetry {
     pub disk_total: u64,
     pub cpu_temp: Option<f32>,
     pub is_ai_capable: bool,
+    pub capabilities: DeviceCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeviceCapabilities {
+    pub ai_models: Vec<String>,
+    pub has_camera: bool,
+    pub has_microphone: bool,
+    pub has_speakers: bool,
+    pub drives: Vec<String>,
+    pub has_rdp: bool,
+    pub has_file_access: bool,
 }
 
 impl NodeTelemetry {

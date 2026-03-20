@@ -62,6 +62,7 @@ pub fn collect_local() -> NodeTelemetry {
     let is_ai_capable = ram_total >= 8 * 1024 * 1024 * 1024; // 8 GB
 
     NodeTelemetry {
+        device_type: "Desktop".to_string(), // Fetched internally, GUI config owns the definitive value
         cpu_pct,
         ram_used,
         ram_total,
@@ -69,6 +70,7 @@ pub fn collect_local() -> NodeTelemetry {
         disk_total,
         cpu_temp,
         is_ai_capable,
+        capabilities: Default::default(),
     }
 }
 
