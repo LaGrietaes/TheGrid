@@ -67,8 +67,7 @@ authors = ["LaGrieta.es"]
 identifier = "com.lagrieta.thegrid"
 icon = []
 copyright = "Copyright © 2026 LaGrieta.es"
-categories = ["Network", "Utility"]
-out-dir = "../../target/release/bundle"
+category = "Network"
 
 [[package.metadata.packager.binaries]]
 path = "../../target/release/thegrid.exe"
