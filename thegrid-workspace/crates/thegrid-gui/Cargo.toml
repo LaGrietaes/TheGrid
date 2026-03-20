@@ -70,7 +70,6 @@ copyright = "Copyright © 2026 LaGrieta.es"
 category = "Utility"
 
 [[package.metadata.packager.binaries]]
-path = "../../target/release/thegrid.exe"
 main = true
 
 [package.metadata.packager.nsis]
