@@ -859,9 +859,9 @@ impl TheGridApp {
                     self.is_tg_agent = true;
                     self.push_toast(Toast::ok(format!("⬡ Agent online: {}", resp.device)));
                 }
-                AppEvent::AgentPingFailed(_) => {
+                AppEvent::AgentPingFailed(err) => {
                     self.is_tg_agent = false;
-                    self.push_toast(Toast::info("THE GRID agent not found on this node"));
+                    self.push_toast(Toast::err(format!("Agent ping failed: {}", err)));
                 }
 
                 // ── File transfer ─────────────────────────────────────────────

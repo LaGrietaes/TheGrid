@@ -42,24 +42,30 @@ impl TailscaleClient {
         let url = format!("{}/tailnet/-/devices", API_BASE);
         log::debug!("GET {}", url);
 
-        let resp = self.http
+        let resp_result = self.http
             .get(&url)
             .bearer_auth(&self.api_key)
-            .send()
-            .context("Sending devices request")?;
+            .send();
+
+        let resp = match resp_result {
+            Ok(r) => r,
+            Err(e) => return self.stale_fallback(anyhow::anyhow!("Request failed: {}", e)),
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
-            return Err(anyhow::anyhow!(
+            return self.stale_fallback(anyhow::anyhow!(
                 "Tailscale API returned {}: {}",
                 status,
                 body.chars().take(200).collect::<String>()
             ));
         }
 
-        let mut data: TailscaleDevicesResponse = resp.json()
-            .context("Parsing devices JSON")?;
+        let mut data: TailscaleDevicesResponse = match resp.json() {
+            Ok(d) => d,
+            Err(e) => return self.stale_fallback(anyhow::anyhow!("JSON Parsing failed: {}", e)),
+        };
 
         data.devices.sort_by(|a, b| {
             a.hostname.to_lowercase().cmp(&b.hostname.to_lowercase())
@@ -71,6 +77,16 @@ impl TailscaleClient {
 
         log::info!("Fetched {} devices from Tailscale", data.devices.len());
         Ok(data.devices)
+    }
+
+    fn stale_fallback(&self, original_err: anyhow::Error) -> Result<Vec<TailscaleDevice>> {
+        if let Ok(guard) = self.cache.lock() {
+            if let Some((devices, _)) = &*guard {
+                log::warn!("Fetch failed ({}), using stale tailnet cache", original_err);
+                return Ok(devices.clone());
+            }
+        }
+        Err(original_err)
     }
 
     /// Checks if a given IP address belongs to any device in the tailnet.

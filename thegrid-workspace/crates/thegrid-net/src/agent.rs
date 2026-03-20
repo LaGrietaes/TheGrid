@@ -249,7 +249,7 @@ impl AgentClient {
 
     pub fn ping(&self) -> Result<AgentPingResponse> {
         let url = format!("{}/ping", self.base_url);
-        let resp = self.http.get(&url).timeout(std::time::Duration::from_secs(3)).send().context("Pinging agent")?;
+        let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).timeout(std::time::Duration::from_secs(3)).send().context("Pinging agent")?;
         resp.json().context("Parsing ping response")
     }
 
@@ -257,13 +257,13 @@ impl AgentClient {
         #[derive(serde::Deserialize)]
         struct Resp { files: Vec<RemoteFile> }
         let url = format!("{}/filelist", self.base_url);
-        let resp: Resp = self.http.get(&url).send()?.json()?;
+        let resp: Resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).send()?.json()?;
         Ok(resp.files)
     }
 
     pub fn download_file(&self, filename: &str, dest_dir: &Path) -> Result<PathBuf> {
         let url = format!("{}/files/{}", self.base_url, urlencoding_encode(filename));
-        let bytes = self.http.get(&url).send()?.bytes().context("Reading file bytes")?;
+        let bytes = self.http.get(&url).header("X-Grid-Key", &self.api_key).send()?.bytes().context("Reading file bytes")?;
         std::fs::create_dir_all(dest_dir)?;
         let dest = dest_dir.join(filename);
         std::fs::write(&dest, &bytes)?;
@@ -274,7 +274,7 @@ impl AgentClient {
         let filename = path.file_name().unwrap_or_default().to_string_lossy().to_string();
         let data = std::fs::read(path)?;
         let url = format!("{}/upload", self.base_url);
-        let resp = self.http.post(&url).header("X-Filename", &filename).body(data).send().context("Uploading file")?;
+        let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).header("X-Filename", &filename).body(data).send().context("Uploading file")?;
         if !resp.status().is_success() {
             return Err(anyhow::anyhow!("Upload returned {}", resp.status()));
         }
@@ -284,7 +284,7 @@ impl AgentClient {
     pub fn send_clipboard(&self, content: &str, sender: &str) -> Result<()> {
         let url = format!("{}/clipboard", self.base_url);
         let body = serde_json::json!({ "content": content, "sender": sender });
-        let resp = self.http.post(&url).json(&body).send()?;
+        let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).json(&body).send()?;
         if !resp.status().is_success() {
             return Err(anyhow::anyhow!("Clipboard relay returned {}", resp.status()));
         }
