@@ -1,0 +1,5 @@
+{
+  "devDependencies": {
+    "@microsoft/winappcli": "^0.2.0"
+  }
+}
