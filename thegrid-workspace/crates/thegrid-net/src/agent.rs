@@ -3,13 +3,23 @@ use reqwest::blocking::Client;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use tiny_http::{Server, Response, Request};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::io::{Read, Write};
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+
 use thegrid_core::{AppEvent, models::*, Config};
 use ascii::AsciiStr;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-use std::sync::Arc;
+
 use crate::tailscale::TailscaleClient;
+
+struct TerminalSession {
+    writer: Box<dyn Write + Send>,
+    output_buffer: Arc<Mutex<VecDeque<u8>>>,
+}
 
 pub struct AgentServer {
     port: u16,
@@ -18,6 +28,7 @@ pub struct AgentServer {
     event_tx: mpsc::Sender<AppEvent>,
     ts_client: Option<Arc<TailscaleClient>>,
     config: Config,
+    terminal_sessions: Mutex<HashMap<String, TerminalSession>>,
 }
 
 impl AgentServer {
@@ -35,6 +46,7 @@ impl AgentServer {
             event_tx,
             ts_client: None,
             config,
+            terminal_sessions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -260,6 +272,88 @@ impl AgentServer {
             return Ok(());
         }
 
+        // ── Terminal Endpoints ──
+        if method == "POST" && url == "/v1/terminal/session" {
+            let pty_system = NativePtySystem::default();
+            let pty_pair = pty_system.openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }).map_err(|e| anyhow::anyhow!("Failed to open PTY: {}", e))?;
+
+            #[cfg(windows)]
+            let shell = "powershell.exe";
+            #[cfg(not(windows))]
+            let shell = "bash";
+
+            let cmd = CommandBuilder::new(shell);
+            let _child = pty_pair.slave.spawn_command(cmd)
+                .map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
+
+            let writer = pty_pair.master.take_writer()
+                .map_err(|e| anyhow::anyhow!("Failed to take PTY writer: {}", e))?;
+            let mut reader = pty_pair.master.try_clone_reader()
+                .map_err(|e| anyhow::anyhow!("Failed to clone PTY reader: {}", e))?;
+
+            let output_buffer = Arc::new(Mutex::new(VecDeque::new()));
+            let output_buffer_clone = Arc::clone(&output_buffer);
+
+            // Thread to read PTY output and push to buffer
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 { break; }
+                    let mut buffer = output_buffer_clone.lock().unwrap();
+                    for &byte in &buf[..n] {
+                        buffer.push_back(byte);
+                        if buffer.len() > 65536 {
+                            buffer.pop_front();
+                        }
+                    }
+                }
+                log::info!("PTY output thread exiting");
+            });
+
+            let session_id = uuid::Uuid::new_v4().to_string();
+            self.terminal_sessions.lock().unwrap().insert(session_id.clone(), TerminalSession {
+                writer,
+                output_buffer,
+            });
+
+            req.respond(Response::from_string(format!(r#"{{"session_id":"{}"}}"#, session_id)))?;
+            return Ok(());
+        }
+
+        if method == "POST" && url.starts_with("/v1/terminal/input") {
+            let id = url.split("id=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
+            let mut body = Vec::new();
+            req.as_reader().read_to_end(&mut body)?;
+            
+            let mut sessions = self.terminal_sessions.lock().unwrap();
+            if let Some(session) = sessions.get_mut(id) {
+                session.writer.write_all(&body)?;
+                session.writer.flush()?;
+                req.respond(Response::from_string("ok"))?;
+            } else {
+                req.respond(Response::from_string("Session not found").with_status_code(404))?;
+            }
+            return Ok(());
+        }
+
+        if method == "GET" && url.starts_with("/v1/terminal/output") {
+            let id = url.split("id=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
+            let sessions = self.terminal_sessions.lock().unwrap();
+            if let Some(session) = sessions.get(id) {
+                let mut buffer = session.output_buffer.lock().unwrap();
+                let bytes: Vec<u8> = buffer.drain(..).collect();
+                req.respond(Response::from_data(bytes))?;
+            } else {
+                req.respond(Response::from_string("Session not found").with_status_code(404))?;
+            }
+            return Ok(());
+        }
+
         // ── NEW: Remote Config Update ──
         if method == "POST" && url == "/v1/config" {
             let mut body = String::new();
@@ -328,7 +422,7 @@ impl AgentServer {
         }
         #[cfg(not(windows))]
         {
-            AgentServer::list_any_dir(Path::new("/"))
+            Self::list_any_dir(Path::new("/"))
         }
     }
 
@@ -403,6 +497,31 @@ impl AgentClient {
             return Err(anyhow::anyhow!("Clipboard relay returned {}", resp.status()));
         }
         Ok(())
+    }
+
+    pub fn create_terminal_session(&self) -> Result<String> {
+        let url = format!("{}/v1/terminal/session", self.base_url);
+        let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).send()?;
+        #[derive(serde::Deserialize)]
+        struct Resp { session_id: String }
+        let r: Resp = resp.json()?;
+        Ok(r.session_id)
+    }
+
+    pub fn send_terminal_input(&self, session_id: &str, data: &[u8]) -> Result<()> {
+        let url = format!("{}/v1/terminal/input?id={}", self.base_url, session_id);
+        let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).body(data.to_vec()).send()?;
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("Terminal input failed: {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    pub fn get_terminal_output(&self, session_id: &str) -> Result<Vec<u8>> {
+        let url = format!("{}/v1/terminal/output?id={}", self.base_url, session_id);
+        let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).send()?;
+        let bytes = resp.bytes()?.to_vec();
+        Ok(bytes)
     }
 
     pub fn get_telemetry(&self) -> Result<NodeTelemetry> {
