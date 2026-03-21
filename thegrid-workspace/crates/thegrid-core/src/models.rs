@@ -62,6 +62,8 @@ pub struct RemoteFile {
     pub name: String,
     pub size: u64,
     pub modified: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone)]

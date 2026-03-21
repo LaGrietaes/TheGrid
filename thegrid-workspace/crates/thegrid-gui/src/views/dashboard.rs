@@ -50,6 +50,10 @@ pub struct DetailState<'a> {
     pub watch_paths:    &'a [std::path::PathBuf],
     /// Phase 3: live telemetry for this device (None = not yet fetched)
     pub telemetry:      Option<&'a thegrid_core::models::NodeTelemetry>,
+    /// New in Node Enhancement: tracks the current directory being browsed
+    pub current_remote_path: &'a mut std::path::PathBuf,
+    /// New in Node Enhancement: tracks the model name being typed in the UI
+    pub remote_model_edit: &'a mut String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +79,12 @@ pub struct DetailActions {
     pub wake_device:     bool,
     /// Phase 3: load timeline data
     pub load_timeline:   bool,
+    /// New in Node Enhancement: browse a specific remote path
+    pub browse_remote:   Option<std::path::PathBuf>,
+    /// New in Node Enhancement: download a file from any path
+    pub download_remote_file: Option<std::path::PathBuf>,
+    /// New in Node Enhancement: update remote AI model config (model, url)
+    pub update_remote_config: Option<(Option<String>, Option<String>)>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -498,6 +508,39 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
     if theme::secondary_button(ui, "+ ADD WATCH DIRECTORY").clicked() {
         actions.add_watch_path = true;
     }
+
+    // ── AI Model Setup ──
+    if s.is_tg_agent {
+        ui.add_space(20.0);
+        ui.add(egui::Separator::default().spacing(0.0));
+        ui.add_space(16.0);
+        theme::section_title(ui, "// REMOTE AI SETUP");
+        ui.add_space(8.0);
+
+        // Auto-fill placeholder from telemetry if empty
+        if s.remote_model_edit.is_empty() {
+            if let Some(t) = s.telemetry {
+                if let Some(m) = t.capabilities.ai_models.first() {
+                    *s.remote_model_edit = m.clone();
+                }
+            }
+        }
+        
+        ui.columns(2, |cols| {
+            cols[0].label(RichText::new("AI MODEL").color(Colors::TEXT_DIM).size(8.0).strong());
+            cols[0].add_space(4.0);
+            cols[0].add(egui::TextEdit::singleline(s.remote_model_edit).hint_text("e.g. llama3").desired_width(f32::INFINITY));
+
+            cols[1].label(RichText::new("PROVIDER URL").color(Colors::TEXT_DIM).size(8.0).strong());
+            cols[1].add_space(4.0);
+            cols[1].label(RichText::new("Uses remote node's local config.").color(Colors::TEXT_MUTED).size(8.0));
+        });
+
+        ui.add_space(8.0);
+        if theme::secondary_button(ui, "UPDATE REMOTE CONFIG").clicked() {
+            actions.update_remote_config = Some((Some(s.remote_model_edit.clone()), None));
+        }
+    }
 }
 
 fn action_card(ui: &mut Ui, icon: theme::IconType, label: &str, sub: &str) -> bool {
@@ -636,58 +679,80 @@ fn render_files_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
         });
         cols[1].add_space(8.0);
 
-        // Remote file list — each download button returns the filename
+        // Remote file list
         egui::Frame::none()
             .fill(Colors::BG_WIDGET)
             .stroke(egui::Stroke::new(1.0, Colors::BORDER))
             .show(&mut cols[1], |ui| {
                 ui.set_min_height(120.0);
+                
+                // ── Path breadcrumb / Back button ──
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    if s.current_remote_path.as_os_str().is_empty() {
+                        ui.label(RichText::new("NOT BROWSING REMOTE").color(Colors::TEXT_MUTED).size(9.0));
+                    } else {
+                        if theme::micro_button(ui, "ᐊ BACK").clicked() {
+                            let parent = s.current_remote_path.parent().unwrap_or(std::path::Path::new(""));
+                            actions.browse_remote = Some(parent.to_path_buf());
+                        }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(s.current_remote_path.display().to_string()).color(Colors::CYAN).size(9.0).strong());
+                    }
+                });
+                ui.add(egui::Separator::default().spacing(4.0));
+
                 if s.remote_files.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(16.0);
-                        ui.label(
-                            RichText::new("SCAN TO LIST REMOTE FILES")
-                                .color(Colors::TEXT_MUTED).size(9.0)
-                        );
+                        ui.label(RichText::new("NO FILES OR NOT SCANNED").color(Colors::TEXT_MUTED).size(9.0));
+                        if theme::secondary_button(ui, "BROWSE ROOT").clicked() {
+                            actions.browse_remote = Some(std::path::PathBuf::new());
+                        }
                     });
                 } else {
                     ScrollArea::vertical()
                         .id_source("remote_file_list")
-                        .max_height(160.0)
+                        .max_height(200.0)
                         .show(ui, |ui| {
                             for rf in s.remote_files {
                                 ui.add_space(2.0);
                                 ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(&rf.name)
-                                            .color(Colors::TEXT).size(9.0)
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            // FIX: button ID embeds filename so we know
-                                            // WHICH file was clicked, returned via DetailActions
-                                            let dl_btn = ui.add(
-                                                egui::Button::new(
-                                                    RichText::new(format!("{} DL", crate::icons::Glyphs::DOWNLOAD))
-                                                        .color(Colors::TEXT_DIM).size(8.0)
-                                                )
-                                                .fill(Color32::TRANSPARENT)
-                                                .stroke(egui::Stroke::new(1.0, Colors::BORDER))
-                                                .min_size(egui::vec2(0.0, 20.0))
-                                            );
-                                            if dl_btn
-                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .clicked()
-                                            {
-                                                actions.download_file = Some(rf.name.clone());
-                                            }
-                                            ui.label(
-                                                RichText::new(fmt_bytes(rf.size))
-                                                    .color(Colors::TEXT_DIM).size(8.0)
-                                            );
+                                    let icon = if rf.is_dir { "📁" } else { "📄" };
+                                    ui.label(RichText::new(icon).color(Colors::TEXT_MUTED).size(9.0));
+                                    ui.add_space(4.0);
+                                    
+                                    let label_color = if rf.is_dir { Colors::CYAN } else { Colors::TEXT };
+                                    let resp = ui.add(egui::Label::new(RichText::new(&rf.name).color(label_color).size(10.0)).sense(egui::Sense::click()));
+                                    
+                                    if resp.clicked() {
+                                        if rf.is_dir {
+                                            let mut new_path = s.current_remote_path.clone();
+                                            new_path.push(&rf.name);
+                                            actions.browse_remote = Some(new_path);
                                         }
-                                    );
+                                    }
+
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if !rf.is_dir {
+                                            // FIX: DL button for files
+                                            let dl_btn = ui.add(
+                                                egui::Button::new(RichText::new(format!("{} DL", crate::icons::Glyphs::DOWNLOAD)).color(Colors::TEXT_DIM).size(8.0))
+                                                .fill(Color32::TRANSPARENT).stroke(egui::Stroke::new(1.0, Colors::BORDER)).min_size(egui::vec2(0.0, 20.0))
+                                            );
+                                            if dl_btn.clicked() {
+                                                if s.current_remote_path.as_os_str().is_empty() {
+                                                    // Transfers dir fallback
+                                                    actions.download_file = Some(rf.name.clone());
+                                                } else {
+                                                    let mut full_path = s.current_remote_path.clone();
+                                                    full_path.push(&rf.name);
+                                                    actions.download_remote_file = Some(full_path);
+                                                }
+                                            }
+                                            ui.label(RichText::new(fmt_bytes(rf.size)).color(Colors::TEXT_DIM).size(8.0));
+                                        }
+                                    });
                                 });
                                 ui.add(egui::Separator::default().spacing(2.0));
                             }

@@ -163,6 +163,13 @@ pub struct TheGridApp {
     toasts:         Vec<Toast>,
     status_msg:     String,
     local_hostname: String,
+
+    /// New in Node Enhancement: tracks the current directory being browsed on
+    /// the SELECTED remote node. Resets when switching nodes.
+    current_remote_path: PathBuf,
+
+    /// New in Node Enhancement: tracks the model name being typed in the UI
+    remote_model_edit: String,
 }
 
 impl TheGridApp {
@@ -279,6 +286,8 @@ impl TheGridApp {
             is_ai_node:        false,
             embedding_progress: (0, 0),
             local_hostname,
+            current_remote_path: PathBuf::new(),
+            remote_model_edit: String::new(),
         };
         
         // --- Detect and Start AI ---
@@ -394,6 +403,44 @@ impl TheGridApp {
             match AgentClient::new(&ip, port, api_key).and_then(|c| c.download_file(&filename, &dest_dir)) {
                 Ok(p)  => { let _ = tx.send(AppEvent::FileDownloaded { name: filename, path: p }); }
                 Err(e) => { let _ = tx.send(AppEvent::FileDownloadFailed { name: filename, error: e.to_string() }); }
+            }
+        });
+    }
+
+    fn spawn_browse_remote_directory(&self, ip: String, device_id: String, path: PathBuf) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.browse_directory(&path)) {
+                Ok(files) => { let _ = tx.send(AppEvent::RemoteBrowseLoaded { device_id, path, files }); }
+                Err(e) => { let _ = tx.send(AppEvent::RemoteBrowseFailed { device_id, error: e.to_string() }); }
+            }
+        });
+    }
+
+    fn spawn_download_remote_file_anywhere(&self, ip: String, path: PathBuf) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let dest_dir = self.config.effective_transfers_dir();
+        let tx = self.event_tx.clone();
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "download".to_string());
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.download_remote_file(&path, &dest_dir)) {
+                Ok(p) => { let _ = tx.send(AppEvent::FileDownloaded { name, path: p }); }
+                Err(e) => { let _ = tx.send(AppEvent::FileDownloadFailed { name, error: e.to_string() }); }
+            }
+        });
+    }
+
+    fn spawn_update_remote_config(&self, ip: String, device_id: String, model: Option<String>, url: Option<String>) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.update_config(model, url)) {
+                Ok(_) => { let _ = tx.send(AppEvent::RemoteConfigUpdated { device_id }); }
+                Err(e) => { let _ = tx.send(AppEvent::RemoteConfigFailed { device_id, error: e.to_string() }); }
             }
         });
     }
@@ -874,6 +921,24 @@ impl TheGridApp {
                 AppEvent::RemoteFilesFailed(err) => {
                     self.push_toast(Toast::err(format!("File scan: {}", err)));
                 }
+
+                AppEvent::RemoteBrowseLoaded { device_id, path, files } => {
+                    if self.selected_idx.and_then(|i| self.devices.get(i)).map(|d| d.id == device_id).unwrap_or(false) {
+                        self.remote_files = files;
+                        self.current_remote_path = path;
+                        self.set_status("Remote directory loaded");
+                    }
+                }
+                AppEvent::RemoteBrowseFailed { device_id: _, error } => {
+                    self.push_toast(Toast::err(format!("Browse failed: {}", error)));
+                }
+
+                AppEvent::RemoteConfigUpdated { device_id: _ } => {
+                    self.push_toast(Toast::ok("Remote configuration updated"));
+                }
+                AppEvent::RemoteConfigFailed { device_id: _, error } => {
+                    self.push_toast(Toast::err(format!("Config update failed: {}", error)));
+                }
                 AppEvent::FileSent { queue_idx, name } => {
                     if let Some(item) = self.file_queue.get_mut(queue_idx) {
                         item.status = FileTransferStatus::Done;
@@ -1325,11 +1390,27 @@ impl TheGridApp {
             }
         }
 
-        if actions.scan_remote    { self.spawn_list_remote_files(ip.to_string()); }
+        if actions.scan_remote {
+            self.spawn_list_remote_files(ip.to_string());
+        }
+
+        if let Some(path) = actions.browse_remote {
+            self.spawn_browse_remote_directory(ip.to_string(), device_id.to_string(), path);
+        }
 
         if let Some(filename) = actions.download_file {
             self.transfer_log.push(TransferLogEntry::info(format!("Downloading {}...", filename)));
             self.spawn_download_file(ip.to_string(), filename);
+        }
+
+        if let Some(path) = actions.download_remote_file {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            self.transfer_log.push(TransferLogEntry::info(format!("Downloading {}...", name)));
+            self.spawn_download_remote_file_anywhere(ip.to_string(), path);
+        }
+
+        if let Some((model, url)) = actions.update_remote_config {
+            self.spawn_update_remote_config(ip.to_string(), device_id.to_string(), model, url);
         }
 
         if actions.open_inbox {
@@ -1497,6 +1578,8 @@ impl eframe::App for TheGridApp {
                         self.selected_idx = Some(idx);
                         self.active_tab   = DashTab::default();
                         self.remote_files.clear();
+                        self.current_remote_path = PathBuf::new();
+                        self.remote_model_edit = String::new();
                         self.is_tg_agent = false;
                     }
                 }
@@ -1552,6 +1635,8 @@ impl eframe::App for TheGridApp {
                                 is_tg_agent:    self.is_tg_agent,
                                 watch_paths:    &watch_snap,
                                 telemetry:      telem_snap.as_ref(),
+                                current_remote_path: &mut self.current_remote_path,
+                                remote_model_edit: &mut self.remote_model_edit,
                             };
 
                             // Pass timeline state into the render
