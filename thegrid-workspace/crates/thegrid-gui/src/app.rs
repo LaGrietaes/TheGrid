@@ -1137,6 +1137,8 @@ impl TheGridApp {
                     std::thread::spawn(move || {
                         let client = reqwest::blocking::Client::new();
                         let url = format!("http://{}:47731/adb/enable", ip);
+                        log::info!("Preparing remote node {} for mirroring...", ip);
+                        
                         match client.post(&url)
                             .header("X-Api-Key", &api_key)
                             .timeout(std::time::Duration::from_secs(5))
@@ -1144,13 +1146,21 @@ impl TheGridApp {
                         {
                             Ok(resp) => {
                                 if resp.status().is_success() {
-                                    log::info!("ADB enabled on remote node {}", ip);
+                                    log::info!("ADB enabled on remote node {}. Waiting for daemon...", ip);
+                                    // Give adbd a moment to restart on port 5555
+                                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                                    
+                                    log::info!("Launching scrcpy for {}...", ip);
+                                    let _ = std::process::Command::new("scrcpy")
+                                        .arg("--tcpip").arg(&ip)
+                                        .spawn();
                                 } else {
-                                    let _ = tx.send(AppEvent::Status(format!("ADB error: {}", resp.status())));
+                                    let msg = format!("ADB enable failed ({}). Ensure 'android-tools' is installed on node.", resp.status());
+                                    let _ = tx.send(AppEvent::Status(msg));
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(AppEvent::Status(format!("ADB failed to reach node: {}", e)));
+                                let _ = tx.send(AppEvent::Status(format!("Node unreachable: {}", e)));
                             }
                         }
                     });
