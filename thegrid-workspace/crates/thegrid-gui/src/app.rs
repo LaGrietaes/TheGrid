@@ -1137,6 +1137,7 @@ impl TheGridApp {
                     std::thread::spawn(move || {
                         let client = reqwest::blocking::Client::new();
                         let url = format!("http://{}:47731/adb/enable", ip);
+                        println!("DEBUG: Sending EnableAdb request to {}", url);
                         log::info!("Preparing remote node {} for mirroring...", ip);
                         
                         match client.post(&url)
