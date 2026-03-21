@@ -148,20 +148,39 @@ impl AgentServer {
             return Ok(());
         }
 
-        // ── ADB Mirroring Preparation ──
         if method == "POST" && url == "/adb/enable" {
             #[cfg(target_os = "linux")]
             {
                 log::info!("Agent: attempting to enable ADB over TCP/IP 5555 (Termux)");
-                let output = std::process::Command::new("adb")
+                match std::process::Command::new("adb")
                     .arg("tcpip").arg("5555")
-                    .output();
-                
-                let success = output.map(|o| o.status.success()).unwrap_or(false);
-                let msg = if success { "ADB 5555 enabled" } else { "Failed to enable ADB (is it installed?)" };
-                req.respond(Response::from_string(format!(r#"{{"ok":{},"message":"{}"}}"#, success, msg))
-                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
-                )?;
+                    .output() 
+                {
+                    Ok(output) => {
+                        let success = output.status.success();
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let msg = if success { 
+                             "ADB 5555 enabled".to_string() 
+                        } else { 
+                            format!("Failed to enable ADB: {}{}", stdout, stderr) 
+                        };
+                        
+                        if success { log::info!("{}", msg); } else { log::error!("{}", msg); }
+
+                        req.respond(Response::from_string(format!(r#"{{"ok":{},"message":{}}}"#, 
+                            success, serde_json::to_string(&msg).unwrap()))
+                            .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                        )?;
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to execute 'adb' binary: {}. Is android-tools installed?", e);
+                        log::error!("{}", msg);
+                        req.respond(Response::from_string(format!(r#"{{"ok":false,"message":{}}}"#, serde_json::to_string(&msg).unwrap()))
+                            .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                        )?;
+                    }
+                }
             }
             #[cfg(not(target_os = "linux"))]
             {
