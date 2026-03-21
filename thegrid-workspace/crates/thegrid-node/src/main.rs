@@ -93,6 +93,13 @@ fn main() -> Result<()> {
                 AppEvent::Status(msg) => {
                     log::debug!("Status: {}", msg);
                 }
+                AppEvent::EnableAdb { .. } => {
+                    log::info!("Enabling ADB over TCP/IP (port 5555)...");
+                    let _ = std::process::Command::new("adb")
+                        .arg("tcpip")
+                        .arg("5555")
+                        .spawn();
+                }
                 _ => {
                     // Ignore GUI events
                     log::debug!("Ignored event: {:?}", event);
