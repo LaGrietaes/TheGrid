@@ -166,6 +166,7 @@ pub enum AppEvent {
     /// Telemetry snapshot from a remote THE GRID agent.
     TelemetryUpdate {
         device_id:  String,
+        ip:         Option<String>,
         telemetry:  NodeTelemetry,
     },
 
@@ -177,6 +178,19 @@ pub enum AppEvent {
 
     /// Temporal view data loaded.
     TemporalLoaded(Vec<TemporalEntry>),
+
+    /// Incoming request from a remote node via AgentServer to generate an embedding.
+    RemoteAiEmbedRequest {
+        text: String,
+        response_tx: mpsc::Sender<Vec<f32>>,
+    },
+
+    /// Incoming request from a remote node via AgentServer to perform a semantic search.
+    RemoteAiSearchRequest {
+        query: String,
+        k:     usize,
+        response_tx: mpsc::Sender<Vec<(i64, f32)>>,
+    },
 
     // ── Status ─────────────────────────────────────────────────────────────
     Status(String),

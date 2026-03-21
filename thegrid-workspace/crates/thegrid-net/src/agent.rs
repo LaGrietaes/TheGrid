@@ -412,35 +412,59 @@ impl AgentServer {
             return Ok(());
         }
 
-        // ── NEW: Remote Config Update ──
-        if method == "POST" && url == "/v1/config" {
+        // ── NEW: Remote AI Inference ──
+        if method == "POST" && url == "/v1/ai/embed" {
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body)?;
-
+            
             #[derive(serde::Deserialize)]
-            struct ConfigUpdate {
-                ai_model: Option<String>,
-                ai_provider_url: Option<String>,
-            }
-
-            if let Ok(update) = serde_json::from_str::<ConfigUpdate>(&body) {
-                let mut cfg = self.config.clone();
-                if update.ai_model.is_some() { cfg.ai_model = update.ai_model; }
-                if update.ai_provider_url.is_some() { cfg.ai_provider_url = update.ai_provider_url; }
+            struct EmbedReq { text: String }
+            
+            if let Ok(req_data) = serde_json::from_str::<EmbedReq>(&body) {
+                let (tx, rx) = mpsc::channel();
+                let _ = self.event_tx.send(AppEvent::RemoteAiEmbedRequest { 
+                    text: req_data.text, 
+                    response_tx: tx 
+                });
                 
-                if let Err(e) = cfg.save() {
-                    log::error!("Failed to save remote config update: {}", e);
-                    req.respond(Response::from_string(format!(r#"{{"error":"{}"}}"#, e)).with_status_code(500))?;
-                } else {
-                    req.respond(Response::from_string(r#"{"ok":true}"#)
-                        .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
-                    )?;
-                }
+                let vector = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_default();
+                let json = serde_json::to_string(&vector)?;
+                req.respond(Response::from_string(json)
+                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                )?;
             } else {
                 req.respond(Response::from_string(r#"{"error":"invalid json"}"#).with_status_code(400))?;
             }
             return Ok(());
         }
+
+        if method == "POST" && url == "/v1/ai/search" {
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body)?;
+            
+            #[derive(serde::Deserialize)]
+            struct SearchReq { query: String, k: usize }
+            
+            if let Ok(req_data) = serde_json::from_str::<SearchReq>(&body) {
+                let (tx, rx) = mpsc::channel();
+                let _ = self.event_tx.send(AppEvent::RemoteAiSearchRequest { 
+                    query: req_data.query, 
+                    k: req_data.k,
+                    response_tx: tx 
+                });
+                
+                let results = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_default();
+                let json = serde_json::to_string(&results)?;
+                req.respond(Response::from_string(json)
+                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                )?;
+            } else {
+                req.respond(Response::from_string(r#"{"error":"invalid json"}"#).with_status_code(400))?;
+            }
+            return Ok(());
+        }
+
+        // ── NEW: Remote Config Update ──
 
         req.respond(Response::from_string("Not found").with_status_code(404))?;
         Ok(())
@@ -618,6 +642,38 @@ impl AgentClient {
         let dest_file = dest.join(&*filename);
         std::fs::write(&dest_file, &bytes)?;
         Ok(dest_file)
+    }
+
+    pub fn remote_embed(&self, text: &str) -> Result<Vec<f32>> {
+        let url = format!("{}/v1/ai/embed", self.base_url);
+        let body = serde_json::json!({ "text": text });
+        let resp = self.http.post(&url)
+            .header("X-Grid-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .context("Remote embedding request")?;
+        
+        if resp.status().is_success() {
+            resp.json().context("Parsing remote embed response")
+        } else {
+            Err(anyhow::anyhow!("Remote embed failed: {}", resp.status()))
+        }
+    }
+
+    pub fn remote_search(&self, query: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        let url = format!("{}/v1/ai/search", self.base_url);
+        let body = serde_json::json!({ "query": query, "k": k });
+        let resp = self.http.post(&url)
+            .header("X-Grid-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .context("Remote search request")?;
+        
+        if resp.status().is_success() {
+            resp.json().context("Parsing remote search response")
+        } else {
+            Err(anyhow::anyhow!("Remote search failed: {}", resp.status()))
+        }
     }
 
     pub fn update_config(&self, model: Option<String>, url: Option<String>) -> Result<()> {

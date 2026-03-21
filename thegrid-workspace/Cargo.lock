@@ -4404,6 +4404,7 @@ dependencies = [
  "thegrid-ai",
  "thegrid-core",
  "thegrid-net",
+ "thegrid-runtime",
 ]
 
 [[package]]
@@ -4443,8 +4444,29 @@ dependencies = [
  "serde_json",
  "thegrid-core",
  "thegrid-net",
+ "thegrid-runtime",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "thegrid-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "hostname 0.3.1",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thegrid-ai",
+ "thegrid-core",
+ "thegrid-net",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

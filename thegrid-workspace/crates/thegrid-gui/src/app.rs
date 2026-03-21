@@ -36,6 +36,7 @@ use thegrid_core::{AppEvent, Config, Database, FileWatcher};
 use thegrid_core::models::*;
 use thegrid_net::{TailscaleClient, RdpLauncher, AgentClient, AgentServer, WolSentry};
 use thegrid_net::rdp::RdpResolution;
+use thegrid_runtime::AppRuntime;
 
 use crate::theme::Colors;
 use crate::views::dashboard::{
@@ -121,14 +122,10 @@ pub struct TheGridApp {
     remote_files: Vec<RemoteFile>,
     transfer_log: Vec<TransferLogEntry>,
 
-    // ── Phase 2: Filesystem watcher ───────────────────────────────────────────
-    file_watcher: Option<FileWatcher>,
-    watch_paths:  Vec<PathBuf>,
+    /// The centralized engine for background tasks and services
+    runtime: Arc<AppRuntime>,
 
-    // ── Phase 3: SQLite index ─────────────────────────────────────────────────
-    // Arc<Mutex<>> so background threads can lock, write, and release without
-    // blocking the GUI thread. update() never holds the lock.
-    db:          Arc<Mutex<Database>>,
+    // ── Phase 3: SQLite index state (UI only) ─────────────────────────────────
     index_stats: IndexStats,
 
     // ── Phase 3: Search ───────────────────────────────────────────────────────
@@ -140,12 +137,9 @@ pub struct TheGridApp {
 
     mesh_sync_last_at: std::time::Instant,
 
-    // --- Phase 4: Semantic AI ---
-    semantic_search:    Arc<Mutex<Option<thegrid_ai::SemanticSearch>>>,
+    // --- Phase 4: Semantic AI UI State ---
     semantic_enabled:   bool,
     semantic_loading:   bool,
-    ai_node_detector:   thegrid_ai::AiNodeDetector,
-    is_ai_node:         bool,
     embedding_progress: (usize, usize),
 
     // ── Phase 3: Telemetry cache ──────────────────────────────────────────────
@@ -194,59 +188,12 @@ impl TheGridApp {
         let settings     = SettingsState::from_config(&config);
         let rdp_username = config.rdp_username.clone();
 
-        // ── Open SQLite database ───────────────────────────────────────────────
-        let db_path = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("thegrid")
-            .join("index.db");
+        // Initialize the shared runtime
+        let runtime = Arc::new(AppRuntime::new(config.clone(), tx.clone())
+            .expect("Failed to initialize AppRuntime"));
+        runtime.start_services();
 
-        let db = match Database::open(&db_path) {
-            Ok(d) => {
-                log::info!("Database opened at {:?}", db_path);
-                Arc::new(Mutex::new(d))
-            }
-            Err(e) => {
-                log::error!("Failed to open database: {} — using in-memory fallback", e);
-                // Fallback: in-memory DB (no persistence, but app still runs)
-                Arc::new(Mutex::new(
-                    Database::open(":memory:").expect("In-memory DB must always work")
-                ))
-            }
-        };
-
-        // ── Start agent server ────────────────────────────────────────────────
-        let transfers_dir = config.effective_transfers_dir();
-        let mut server = AgentServer::new(
-            config.agent_port,
-            config.api_key.clone(),
-            transfers_dir.clone(),
-            tx.clone(),
-            config.clone()
-        );
-
-        if !config.api_key.trim().is_empty() {
-            if let Ok(ts_client) = TailscaleClient::new(config.api_key.clone()) {
-                server = server.with_tailscale(Arc::new(ts_client));
-            }
-        }
-        server.spawn();
-
-        // ── Start filesystem watcher ──────────────────────────────────────────
-        let mut file_watcher = match FileWatcher::new(tx.clone()) {
-            Ok(fw) => { log::info!("FileWatcher ready"); Some(fw) }
-            Err(e) => { log::warn!("FileWatcher unavailable: {}", e); None }
-        };
-
-        // Initialize with default watch paths from config
-        if let Some(fw) = &mut file_watcher {
-            for path in &config.watch_paths {
-                let _ = fw.watch(path.clone());
-            }
-        }
-
-        let watch_paths = config.watch_paths.clone();
-
-        let mut app = Self {
+        Self {
             screen:      Screen::Boot,
             boot_start:  std::time::Instant::now(),
             config,
@@ -266,9 +213,8 @@ impl TheGridApp {
             file_queue:   Vec::new(),
             remote_files: Vec::new(),
             transfer_log: Vec::new(),
-            file_watcher,
-            watch_paths,
-            db,
+            
+            runtime,
             index_stats:  IndexStats::default(),
             search:           SearchPanelState::default(),
             search_keystroke: None,
@@ -282,28 +228,15 @@ impl TheGridApp {
             status_msg: "READY".into(),
             mesh_sync_last_at: std::time::Instant::now(),
             
-            // --- Phase 4: AI ---
-            semantic_search:   Arc::new(Mutex::new(None)),
+            // --- Phase 4: UI state (kept in app) ---
             semantic_enabled:  false,
             semantic_loading:  true,
-            ai_node_detector:  thegrid_ai::AiNodeDetector::new(),
-            is_ai_node:        false,
             embedding_progress: (0, 0),
             local_hostname,
             current_remote_path: PathBuf::new(),
             remote_model_edit: String::new(),
             terminal_sessions: HashMap::new(),
-        };
-        
-        // --- Detect and Start AI ---
-        app.is_ai_node = app.ai_node_detector.is_ai_node();
-        if app.is_ai_node {
-            app.spawn_semantic_initializer();
-        } else {
-            app.semantic_loading = false;
         }
-        
-        app
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -314,15 +247,7 @@ impl TheGridApp {
         if self.devices_loading { return; }
         self.devices_loading = true;
         self.set_status("Fetching devices from Tailscale...");
-        let api_key = self.config.api_key.clone();
-        let tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let result = TailscaleClient::new(api_key).and_then(|c| c.fetch_devices());
-            match result {
-                Ok(d)  => { let _ = tx.send(AppEvent::DevicesLoaded(d)); }
-                Err(e) => { let _ = tx.send(AppEvent::DevicesFailed(e.to_string())); }
-            }
-        });
+        self.runtime.spawn_load_devices();
     }
 
     fn spawn_setup_connect(&mut self) {
@@ -349,15 +274,7 @@ impl TheGridApp {
     }
 
     fn spawn_ping(&self, ip: String) {
-        let port = self.config.agent_port;
-        let tx   = self.event_tx.clone();
-        let api_key = self.config.api_key.clone();
-        std::thread::spawn(move || {
-            match AgentClient::new(&ip, port, api_key).and_then(|c| c.ping()) {
-                Ok(r)  => { let _ = tx.send(AppEvent::AgentPingOk(r)); }
-                Err(e) => { let _ = tx.send(AppEvent::AgentPingFailed(e.to_string())); }
-            }
-        });
+        self.runtime.spawn_ping(ip);
     }
 
     fn spawn_send_clipboard(&self, ip: String, content: String) {
@@ -374,54 +291,19 @@ impl TheGridApp {
     }
 
     fn spawn_list_remote_files(&self, ip: String) {
-        let port = self.config.agent_port;
-        let api_key = self.config.api_key.clone();
-        let tx   = self.event_tx.clone();
-        std::thread::spawn(move || {
-            match AgentClient::new(&ip, port, api_key).and_then(|c| c.list_files()) {
-                Ok(f)  => { let _ = tx.send(AppEvent::RemoteFilesLoaded(f)); }
-                Err(e) => { let _ = tx.send(AppEvent::RemoteFilesFailed(e.to_string())); }
-            }
-        });
+        self.runtime.spawn_list_remote_files(ip);
     }
 
     fn spawn_send_file(&self, ip: String, path: PathBuf, queue_idx: usize) {
-        let port = self.config.agent_port;
-        let api_key = self.config.api_key.clone();
-        let _sender = self.config.device_name.clone();
-        let tx     = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            match AgentClient::new(&ip, port, api_key).and_then(|c| c.upload_file(&path)) {
-                Ok(_)  => { let _ = tx.send(AppEvent::FileSent { queue_idx, name }); }
-                Err(e) => { let _ = tx.send(AppEvent::FileSendFailed { queue_idx, error: e.to_string() }); }
-            }
-        });
+        self.runtime.spawn_send_file(ip, path, queue_idx);
     }
 
     fn spawn_download_file(&self, ip: String, filename: String) {
-        let port     = self.config.agent_port;
-        let api_key  = self.config.api_key.clone();
-        let dest_dir = self.config.effective_transfers_dir();
-        let tx       = self.event_tx.clone();
-        std::thread::spawn(move || {
-            match AgentClient::new(&ip, port, api_key).and_then(|c| c.download_file(&filename, &dest_dir)) {
-                Ok(p)  => { let _ = tx.send(AppEvent::FileDownloaded { name: filename, path: p }); }
-                Err(e) => { let _ = tx.send(AppEvent::FileDownloadFailed { name: filename, error: e.to_string() }); }
-            }
-        });
+        self.runtime.spawn_download_file(ip, filename);
     }
 
     fn spawn_browse_remote_directory(&self, ip: String, device_id: String, path: PathBuf) {
-        let port = self.config.agent_port;
-        let api_key = self.config.api_key.clone();
-        let tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            match AgentClient::new(&ip, port, api_key).and_then(|c| c.browse_directory(&path)) {
-                Ok(files) => { let _ = tx.send(AppEvent::RemoteBrowseLoaded { device_id, path, files }); }
-                Err(e) => { let _ = tx.send(AppEvent::RemoteBrowseFailed { device_id, error: e.to_string() }); }
-            }
-        });
+        self.runtime.spawn_browse_remote_directory(ip, device_id, path);
     }
 
     fn spawn_download_remote_file_anywhere(&self, ip: String, path: PathBuf) {
@@ -455,131 +337,19 @@ impl TheGridApp {
     /// Kick off a full directory walk for a newly added watch path.
     /// Sends IndexProgress events during the walk, then IndexComplete.
     fn spawn_index_directory(&self, path: PathBuf, device_id: String, device_name: String) {
-        let db = Arc::clone(&self.db);
-        let tx = self.event_tx.clone();
-        self.set_status_clone(format!("Indexing {}...", path.display()));
-
-        std::thread::Builder::new()
-            .name(format!("tg-index-{}", path.display()))
-            .spawn(move || {
-                let start = std::time::Instant::now();
-                let result = {
-                    // Lock only for the duration of the index_directory call.
-                    // The progress callback fires INSIDE the lock — each call
-                    // is brief (just an INSERT/UPSERT) so UI is not starved.
-                    match db.lock() {
-                        Err(_) => { let _ = tx.send(AppEvent::Status("Index lock failed".into())); return; }
-                        Ok(guard) => {
-                            guard.index_directory(
-                                &device_id,
-                                &device_name,
-                                &path,
-                                |scanned, current| {
-                                    // Send progress every 250 files to avoid flooding the channel
-                                    if scanned % 250 == 0 {
-                                        let current_str = current.file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .to_string();
-                                        let _ = tx.send(AppEvent::IndexProgress {
-                                            scanned,
-                                            total: scanned + 1, // estimated
-                                            current: current_str,
-                                        });
-                                    }
-                                }
-                            )
-                        }
-                    }
-                };
-
-                match result {
-                    Ok(count) => {
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
-                        let _ = tx.send(AppEvent::IndexComplete {
-                            device_id,
-                            files_added: count,
-                            duration_ms: elapsed_ms,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Status(format!("Index error: {}", e)));
-                    }
-                }
-            })
-            .expect("spawning index thread");
+        self.runtime.spawn_index_directory(path, device_id, device_name);
     }
 
     /// Incrementally re-index a set of changed paths (from FileSystemChanged).
     fn spawn_incremental_index(&self, paths: Vec<PathBuf>) {
-        let db          = Arc::clone(&self.db);
-        let device_id   = self.config.device_name.clone();
-        let device_name = self.config.device_name.clone();
-        let tx          = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let result = db.lock().map(|guard| {
-                guard.index_changed_paths(&device_id, &device_name, &paths)
-            });
-            match result {
-                Ok(Ok((updated, _deleted))) => {
-                    let _ = tx.send(AppEvent::IndexUpdated { paths_updated: updated });
-                }
-                Ok(Err(e)) => {
-                    log::warn!("Incremental index error: {}", e);
-                }
-                Err(_) => {
-                    log::warn!("DB lock poisoned during incremental index");
-                }
-            }
-        });
+        self.runtime.spawn_incremental_index(paths);
     }
 
     /// Run an FTS5 search. Generation counter prevents stale results overwriting
     /// newer ones if multiple searches are in flight simultaneously.
     /// Sync a single remote node's index delta. (Phase 3)
     fn spawn_sync_node(&self, device_id: String, ip: String, hostname: String) {
-        let db          = self.db.clone();
-        let event_tx    = self.event_tx.clone();
-        let api_key     = self.config.api_key.clone();
-        let port        = self.config.agent_port;
-
-        std::thread::spawn(move || {
-            let last_ts = match db.lock() {
-                Ok(guard) => guard.get_node_sync_ts(&device_id).unwrap_or(0),
-                Err(_)    => 0,
-            };
-
-            let client = match AgentClient::new(&ip, port, api_key) {
-                Ok(c) => c,
-                Err(e) => {
-                    log::debug!("Sync connection failed for {}: {}", device_id, e);
-                    return;
-                }
-            };
-
-            match client.sync_index(last_ts) {
-                Ok(results) => {
-                    let mut count = 0;
-                    let mut max_ts = last_ts;
-                    if let Ok(guard) = db.lock() {
-                        for r in results {
-                            let mod_ts = r.modified.unwrap_or(0);
-                            if mod_ts > max_ts { max_ts = mod_ts; }
-                            if guard.upsert_remote_file(r).is_ok() {
-                                count += 1;
-                            }
-                        }
-                        let _ = guard.update_node_sync_ts(&device_id, &hostname, max_ts);
-                    }
-                    if count > 0 {
-                        let _ = event_tx.send(AppEvent::SyncComplete { device_id, files_added: count });
-                    }
-                }
-                Err(e) => {
-                    log::debug!("Sync failed for {}: {}", device_id, e);
-                }
-            }
-        });
+        self.runtime.spawn_sync_node(device_id, ip, hostname);
     }
 
     /// Pull index deltas from ALL reachable Tailscale nodes. (Phase 3)
@@ -595,86 +365,12 @@ impl TheGridApp {
 
     /// Initialize the semantic search engine in a background thread.
     fn spawn_semantic_initializer(&self) {
-        let event_tx = self.event_tx.clone();
-        let db       = self.db.clone();
-        let semantic = self.semantic_search.clone();
-        
-        std::thread::spawn(move || {
-            match thegrid_ai::FastEmbedProvider::new() {
-                Ok(provider) => {
-                    let provider: Arc<dyn thegrid_ai::EmbeddingProvider> = Arc::new(provider);
-                    match thegrid_ai::SemanticSearch::new(provider) {
-                        Ok(mut search) => {
-                            // Pre-load all existing embeddings from DB into the USearch index
-                            if let Ok(guard) = db.lock() {
-                                if let Ok(all) = guard.get_all_embeddings() {
-                                    for (fid, vec) in all {
-                                        let _ = search.add_vector(fid, &vec);
-                                    }
-                                }
-                            }
-                            
-                            // Store the initialized engine
-                            {
-                                let mut lock = semantic.lock().expect("semantic lock");
-                                *lock = Some(search);
-                            }
-                            
-                            let _ = event_tx.send(AppEvent::SemanticReady);
-                        }
-                        Err(e) => {
-                            let _ = event_tx.send(AppEvent::SemanticFailed(format!("Vector engine: {}", e)));
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = event_tx.send(AppEvent::SemanticFailed(format!("Model download: {}", e)));
-                }
-            }
-        });
+        self.runtime.spawn_semantic_initializer();
     }
 
     /// Background worker that processes files and generates embeddings.
     fn spawn_embedding_worker(&self) {
-        let db       = self.db.clone();
-        let event_tx = self.event_tx.clone();
-        let semantic = self.semantic_search.clone();
-        
-        std::thread::spawn(move || {
-            let total = db.lock().ok().and_then(|g| g.count_unindexed_files().ok()).unwrap_or(0);
-            let mut indexed = 0;
-
-            loop {
-                // Check if engine is still there
-                let has_engine = {
-                    let lock = semantic.lock().expect("semantic lock");
-                    lock.is_some()
-                };
-                if !has_engine { break; }
-
-                let batch = match db.lock() {
-                    Ok(guard) => guard.get_files_needing_embedding(20).unwrap_or_default(),
-                    Err(_) => break,
-                };
-                
-                if batch.is_empty() { break; }
-                
-                for (fid, text) in batch {
-                    let mut lock = semantic.lock().expect("semantic lock");
-                    if let Some(search) = &mut *lock {
-                        if let Ok(vec) = search.index_file(fid, &text) {
-                            if let Ok(db_lock) = db.lock() {
-                                let _ = db_lock.save_embedding(fid, search.model_id(), &vec);
-                            }
-                        }
-                    }
-                    indexed += 1;
-                    let _ = event_tx.send(AppEvent::EmbeddingProgress { indexed, total });
-                }
-                
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        });
+        self.runtime.spawn_embedding_worker();
     }
 
     fn spawn_search(&mut self) {
@@ -685,38 +381,11 @@ impl TheGridApp {
             return;
         }
 
-        let gen      = self.search.mark_dispatched();
-        let db       = Arc::clone(&self.db);
-        let tx       = self.event_tx.clone();
-        let dev_filt = self.search.device_filter.clone();
+        let _gen     = self.search.mark_dispatched();
+        let device_filter = self.search.device_filter.clone();
         let semantic_enabled = self.semantic_enabled;
-        let semantic_search  = self.semantic_search.clone();
 
-        std::thread::spawn(move || {
-            let results = if semantic_enabled {
-                if let Ok(mut lock) = semantic_search.lock() {
-                    if let Some(engine) = &mut *lock {
-                        match engine.search(&query, 50) {
-                            Ok(hits) => {
-                                let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
-                                db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default()
-                            }
-                            Err(e) => {
-                                log::error!("Semantic search failed: {}", e);
-                                vec![]
-                            }
-                        }
-                    } else { vec![] }
-                } else { vec![] }
-            } else {
-                db.lock().ok().and_then(|guard| {
-                    guard.search_fts(&query, 50, dev_filt.as_deref()).ok()
-                }).unwrap_or_default()
-            };
-
-            let _ = tx.send(AppEvent::SearchResults(results));
-            let _ = tx.send(AppEvent::Status(format!("search_gen:{}", gen)));
-        });
+        self.runtime.spawn_search(query, device_filter, semantic_enabled);
     }
 
     /// Fetch hardware telemetry from a remote agent (rate-limited to once per 15s).
@@ -727,16 +396,7 @@ impl TheGridApp {
         }
         self.telemetry_last_poll.insert(device_id.clone(), now);
 
-        let port = self.config.agent_port;
-        let api_key = self.config.api_key.clone();
-        let tx   = self.event_tx.clone();
-        std::thread::spawn(move || {
-            if let Ok(client) = AgentClient::new(&ip, port, api_key) {
-                if let Ok(telemetry) = client.get_telemetry() {
-                    let _ = tx.send(AppEvent::TelemetryUpdate { device_id, telemetry });
-                }
-            }
-        });
+        self.runtime.spawn_get_telemetry(ip, device_id);
     }
 
     /// Collect telemetry for the LOCAL machine via sysinfo (non-blocking).
@@ -748,57 +408,27 @@ impl TheGridApp {
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let telemetry = crate::telemetry::collect_local();
-            let _ = tx.send(AppEvent::TelemetryUpdate { device_id, telemetry });
+            let _ = tx.send(AppEvent::TelemetryUpdate { device_id, ip: None, telemetry });
         });
     }
 
     /// Send a Wake-on-LAN magic packet.
     /// `mac_addr` format: "AA:BB:CC:DD:EE:FF"
     fn spawn_wol(&mut self, device_name: String, mac_addr: String) {
-        let tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            // Broadcast on both the standard broadcast and the Tailscale subnet broadcast
-            let result = WolSentry::send_multi(
-                &mac_addr,
-                &["255.255.255.255", "100.64.0.255"],
-            );
-            match result {
-                Ok(_) => {
-                    let _ = tx.send(AppEvent::WolSent {
-                        device_name,
-                        target_mac: mac_addr,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx.send(AppEvent::WolFailed { reason: e.to_string() });
-                }
-            }
-        });
+        self.runtime.spawn_wol(device_name, mac_addr);
     }
 
     /// Load recent files from SQLite for the Timeline view.
     fn spawn_load_timeline(&mut self) {
         if self.timeline.loading { return; }
         self.timeline.loading = true;
-
-        let db   = Arc::clone(&self.db);
-        let tx   = self.event_tx.clone();
-        let filt = self.timeline.device_filter.clone();
-        std::thread::spawn(move || {
-            let result = db.lock().map(|guard| {
-                guard.get_recent_files(200, filt.as_deref())
-            });
-            match result {
-                Ok(Ok(entries)) => { let _ = tx.send(AppEvent::TemporalLoaded(entries)); }
-                Ok(Err(e))      => { log::warn!("Timeline load error: {}", e); }
-                Err(_)          => {}
-            }
-        });
+        let device_filter = self.timeline.device_filter.clone();
+        self.runtime.spawn_load_timeline(device_filter);
     }
 
     /// Update index_stats from the DB (cheap count query, safe to call often).
     fn refresh_index_stats(&mut self) {
-        let db = Arc::clone(&self.db);
+        let db = Arc::clone(&self.runtime.db);
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             if let Ok(guard) = db.lock() {
@@ -817,12 +447,17 @@ impl TheGridApp {
             .set_title("Select directory to watch")
             .pick_folder()
         {
-            if self.watch_paths.contains(&path) {
+            let is_watching = self.runtime.config.lock().unwrap().watch_paths.contains(&path);
+            if is_watching {
                 self.push_toast(Toast::info("Already watching that directory"));
                 return;
             }
-            match &mut self.file_watcher {
+            
+            let rt = Arc::clone(&self.runtime);
+            let mut watcher_lock = rt.file_watcher.lock().unwrap();
+            match &mut *watcher_lock {
                 None => {
+                    drop(watcher_lock);
                     self.push_toast(Toast::err("File watcher unavailable"));
                 }
                 Some(fw) => {
@@ -830,7 +465,8 @@ impl TheGridApp {
                         Ok(_) => {
                             let label = path.file_name()
                                 .unwrap_or_default().to_string_lossy().to_string();
-                            self.watch_paths.push(path.clone());
+                            rt.config.lock().unwrap().watch_paths.push(path.clone());
+                            drop(watcher_lock);
                             self.push_toast(Toast::ok(format!("Watching: {}", label)));
 
                             // Kick off a full index scan for the new path
@@ -839,6 +475,7 @@ impl TheGridApp {
                             self.spawn_index_directory(path, dev_id, dev_name);
                         }
                         Err(e) => {
+                            drop(watcher_lock);
                             self.push_toast(Toast::err(format!("Watch failed: {}", e)));
                         }
                     }
@@ -868,7 +505,7 @@ impl TheGridApp {
 
                     // Register all devices in the DB so names are available offline
                     {
-                        if let Ok(guard) = self.db.lock() {
+                        if let Ok(guard) = self.runtime.db.lock() {
                             for d in &devices {
                                 let _ = guard.upsert_device(&d.id, d.display_name());
                             }
@@ -1014,7 +651,7 @@ impl TheGridApp {
 
                 // ── Phase 3: Mesh Sync ─────────────────────────────────────────
                 AppEvent::SyncRequest { after, response_tx } => {
-                    let db = self.db.clone();
+                    let db = self.runtime.db.clone();
                     std::thread::spawn(move || {
                         if let Ok(guard) = db.lock() {
                             let results = guard.get_files_after(after).unwrap_or_default();
@@ -1074,7 +711,7 @@ impl TheGridApp {
                     self.refresh_index_stats();
 
                     // Phase 4: Trigger embedding generation for the new files
-                    if !self.semantic_loading && self.is_ai_node {
+                    if !self.semantic_loading && self.runtime.is_ai_node {
                         self.spawn_embedding_worker();
                     }
                 }
@@ -1084,7 +721,7 @@ impl TheGridApp {
                         self.refresh_index_stats();
 
                         // Phase 4: Trigger embedding generation for the changes
-                        if !self.semantic_loading && self.is_ai_node {
+                        if !self.semantic_loading && self.runtime.is_ai_node {
                             self.spawn_embedding_worker();
                         }
                     }
@@ -1098,11 +735,22 @@ impl TheGridApp {
                 }
 
                 // ── Phase 3: Telemetry ────────────────────────────────────────
-                AppEvent::TelemetryUpdate { device_id, telemetry } => {
+                AppEvent::TelemetryUpdate { device_id, ip, telemetry } => {
                     // Mark local telemetry as no longer pending
                     if device_id == self.config.device_name {
                         self.local_telemetry_pending = false;
                     }
+
+                    // Synchronize the runtime's remote AI map
+                    if let Some(ip_addr) = ip {
+                        let mut nodes = self.runtime.remote_ai_nodes.lock().unwrap();
+                        if telemetry.is_ai_capable {
+                            nodes.insert(device_id.clone(), ip_addr);
+                        } else {
+                            nodes.remove(&device_id);
+                        }
+                    }
+
                     self.telemetry_cache.insert(device_id, telemetry);
                 }
 
@@ -1339,13 +987,17 @@ impl TheGridApp {
                     ui.label(RichText::new("TAILSCALE").color(Colors::TEXT_MUTED).size(9.0));
                     ui.label(RichText::new("|").color(Colors::BORDER).size(9.0));
                     ui.label(RichText::new(format!("AGENT :{}", self.config.agent_port)).color(Colors::TEXT_MUTED).size(9.0));
-                    if self.file_watcher.is_some() {
-                        ui.label(RichText::new("|").color(Colors::BORDER).size(9.0));
-                        ui.label(
-                            RichText::new(format!("WATCHING {}", self.watch_paths.len()))
-                                .color(if self.watch_paths.is_empty() { Colors::TEXT_MUTED } else { Colors::GREEN })
-                                .size(9.0)
-                        );
+                    {
+                        let watcher = self.runtime.file_watcher.lock().unwrap();
+                        let cfg = self.runtime.config.lock().unwrap();
+                        if watcher.is_some() {
+                            ui.label(RichText::new("|").color(Colors::BORDER).size(9.0));
+                            ui.label(
+                                RichText::new(format!("WATCHING {}", cfg.watch_paths.len()))
+                                    .color(if cfg.watch_paths.is_empty() { Colors::TEXT_MUTED } else { Colors::GREEN })
+                                    .size(9.0)
+                            );
+                        }
                     }
                     ui.label(RichText::new("|").color(Colors::BORDER).size(9.0));
                     ui.label(
@@ -1551,11 +1203,8 @@ impl TheGridApp {
     }
 
     fn spawn_launch_scrcpy(&self, ip: String) {
-        std::thread::spawn(move || {
-            let _ = std::process::Command::new("scrcpy")
-                .arg(format!("--tcpip={}", ip))
-                .spawn();
-        });
+        let api_key = self.config.api_key.clone();
+        let _ = self.event_tx.send(AppEvent::EnableAdb { ip, api_key });
     }
 }
 
@@ -1734,7 +1383,7 @@ impl eframe::App for TheGridApp {
                             let queue_snap   = self.file_queue.clone();
                             let remote_snap  = self.remote_files.clone();
                             let log_snap     = self.transfer_log.clone();
-                            let watch_snap   = self.watch_paths.clone();
+                            let watch_snap   = self.runtime.config.lock().unwrap().watch_paths.clone();
                             let telem_snap   = telemetry_snap.get(&device.id).cloned();
 
                             let mut detail = DetailState {
@@ -1793,8 +1442,9 @@ impl eframe::App for TheGridApp {
                             self.push_toast(Toast::ok("Settings saved"));
                             self.rdp_username = new_config.rdp_username.clone();
 
-                            // Live update watcher
-                            if let Some(fw) = &mut self.file_watcher {
+                             // Live update watcher
+                            let mut watcher_lock = self.runtime.file_watcher.lock().unwrap();
+                            if let Some(fw) = &mut *watcher_lock {
                                 // 1. Remove paths no longer in config
                                 for old_path in &self.config.watch_paths {
                                     if !new_config.watch_paths.contains(old_path) {
@@ -1808,9 +1458,11 @@ impl eframe::App for TheGridApp {
                                     }
                                 }
                             }
+                            drop(watcher_lock);
                             
-                            self.config      = new_config;
-                            self.watch_paths = self.config.watch_paths.clone();
+                            self.config = new_config.clone();
+                            // Keep runtime config in sync
+                            *self.runtime.config.lock().unwrap() = new_config;
                             self.spawn_load_devices();
                         }
                         Err(e) => self.push_toast(Toast::err(format!("Save failed: {}", e))),

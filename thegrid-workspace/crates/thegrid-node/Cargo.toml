@@ -5,8 +5,9 @@ edition = "2021"
 description = "Headless node for The Grid network"
 
 [dependencies]
-thegrid-core = { path = "../thegrid-core" }
-thegrid-net  = { path = "../thegrid-net" }
+thegrid-core    = { path = "../thegrid-core" }
+thegrid-net     = { path = "../thegrid-net" }
+thegrid-runtime = { path = "../thegrid-runtime" }
 
 # Shared dependencies from workspace
 serde      = { workspace = true }
