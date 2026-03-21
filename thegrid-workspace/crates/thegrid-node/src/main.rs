@@ -26,7 +26,7 @@ fn main() -> Result<()> {
         config.device_name = name;
     }
 
-    // Support simple CLI arguments: --api-key <key> --device-name <name>
+    // Support simple CLI arguments: --api-key <key> --device-name <name> --port <port>
     let args: Vec<String> = std::env::args().collect();
     for i in 0..args.len() {
         if args[i] == "--api-key" && i + 1 < args.len() {
@@ -34,6 +34,11 @@ fn main() -> Result<()> {
         }
         if args[i] == "--device-name" && i + 1 < args.len() {
             config.device_name = args[i+1].clone();
+        }
+        if (args[i] == "--port" || args[i] == "--agent-port") && i + 1 < args.len() {
+            if let Ok(p) = args[i+1].parse::<u16>() {
+                config.agent_port = p;
+            }
         }
     }
 
