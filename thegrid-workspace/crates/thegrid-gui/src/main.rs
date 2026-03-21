@@ -10,7 +10,7 @@
 //   RUST_LOG=debug cargo run -p thegrid-gui
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 // ↑ On release builds, suppress the console window on Windows.
 //   Remove this attribute during development so you can see RUST_LOG output.
 

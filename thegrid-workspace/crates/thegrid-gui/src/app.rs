@@ -811,21 +811,33 @@ impl TheGridApp {
                                         .output();
                                     
                                     match output {
-                                        Ok(out) if out.status.success() => {
-                                            let msg = String::from_utf8_lossy(&out.stdout);
-                                            log::info!("ADB connected: {}", msg.trim());
-                                            let _ = tx.send(AppEvent::Status(format!("Connected to {}", ip)));
-                                            
-                                            std::thread::sleep(std::time::Duration::from_millis(500));
-                                            
-                                            log::info!("Launching scrcpy...");
-                                            let _ = std::process::Command::new("scrcpy")
-                                                .arg("--tcpip").arg(&addr)
-                                                .spawn();
-                                        }
                                         Ok(out) => {
-                                            let err = String::from_utf8_lossy(&out.stderr);
-                                            let _ = tx.send(AppEvent::Status(format!("ADB connect failed: {}", err.trim())));
+                                            let stdout = String::from_utf8_lossy(&out.stdout);
+                                            let stderr = String::from_utf8_lossy(&out.stderr);
+                                            let combined = format!("{}{}", stdout, stderr);
+
+                                            if combined.contains("connected to") {
+                                                log::info!("ADB connected: {}", stdout.trim());
+                                                let _ = tx.send(AppEvent::Status(format!("Connected to {}", ip)));
+                                                
+                                                std::thread::sleep(std::time::Duration::from_millis(1000));
+                                                
+                                                log::info!("Launching scrcpy...");
+                                                let _ = std::process::Command::new("scrcpy")
+                                                    .arg(format!("--tcpip={}", ip))
+                                                    .spawn();
+                                            } else {
+                                                log::error!("ADB connect failed: {}", combined.trim());
+                                                let _ = tx.send(AppEvent::Status(format!("Conn Fail: {}", combined.trim())));
+                                                
+                                                // If we fail to connect, maybe scrcpy can auto-handle it if we just pass the IP?
+                                                // Actually, scrcpy --tcpip=... will try to connect itself.
+                                                // Let's try that as a fallback.
+                                                log::info!("Attempting scrcpy auto-connect...");
+                                                let _ = std::process::Command::new("scrcpy")
+                                                    .arg(format!("--tcpip={}", ip))
+                                                    .spawn();
+                                            }
                                         }
                                         Err(e) => {
                                             let _ = tx.send(AppEvent::Status(format!("Could not execute adb: {}", e)));
