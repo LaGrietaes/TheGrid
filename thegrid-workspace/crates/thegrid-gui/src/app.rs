@@ -44,6 +44,7 @@ use crate::views::dashboard::{
 use crate::views::search::SearchPanelState;
 use crate::views::setup::SetupState;
 use crate::views::timeline::TimelineState;
+use crate::views::terminal::TerminalView;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // mpsc convenience alias
@@ -170,6 +171,9 @@ pub struct TheGridApp {
 
     /// New in Node Enhancement: tracks the model name being typed in the UI
     remote_model_edit: String,
+
+    /// New in Node Enhancement: tracks active terminal sessions
+    terminal_sessions: HashMap<String, TerminalView>,
 }
 
 impl TheGridApp {
@@ -288,6 +292,7 @@ impl TheGridApp {
             local_hostname,
             current_remote_path: PathBuf::new(),
             remote_model_edit: String::new(),
+            terminal_sessions: HashMap::new(),
         };
         
         // --- Detect and Start AI ---
@@ -597,7 +602,7 @@ impl TheGridApp {
         std::thread::spawn(move || {
             match thegrid_ai::FastEmbedProvider::new() {
                 Ok(provider) => {
-                    let provider = Arc::new(provider);
+                    let provider: Arc<dyn thegrid_ai::EmbeddingProvider> = Arc::new(provider);
                     match thegrid_ai::SemanticSearch::new(provider) {
                         Ok(mut search) => {
                             // Pre-load all existing embeddings from DB into the USearch index
@@ -953,15 +958,27 @@ impl TheGridApp {
                     self.transfer_log.push(TransferLogEntry::err(format!("✗ {}", error)));
                     self.push_toast(Toast::err(format!("Send failed: {}", error)));
                 }
-                AppEvent::FileDownloaded { name, path: _ } => {
-                    self.transfer_log.push(TransferLogEntry::ok(format!("⬇ Downloaded: {}", name)));
-                    self.push_toast(Toast::ok(format!("Downloaded: {}", name)));
-                }
                 AppEvent::FileDownloadFailed { name, error } => {
                     self.transfer_log.push(TransferLogEntry::err(
                         format!("✗ {}: {}", name, error)
                     ));
                     self.push_toast(Toast::err(format!("Download failed: {}", name)));
+                }
+
+                // ── Remote Terminal ───────────────────────────────────────────
+                AppEvent::RemoteTerminalCreated { device_id, session_id } => {
+                    self.terminal_sessions.insert(device_id.clone(), TerminalView::new());
+                    self.push_toast(Toast::ok("Terminal session established"));
+                    // Start polling for output
+                    self.spawn_poll_terminal_output(device_id, session_id);
+                }
+                AppEvent::RemoteTerminalFailed { device_id: _, error } => {
+                    self.push_toast(Toast::err(format!("Terminal failed: {}", error)));
+                }
+                AppEvent::RemoteTerminalOutput { device_id, data } => {
+                    if let Some(view) = self.terminal_sessions.get_mut(&device_id) {
+                        view.push_output(&data);
+                    }
                 }
 
                 // ── Clipboard ─────────────────────────────────────────────────
@@ -1117,6 +1134,7 @@ impl TheGridApp {
                 }
                 AppEvent::RequestRefresh => { self.spawn_load_devices(); }
                 AppEvent::OpenSettings   => { self.settings.open = true; }
+                _ => {}
             }
         }
     }
@@ -1413,6 +1431,14 @@ impl TheGridApp {
             self.spawn_update_remote_config(ip.to_string(), device_id.to_string(), model, url);
         }
 
+        if actions.create_terminal {
+            self.spawn_create_terminal_session(ip.to_string(), device_id.to_string());
+        }
+
+        if actions.launch_scrcpy {
+            self.spawn_launch_scrcpy(ip.to_string());
+        }
+
         if actions.open_inbox {
             let dir = self.config.effective_transfers_dir();
             let _ = std::fs::create_dir_all(&dir);
@@ -1423,24 +1449,79 @@ impl TheGridApp {
 
         if actions.add_watch_path { self.add_watch_directory(); }
 
-        // Phase 3 actions
         if actions.fetch_telemetry {
             self.spawn_get_telemetry(ip.to_string(), device_id.to_string());
         }
 
         if actions.wake_device {
-            // For now, prompt the user for the MAC address.
-            // Phase 4: persist MAC addresses in the known_devices SQLite table.
-            let mac = rfd::FileDialog::new(); // placeholder — MAC input needs a text dialog
-            // TODO: replace with a proper input dialog
-            // For now use a known-format prompt via the status bar
             self.push_toast(Toast::info("WoL: enter MAC in settings (feature coming in Phase 4)"));
-            let _ = mac; // suppress warning
         }
 
         if actions.load_timeline {
             self.spawn_load_timeline();
         }
+    }
+
+    // ── Remote Terminal Spawners ─────────────────────────────────────────────
+
+    fn spawn_create_terminal_session(&mut self, ip: String, device_id: String) {
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, 3030, api_key) {
+                Ok(client) => match client.create_terminal_session() {
+                    Ok(session_id) => {
+                        let _ = tx.send(AppEvent::RemoteTerminalCreated { device_id, session_id });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::RemoteTerminalFailed { device_id, error: e.to_string() });
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(AppEvent::RemoteTerminalFailed { device_id, error: e.to_string() });
+                }
+            }
+        });
+    }
+
+    fn spawn_poll_terminal_output(&self, device_id: String, session_id: String) {
+        let ip = self.devices.iter().find(|d| d.id == device_id).and_then(|d| d.primary_ip().map(|s| s.to_string()));
+        let Some(ip) = ip else { return; };
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            if let Ok(client) = AgentClient::new(&ip, 3030, api_key) {
+                loop {
+                    match client.get_terminal_output(&session_id) {
+                        Ok(data) => {
+                            if !data.is_empty() {
+                                let _ = tx.send(AppEvent::RemoteTerminalOutput { device_id: device_id.clone(), data });
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        });
+    }
+
+    fn spawn_send_terminal_input(&self, ip: String, session_id: String, data: Vec<u8>) {
+        let api_key = self.config.api_key.clone();
+        std::thread::spawn(move || {
+            if let Ok(client) = AgentClient::new(&ip, 3030, api_key) {
+                let _ = client.send_terminal_input(&session_id, &data);
+            }
+        });
+    }
+
+    fn spawn_launch_scrcpy(&self, ip: String) {
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("scrcpy")
+                .arg(format!("--tcpip={}", ip))
+                .spawn();
+        });
     }
 }
 
@@ -1637,6 +1718,7 @@ impl eframe::App for TheGridApp {
                                 telemetry:      telem_snap.as_ref(),
                                 current_remote_path: &mut self.current_remote_path,
                                 remote_model_edit: &mut self.remote_model_edit,
+                                terminal_view: self.terminal_sessions.get_mut(&device.id),
                             };
 
                             // Pass timeline state into the render

@@ -11,3 +11,4 @@ pub mod setup;
 pub mod dashboard;
 pub mod search;
 pub mod timeline;
+pub mod terminal;

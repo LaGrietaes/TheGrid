@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-// use std::process::Command;
+use std::process::Command;
 
 /// Resolution preset for RDP sessions.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,9 +35,10 @@ pub struct RdpLauncher;
 impl RdpLauncher {
     /// Launch mstsc.exe pointing at `ip`, optionally with credentials and
     /// resolution.
-    pub fn launch(_ip: &str, _username: Option<&str>, _resolution: &RdpResolution) -> Result<()> {
+    pub fn launch(ip: &str, username: Option<&str>, resolution: &RdpResolution) -> Result<()> {
         #[cfg(not(target_os = "windows"))]
         {
+            let _ = (ip, username, resolution);
             bail!(
                 "RDP launch requires Windows (mstsc.exe). \
                  On Linux/macOS consider xfreerdp or Remmina — Phase 3 TODO."

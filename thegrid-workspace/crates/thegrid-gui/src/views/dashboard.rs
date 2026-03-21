@@ -29,6 +29,8 @@ pub enum DashTab {
     Clipboard,
     /// Phase 3: The Flow — temporal file activity view
     Timeline,
+    /// New in Node Enhancement: Remote Terminal
+    Terminal,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,7 +55,10 @@ pub struct DetailState<'a> {
     /// New in Node Enhancement: tracks the current directory being browsed
     pub current_remote_path: &'a mut std::path::PathBuf,
     /// New in Node Enhancement: tracks the model name being typed in the UI
+    /// New in Node Enhancement: tracks the model name being typed in the UI
     pub remote_model_edit: &'a mut String,
+    /// New in Node Enhancement: the terminal view object
+    pub terminal_view:      Option<&'a mut crate::views::terminal::TerminalView>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +90,10 @@ pub struct DetailActions {
     pub download_remote_file: Option<std::path::PathBuf>,
     /// New in Node Enhancement: update remote AI model config (model, url)
     pub update_remote_config: Option<(Option<String>, Option<String>)>,
+    /// New in Node Enhancement: terminal actions
+    pub create_terminal:      bool,
+    pub send_terminal_input:  Option<Vec<u8>>,
+    pub launch_scrcpy:        bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -376,6 +385,7 @@ pub fn render_detail_panel(ui: &mut Ui, s: &mut DetailState) -> DetailActions {
                             // Minimal placeholder for the non-timeline version of the dashboard
                             ui.label("Timeline is not available in this view configuration.");
                         }
+                        DashTab::Terminal  => render_terminal_tab(ui, s, &mut actions),
                     }
                 });
             ui.add_space(16.0);
@@ -403,6 +413,16 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
             actions.ping = true;
         }
     });
+
+    if s.is_tg_agent {
+        ui.add_space(8.0);
+        ui.columns(3, |cols| {
+            if action_card(&mut cols[0], theme::IconType::Desktop, "SCREEN MIRROR", "Launch Scrcpy (ADB over IP)") {
+                actions.launch_scrcpy = true;
+            }
+            // Future slots
+        });
+    }
 
     ui.add_space(20.0);
     ui.add(egui::Separator::default().spacing(0.0));
@@ -540,6 +560,29 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
         if theme::secondary_button(ui, "UPDATE REMOTE CONFIG").clicked() {
             actions.update_remote_config = Some((Some(s.remote_model_edit.clone()), None));
         }
+    }
+}
+
+fn render_terminal_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    if let Some(terminal) = s.terminal_view.as_deref_mut() {
+        // If the terminal doesn't have a session, show a "Create" button
+        if terminal.session_id.is_none() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(RichText::new("TERMINAL SESSION NOT ACTIVE").color(Colors::TEXT_DIM).size(10.0));
+                ui.add_space(12.0);
+                if theme::primary_button(ui, "SPAWN REMOTE SHELL").clicked() {
+                    actions.create_terminal = true;
+                }
+            });
+        } else {
+            // Render the terminal view and capture input
+            if let Some(input) = terminal.ui(ui) {
+                actions.send_terminal_input = Some(input.into_bytes());
+            }
+        }
+    } else {
+        ui.label(RichText::new("TERMINAL INITIALIZING...").color(Colors::TEXT_DIM));
     }
 }
 
@@ -1281,7 +1324,9 @@ pub fn render_detail_panel_with_timeline(
             ("FILES",     DashTab::Files),
             ("CLIPBOARD", DashTab::Clipboard),
             ("TIMELINE",  DashTab::Timeline),
+            ("TERMINAL",  DashTab::Terminal),
         ] {
+            if tab_variant == DashTab::Terminal && !s.is_tg_agent { continue; }
             let is_active = *s.active_tab == tab_variant;
             let color = if is_active { Colors::GREEN } else { Colors::TEXT_DIM };
             let resp = ui.add(
@@ -1328,6 +1373,7 @@ pub fn render_detail_panel_with_timeline(
                                 // For now just show a toast — Phase 4 can deep-link to the file
                             }
                         }
+                        DashTab::Terminal  => render_terminal_tab(ui, s, &mut actions),
                     }
                 });
             ui.add_space(16.0);

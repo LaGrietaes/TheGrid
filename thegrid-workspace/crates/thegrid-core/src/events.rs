@@ -49,6 +49,25 @@ pub enum AppEvent {
         error:     String,
     },
 
+    // ── Remote Terminal ────────────────────────────────────────────────────
+    /// Terminal session created
+    RemoteTerminalCreated {
+        device_id:  String,
+        session_id: String,
+    },
+
+    /// Terminal session creation failed
+    RemoteTerminalFailed {
+        device_id: String,
+        error:     String,
+    },
+
+    /// Incoming terminal output
+    RemoteTerminalOutput {
+        device_id: String,
+        data:      Vec<u8>,
+    },
+
     // ── File Transfer ──────────────────────────────────────────────────────
     /// A file was sent successfully (queue index, file name)
     FileSent { queue_idx: usize, name: String },

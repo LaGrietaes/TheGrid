@@ -64,7 +64,7 @@ fn configure_fonts(ctx: &Context) {
     //   fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "JetBrainsMono".to_owned());
     //   ctx.set_fonts(fonts);
 
-    let mut fonts = egui::FontDefinitions::default();
+    let fonts = egui::FontDefinitions::default();
     
     // Use default egui fonts (Hack for Monospace, Proportional for others)
     // We don't need explicit fallbacks now that we use Vector graphics for all symbols.
