@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params, OptionalExtension};
+use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::models::{FileSearchResult, TemporalEntry, TemporalEventKind};

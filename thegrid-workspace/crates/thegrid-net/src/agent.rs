@@ -328,7 +328,7 @@ impl AgentServer {
         }
         #[cfg(not(windows))]
         {
-            self.list_any_dir(Path::new("/"))
+            AgentServer::list_any_dir(Path::new("/"))
         }
     }
 
