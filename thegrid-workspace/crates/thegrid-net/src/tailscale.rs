@@ -16,6 +16,15 @@ pub struct TailscaleClient {
 
 impl TailscaleClient {
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
+        let mut key: String = api_key.into();
+        key = key.trim().to_string();
+        
+        // Ensure standard lowercase prefix if it matches
+        if key.to_lowercase().starts_with("tskey-api-") {
+            let suffix = &key[10..];
+            key = format!("tskey-api-{}", suffix);
+        }
+
         let http = Client::builder()
             .user_agent(concat!("THEGRID/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(10))
@@ -23,7 +32,7 @@ impl TailscaleClient {
             .context("Building HTTP client")?;
         Ok(Self { 
             http, 
-            api_key: api_key.into(),
+            api_key: key,
             cache: Arc::new(Mutex::new(None)),
         })
     }
@@ -55,6 +64,7 @@ impl TailscaleClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
+            log::error!("Tailscale API Error {}: {}", status, body);
             return self.stale_fallback(anyhow::anyhow!(
                 "Tailscale API returned {}: {}",
                 status,
