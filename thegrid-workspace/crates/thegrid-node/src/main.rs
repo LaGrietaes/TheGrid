@@ -95,10 +95,23 @@ fn main() -> Result<()> {
                 }
                 AppEvent::EnableAdb { .. } => {
                     log::info!("Enabling ADB over TCP/IP (port 5555)...");
-                    let _ = std::process::Command::new("adb")
+                    match std::process::Command::new("adb")
                         .arg("tcpip")
                         .arg("5555")
-                        .spawn();
+                        .output() 
+                    {
+                        Ok(output) => {
+                            if output.status.success() {
+                                log::info!("ADB daemon restarted on port 5555.");
+                            } else {
+                                let err = String::from_utf8_lossy(&output.stderr);
+                                log::error!("ADB enable failed: {}. Is ADB installed via 'pkg install android-tools'?", err);
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to execute 'adb': {}. Ensure android-tools are installed.", e);
+                        }
+                    }
                 }
                 _ => {
                     // Ignore GUI events

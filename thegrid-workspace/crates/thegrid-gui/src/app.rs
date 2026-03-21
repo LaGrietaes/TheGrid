@@ -794,14 +794,21 @@ impl TheGridApp {
                             .send() 
                         {
                             Ok(resp) => {
-                                if resp.status().is_success() {
-                                    log::info!("ADB enabled on remote node {}. Waiting for daemon...", ip);
+                                    log::info!("ADB enabled on remote node {}. Connecting...", ip);
                                     // Give adbd a moment to restart on port 5555
-                                    std::thread::sleep(std::time::Duration::from_millis(2000)); // Increased to 2s
+                                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                                    
+                                    // Explicitly run 'adb connect' first to handle authorization and status
+                                    let _ = std::process::Command::new("adb")
+                                        .arg("connect")
+                                        .arg(format!("{}:5555", ip))
+                                        .output(); // Wait for it to finish
+                                    
+                                    std::thread::sleep(std::time::Duration::from_millis(500));
                                     
                                     log::info!("Launching scrcpy for {}...", ip);
                                     let _ = std::process::Command::new("scrcpy")
-                                        .arg("--tcpip").arg(format!("{}:5555", ip)) // Use full address
+                                        .arg("--tcpip").arg(format!("{}:5555", ip))
                                         .spawn();
                                 } else {
                                     let msg = format!("ADB enable failed ({}). Ensure 'android-tools' is installed on node.", resp.status());
