@@ -25,6 +25,30 @@ pub enum AppEvent {
     /// Remote file list fetch failed
     RemoteFilesFailed(String),
 
+    /// A directory list was fetched from a remote node
+    RemoteBrowseLoaded {
+        device_id: String,
+        path:      PathBuf,
+        files:     Vec<RemoteFile>,
+    },
+
+    /// A remote directory browse failed
+    RemoteBrowseFailed {
+        device_id: String,
+        error:     String,
+    },
+
+    /// Remote configuration was updated successfully
+    RemoteConfigUpdated {
+        device_id: String,
+    },
+
+    /// Remote configuration update failed
+    RemoteConfigFailed {
+        device_id: String,
+        error:     String,
+    },
+
     // ── File Transfer ──────────────────────────────────────────────────────
     /// A file was sent successfully (queue index, file name)
     FileSent { queue_idx: usize, name: String },

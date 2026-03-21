@@ -71,7 +71,8 @@ fn main() -> Result<()> {
         config.agent_port,
         config.api_key.clone(),
         transfers_dir.clone(),
-        tx.clone()
+        tx.clone(),
+        config.clone()
     );
 
     // If we have an API key, enable Tailscale trust bypass

@@ -3,7 +3,7 @@ use reqwest::blocking::Client;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use tiny_http::{Server, Response, Request};
-use thegrid_core::{AppEvent, models::*};
+use thegrid_core::{AppEvent, models::*, Config};
 use ascii::AsciiStr;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,6 +17,7 @@ pub struct AgentServer {
     transfers_dir: PathBuf,
     event_tx: mpsc::Sender<AppEvent>,
     ts_client: Option<Arc<TailscaleClient>>,
+    config: Config,
 }
 
 impl AgentServer {
@@ -25,6 +26,7 @@ impl AgentServer {
         api_key: String,
         transfers_dir: PathBuf,
         event_tx: mpsc::Sender<AppEvent>,
+        config: Config,
     ) -> Self {
         Self { 
             port, 
@@ -32,6 +34,7 @@ impl AgentServer {
             transfers_dir, 
             event_tx,
             ts_client: None,
+            config,
         }
     }
 
@@ -124,7 +127,7 @@ impl AgentServer {
         }
 
         if method == "GET" && url == "/telemetry" {
-            let telemetry = collect_telemetry();
+            let telemetry = collect_telemetry(&self.config);
             let json = serde_json::to_string(&telemetry).unwrap_or_default();
             req.respond(Response::from_string(json)
                 .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
@@ -215,8 +218,118 @@ impl AgentServer {
             return Ok(());
         }
 
+        // ── NEW: Remote File Browsing ──
+        if method == "GET" && url.starts_with("/v1/browse") {
+            if !self.config.enable_file_access {
+                req.respond(Response::from_string(r#"{"error":"file access disabled"}"#).with_status_code(403))?;
+                return Ok(());
+            }
+            let path_str = url.split("path=").nth(1).unwrap_or("");
+            let path_str = urlencoding_decode(path_str);
+            let path = PathBuf::from(path_str);
+
+            let files = if path.as_os_str().is_empty() {
+                // List drives on Windows, or root on Linux if empty path
+                AgentServer::list_root_dir()
+            } else {
+                AgentServer::list_any_dir(&path)
+            };
+
+            let json = serde_json::to_string(&files)?;
+            req.respond(Response::from_string(json)
+                .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            )?;
+            return Ok(());
+        }
+
+        if method == "GET" && url.starts_with("/v1/read") {
+            if !self.config.enable_file_access {
+                req.respond(Response::from_string(r#"{"error":"file access disabled"}"#).with_status_code(403))?;
+                return Ok(());
+            }
+            let path_str = url.split("path=").nth(1).unwrap_or("");
+            let path_str = urlencoding_decode(path_str);
+            let path = PathBuf::from(path_str);
+
+            if path.exists() && path.is_file() {
+                let data = std::fs::read(&path)?;
+                req.respond(Response::from_data(data))?;
+            } else {
+                req.respond(Response::from_string("Not found").with_status_code(404))?;
+            }
+            return Ok(());
+        }
+
+        // ── NEW: Remote Config Update ──
+        if method == "POST" && url == "/v1/config" {
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body)?;
+
+            #[derive(serde::Deserialize)]
+            struct ConfigUpdate {
+                ai_model: Option<String>,
+                ai_provider_url: Option<String>,
+            }
+
+            if let Ok(update) = serde_json::from_str::<ConfigUpdate>(&body) {
+                let mut cfg = self.config.clone();
+                if update.ai_model.is_some() { cfg.ai_model = update.ai_model; }
+                if update.ai_provider_url.is_some() { cfg.ai_provider_url = update.ai_provider_url; }
+                
+                if let Err(e) = cfg.save() {
+                    log::error!("Failed to save remote config update: {}", e);
+                    req.respond(Response::from_string(format!(r#"{{"error":"{}"}}"#, e)).with_status_code(500))?;
+                } else {
+                    req.respond(Response::from_string(r#"{"ok":true}"#)
+                        .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                    )?;
+                }
+            } else {
+                req.respond(Response::from_string(r#"{"error":"invalid json"}"#).with_status_code(400))?;
+            }
+            return Ok(());
+        }
+
         req.respond(Response::from_string("Not found").with_status_code(404))?;
         Ok(())
+    }
+
+    pub fn list_any_dir(path: &Path) -> Vec<RemoteFile> {
+        std::fs::read_dir(path).map(|entries| {
+            entries.filter_map(|e| {
+                let e = e.ok()?;
+                let meta = e.metadata().ok()?;
+                Some(RemoteFile {
+                    name: e.file_name().to_string_lossy().to_string(),
+                    size: meta.len(),
+                    modified: meta.modified().ok().map(|t| chrono::DateTime::from(t)),
+                    is_dir: meta.is_dir(),
+                })
+            }).collect()
+        }).unwrap_or_default()
+    }
+
+    pub fn list_root_dir() -> Vec<RemoteFile> {
+        #[cfg(windows)]
+        {
+            let mut drives = Vec::new();
+            for drive_letter in b'A'..=b'Z' {
+                let path = format!("{}:\\", drive_letter as char);
+                if Path::new(&path).exists() {
+                    drives.push(RemoteFile {
+                        name: path,
+                        size: 0,
+                        modified: None,
+                        is_dir: true,
+                    });
+                }
+            }
+            drives
+        }
+        #[cfg(not(windows))]
+        {
+            self.list_any_dir(Path::new("/"))
+        }
     }
 
     fn list_transfer_files(&self) -> Vec<RemoteFile> {
@@ -229,6 +342,7 @@ impl AgentServer {
                     name: e.file_name().to_string_lossy().to_string(),
                     size: meta.len(),
                     modified: meta.modified().ok().map(|t| chrono::DateTime::from(t)),
+                    is_dir: meta.is_dir(),
                 })
             }).collect()
         }).unwrap_or_default()
@@ -306,10 +420,97 @@ impl AgentClient {
             Err(anyhow::anyhow!("Sync failed: {}", resp.status()))
         }
     }
+
+    pub fn browse_directory(&self, path: &Path) -> Result<Vec<RemoteFile>> {
+        let path_str = urlencoding_encode(&path.to_string_lossy());
+        let url = format!("{}/v1/browse?path={}", self.base_url, path_str);
+        let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).send().context("Browsing remote directory")?;
+        if resp.status().is_success() {
+            resp.json().context("Parsing browse JSON")
+        } else {
+            Err(anyhow::anyhow!("Browse failed: {}", resp.status()))
+        }
+    }
+
+    pub fn download_remote_file(&self, path: &Path, dest: &Path) -> Result<PathBuf> {
+        let filename = path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid path"))?.to_string_lossy();
+        let path_str = urlencoding_encode(&path.to_string_lossy());
+        let url = format!("{}/v1/read?path={}", self.base_url, path_str);
+        let bytes = self.http.get(&url).header("X-Grid-Key", &self.api_key).send()?.bytes().context("Reading remote file bytes")?;
+        
+        let dest_file = dest.join(&*filename);
+        std::fs::write(&dest_file, &bytes)?;
+        Ok(dest_file)
+    }
+
+    pub fn update_config(&self, model: Option<String>, url: Option<String>) -> Result<()> {
+        let endpoint = format!("{}/v1/config", self.base_url);
+        let body = serde_json::json!({
+            "ai_model": model,
+            "ai_provider_url": url,
+        });
+        let resp = self.http.post(&endpoint)
+            .header("X-Grid-Key", &self.api_key)
+            .json(&body)
+            .send()
+            .context("Sending config update")?;
+        
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let err_body = resp.text().unwrap_or_else(|_| "Unknown error".to_string());
+            Err(anyhow::anyhow!("Config update failed: {}", err_body))
+        }
+    }
 }
 
-fn collect_telemetry() -> NodeTelemetry {
-    NodeTelemetry::default()
+fn collect_telemetry(config: &Config) -> NodeTelemetry {
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_all();
+    
+    let cpu_pct = sys.global_cpu_info().cpu_usage();
+    let ram_used = sys.used_memory();
+    let ram_total = sys.total_memory();
+    
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    let mut disk_used = 0;
+    let mut disk_total = 0;
+    let mut drive_names = Vec::new();
+    
+    for disk in &disks {
+        disk_used += disk.total_space() - disk.available_space();
+        disk_total += disk.total_space();
+        drive_names.push(disk.name().to_string_lossy().into_owned());
+    }
+
+    let mut ai_models = Vec::new();
+    if let Some(m) = &config.ai_model {
+        if !m.is_empty() {
+            ai_models.push(m.clone());
+        }
+    }
+
+    let capabilities = DeviceCapabilities {
+        ai_models,
+        has_camera: true,        // Stubbed for now as agreed
+        has_microphone: true,    // Stubbed for now as agreed
+        has_speakers: true,      // Stubbed for now as agreed
+        drives: drive_names,
+        has_rdp: config.enable_rdp,
+        has_file_access: config.enable_file_access,
+    };
+
+    NodeTelemetry {
+        device_type: config.device_type.clone(),
+        cpu_pct,
+        ram_used,
+        ram_total,
+        disk_used,
+        disk_total,
+        cpu_temp: None,
+        is_ai_capable: !capabilities.ai_models.is_empty(),
+        capabilities,
+    }
 }
 
 fn urlencoding_decode(s: &str) -> String {
@@ -337,4 +538,39 @@ fn urlencoding_encode(s: &str) -> String {
             format!("%{:02X}", c as u32)
         }
     }).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_url_encoding_roundtrip() {
+        let original = "C:\\Program Files\\My App/Data";
+        let encoded = urlencoding_encode(original);
+        assert!(encoded.contains("%5C"));
+        let decoded = urlencoding_decode(&encoded);
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_list_any_dir() {
+        let dir = tempdir().unwrap();
+        let file1 = dir.path().join("test_file.txt");
+        let sub_dir = dir.path().join("sub_dir");
+        fs::write(&file1, "hello").unwrap();
+        fs::create_dir(&sub_dir).unwrap();
+
+        let files = AgentServer::list_any_dir(dir.path());
+        assert_eq!(files.len(), 2);
+        
+        let file_entry = files.iter().find(|f| f.name == "test_file.txt").unwrap();
+        assert!(!file_entry.is_dir);
+        assert_eq!(file_entry.size, 5);
+
+        let dir_entry = files.iter().find(|f| f.name == "sub_dir").unwrap();
+        assert!(dir_entry.is_dir);
+    }
 }

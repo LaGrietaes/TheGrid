@@ -13,6 +13,10 @@ pub struct Config {
     #[serde(default)]
     pub device_name: String,
 
+    /// Device type classification (Desktop, Laptop, Tablet, Smartphone, Server, NAS, Board)
+    #[serde(default = "Config::default_device_type")]
+    pub device_type: String,
+
     /// Default Windows username for RDP sessions
     #[serde(default)]
     pub rdp_username: String,
@@ -28,6 +32,22 @@ pub struct Config {
     /// Directory where received files are saved
     #[serde(default)]
     pub transfers_dir: Option<PathBuf>,
+
+    /// Specific local AI model for this device (e.g. "llama3:8b")
+    #[serde(default)]
+    pub ai_model: Option<String>,
+
+    /// API URL for the AI provider (e.g. local Ollama server)
+    #[serde(default)]
+    pub ai_provider_url: Option<String>,
+
+    /// Enable RDP access on this node
+    #[serde(default = "Config::default_true")]
+    pub enable_rdp: bool,
+
+    /// Enable remote file access over the mesh
+    #[serde(default = "Config::default_true")]
+    pub enable_file_access: bool,
 }
 
 impl Default for Config {
@@ -35,16 +55,23 @@ impl Default for Config {
         Self {
             api_key: String::new(),
             device_name: String::new(),
+            device_type: Self::default_device_type(),
             rdp_username: String::new(),
             agent_port: Self::default_agent_port(),
             watch_paths: Vec::new(),
             transfers_dir: None,
+            ai_model: None,
+            ai_provider_url: None,
+            enable_rdp: true,
+            enable_file_access: true,
         }
     }
 }
 
 impl Config {
     fn default_agent_port() -> u16 { 47731 }
+    fn default_true() -> bool { true }
+    fn default_device_type() -> String { "Desktop".to_string() }
 
     /// Returns the path to the config file, creating the directory if needed.
     pub fn config_path() -> Result<PathBuf> {
