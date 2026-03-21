@@ -6,6 +6,7 @@ use tiny_http::{Server, Response, Request};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::io::{Read, Write};
+#[cfg(windows)]
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use thegrid_core::{AppEvent, models::*, Config};
@@ -274,27 +275,58 @@ impl AgentServer {
 
         // ── Terminal Endpoints ──
         if method == "POST" && url == "/v1/terminal/session" {
-            let pty_system = NativePtySystem::default();
-            let pty_pair = pty_system.openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            }).map_err(|e| anyhow::anyhow!("Failed to open PTY: {}", e))?;
+            let (writer, mut reader): (Box<dyn Write + Send>, Box<dyn Read + Send>) = {
+                #[cfg(windows)]
+                {
+                    let pty_system = NativePtySystem::default();
+                    let pty_pair = pty_system.openpty(PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    }).map_err(|e| anyhow::anyhow!("Failed to open PTY: {}", e))?;
 
-            #[cfg(windows)]
-            let shell = "powershell.exe";
-            #[cfg(not(windows))]
-            let shell = "bash";
+                    let cmd = CommandBuilder::new("powershell.exe");
+                    let _child = pty_pair.slave.spawn_command(cmd)
+                        .map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
 
-            let cmd = CommandBuilder::new(shell);
-            let _child = pty_pair.slave.spawn_command(cmd)
-                .map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
+                    let w = pty_pair.master.take_writer()
+                        .map_err(|e| anyhow::anyhow!("Failed to take PTY writer: {}", e))?;
+                    let r = pty_pair.master.try_clone_reader()
+                        .map_err(|e| anyhow::anyhow!("Failed to clone PTY reader: {}", e))?;
+                    (Box::new(w), Box::new(r))
+                }
 
-            let writer = pty_pair.master.take_writer()
-                .map_err(|e| anyhow::anyhow!("Failed to take PTY writer: {}", e))?;
-            let mut reader = pty_pair.master.try_clone_reader()
-                .map_err(|e| anyhow::anyhow!("Failed to clone PTY reader: {}", e))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::FromRawFd;
+                    use std::os::unix::process::CommandExt;
+
+                    let pty = nix::pty::openpty(None, None)
+                        .map_err(|e| anyhow::anyhow!("openpty failed: {}", e))?;
+                    
+                    let shell = if std::path::Path::new("/system/bin/sh").exists() { "/system/bin/sh" } else { "bash" };
+                    let mut cmd = std::process::Command::new(shell);
+                    
+                    // Connect slave to child process
+                    unsafe {
+                        let slave_fd = pty.slave;
+                        cmd.pre_exec(move || {
+                            let _ = nix::unistd::setsid();
+                            let _ = nix::unistd::dup2(slave_fd, 0);
+                            let _ = nix::unistd::dup2(slave_fd, 1);
+                            let _ = nix::unistd::dup2(slave_fd, 2);
+                            Ok(())
+                        });
+                    }
+
+                    cmd.spawn().map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
+
+                    let master_writer = unsafe { std::fs::File::from_raw_fd(pty.master) };
+                    let master_reader = unsafe { std::fs::File::from_raw_fd(nix::unistd::dup(pty.master)?) };
+                    (Box::new(master_writer), Box::new(master_reader))
+                }
+            };
 
             let output_buffer = Arc::new(Mutex::new(VecDeque::new()));
             let output_buffer_clone = Arc::clone(&output_buffer);
