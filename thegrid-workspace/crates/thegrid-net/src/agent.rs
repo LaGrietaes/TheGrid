@@ -58,6 +58,8 @@ impl AgentServer {
 
     pub fn spawn(self) {
         let port = self.port;
+        let api_key_prefix: String = self.api_key.chars().take(8).collect();
+        
         // Move self into the thread — this is why we don't need Arc<Self>
         std::thread::Builder::new()
             .name("thegrid-agent".into())
@@ -67,7 +69,11 @@ impl AgentServer {
                 }
             })
             .expect("Spawning agent thread");
-        log::info!("THE GRID agent server started on port {}", port);
+
+        log::info!("THE GRID agent server started on port {} (X-Grid-Key starts with: {}...)", 
+            port, 
+            api_key_prefix
+        );
     }
 
     fn run(&self) -> Result<()> {

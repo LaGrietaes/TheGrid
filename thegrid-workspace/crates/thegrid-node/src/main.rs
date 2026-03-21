@@ -18,7 +18,7 @@ fn main() -> Result<()> {
         Config::default()
     });
 
-    // Support environment variables for headless setup
+    // Support environment variables
     if let Ok(key) = std::env::var("THEGRID_API_KEY") {
         config.api_key = key;
     }
@@ -26,20 +26,36 @@ fn main() -> Result<()> {
         config.device_name = name;
     }
 
-    // Support simple CLI arguments: --api-key <key> --device-name <name> --port <port>
+    // Robust CLI Argument Parsing
     let args: Vec<String> = std::env::args().collect();
-    for i in 0..args.len() {
-        if args[i] == "--api-key" && i + 1 < args.len() {
-            config.api_key = args[i+1].clone();
-        }
-        if args[i] == "--device-name" && i + 1 < args.len() {
-            config.device_name = args[i+1].clone();
-        }
-        if (args[i] == "--port" || args[i] == "--agent-port") && i + 1 < args.len() {
-            if let Ok(p) = args[i+1].parse::<u16>() {
-                config.agent_port = p;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--api-key" => {
+                if i + 1 < args.len() {
+                    config.api_key = args[i + 1].trim().to_string();
+                    i += 1;
+                }
+            }
+            "--device-name" => {
+                if i + 1 < args.len() {
+                    config.device_name = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--port" | "--agent-port" => {
+                if i + 1 < args.len() {
+                    if let Ok(p) = args[i + 1].parse::<u16>() {
+                        config.agent_port = p;
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                log::warn!("Unknown argument: {}", args[i]);
             }
         }
+        i += 1;
     }
 
     if config.device_name.is_empty() {
@@ -47,6 +63,9 @@ fn main() -> Result<()> {
             .map(|h| h.to_string_lossy().to_string())
             .unwrap_or_else(|_| "UNKNOWN-NODE".to_string());
     }
+
+    log::info!("Config: device={}, port={}, key_len={}", 
+        config.device_name, config.agent_port, config.api_key.len());
 
     // 2. Initialize Runtime
     let (tx, rx) = mpsc::channel::<AppEvent>();
