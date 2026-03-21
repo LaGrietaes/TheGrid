@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# THE GRID — Rust Workspace Root
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Architecture Overview:
+#   thegrid-core  → Shared data models, config persistence, SQLite DB layer
+#   thegrid-net   → Tailscale API client, RDP launcher, P2P agent server
+#   thegrid-ai    → Semantic indexing stubs (Phase 4 — future implementation)
+#   thegrid-gui   → egui IMGUI frontend — the binary users run
+#
+# Build the app:
+#   cargo build --release -p thegrid-gui
+#
+# Dev run with logging:
+#   RUST_LOG=debug cargo run -p thegrid-gui
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[workspace]
+members = [
+    "crates/thegrid-core",
+    "crates/thegrid-net",
+    "crates/thegrid-ai",
+    "crates/thegrid-node",
+    "crates/thegrid-gui",
+]
+resolver = "2"
+
+# ── Shared dependency versions (keeps crates in sync) ─────────────────────────
+[workspace.dependencies]
+# Serialization — used by every crate for config, API responses, IPC
+serde       = { version = "1",    features = ["derive"] }
+serde_json  = "1"
+
+# Error handling — anyhow for application errors, thiserror for library errors
+anyhow      = "1"
+thiserror   = "1"
+
+# Logging facade — impl chosen by the binary (thegrid-gui uses env_logger)
+log         = "0.4"
+
+# Time
+chrono      = { version = "0.4",  features = ["serde"] }
+
+# Async runtime — used for non-blocking network in background threads
+# NOTE: We do NOT use async in the egui update() loop. All async work is
+# offloaded to spawned threads that communicate back via std::sync::mpsc.
+tokio       = { version = "1",    features = ["full"] }
+
+# HTTP client — blocking feature used in spawned threads
+reqwest     = { version = "0.12", features = ["blocking", "json"] }
