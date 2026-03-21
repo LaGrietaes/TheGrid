@@ -787,6 +787,7 @@ impl TheGridApp {
                         let client = reqwest::blocking::Client::new();
                         let url = format!("http://{}:{}/adb/enable", ip, port);
                         log::info!("Preparing remote node {} for mirroring...", ip);
+                        let _ = tx.send(AppEvent::Status(format!("Enabling ADB on {}...", ip)));
                         
                         match client.post(&url)
                             .header("X-Grid-Key", &api_key)
@@ -795,23 +796,43 @@ impl TheGridApp {
                         {
                             Ok(resp) => {
                                 if resp.status().is_success() {
-                                    log::info!("ADB enabled on remote node {}. Connecting...", ip);
-                                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                                    log::info!("ADB enabled on remote. Connecting...");
+                                    let _ = tx.send(AppEvent::Status("ADB enabled. Connecting...".to_string()));
                                     
-                                    let _ = std::process::Command::new("adb")
+                                    // Clear stale connections
+                                    let _ = std::process::Command::new("adb").arg("disconnect").output();
+                                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                                    
+                                    // Connect
+                                    let addr = format!("{}:5555", ip);
+                                    let output = std::process::Command::new("adb")
                                         .arg("connect")
-                                        .arg(format!("{}:5555", ip))
+                                        .arg(&addr)
                                         .output();
                                     
-                                    std::thread::sleep(std::time::Duration::from_millis(500));
-                                    
-                                    log::info!("Launching scrcpy for {}...", ip);
-                                    let _ = std::process::Command::new("scrcpy")
-                                        .arg("--tcpip").arg(format!("{}:5555", ip))
-                                        .spawn();
+                                    match output {
+                                        Ok(out) if out.status.success() => {
+                                            let msg = String::from_utf8_lossy(&out.stdout);
+                                            log::info!("ADB connected: {}", msg.trim());
+                                            let _ = tx.send(AppEvent::Status(format!("Connected to {}", ip)));
+                                            
+                                            std::thread::sleep(std::time::Duration::from_millis(500));
+                                            
+                                            log::info!("Launching scrcpy...");
+                                            let _ = std::process::Command::new("scrcpy")
+                                                .arg("--tcpip").arg(&addr)
+                                                .spawn();
+                                        }
+                                        Ok(out) => {
+                                            let err = String::from_utf8_lossy(&out.stderr);
+                                            let _ = tx.send(AppEvent::Status(format!("ADB connect failed: {}", err.trim())));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(AppEvent::Status(format!("Could not execute adb: {}", e)));
+                                        }
+                                    }
                                 } else {
-                                    let msg = format!("ADB enable failed ({}).", resp.status());
-                                    let _ = tx.send(AppEvent::Status(msg));
+                                    let _ = tx.send(AppEvent::Status(format!("Enable failed: {}", resp.status())));
                                 }
                             }
                             Err(e) => {

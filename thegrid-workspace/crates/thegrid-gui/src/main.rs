@@ -32,6 +32,28 @@ fn main() -> eframe::Result<()> {
         env_logger::Env::default().default_filter_or("info")
     ).init();
 
+    // Set a panic hook to log crashes to a file
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            &s[..]
+        } else {
+            "Unknown panic"
+        };
+        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let log_msg = format!("PANIC: {} at {}\n", msg, location);
+        eprintln!("{}", log_msg);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("crash.log")
+            .and_then(|mut f| {
+                use std::io::Write;
+                writeln!(f, "{}", log_msg)
+            });
+    }));
+
     log::info!("THE GRID v{} starting", env!("CARGO_PKG_VERSION"));
 
     let native_opts = eframe::NativeOptions {
