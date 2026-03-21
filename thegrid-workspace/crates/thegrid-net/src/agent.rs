@@ -299,7 +299,7 @@ impl AgentServer {
 
                 #[cfg(unix)]
                 {
-                    use std::os::unix::io::FromRawFd;
+                    use std::os::unix::io::{FromRawFd, IntoRawFd};
                     use std::os::unix::process::CommandExt;
 
                     let pty = nix::pty::openpty(None, None)
@@ -308,9 +308,11 @@ impl AgentServer {
                     let shell = if std::path::Path::new("/system/bin/sh").exists() { "/system/bin/sh" } else { "bash" };
                     let mut cmd = std::process::Command::new(shell);
                     
+                    let slave_fd = pty.slave.into_raw_fd();
+                    let master_fd = pty.master.into_raw_fd();
+
                     // Connect slave to child process
                     unsafe {
-                        let slave_fd = pty.slave;
                         cmd.pre_exec(move || {
                             let _ = nix::unistd::setsid();
                             let _ = nix::unistd::dup2(slave_fd, 0);
@@ -322,8 +324,8 @@ impl AgentServer {
 
                     cmd.spawn().map_err(|e| anyhow::anyhow!("Failed to spawn shell: {}", e))?;
 
-                    let master_writer = unsafe { std::fs::File::from_raw_fd(pty.master) };
-                    let master_reader = unsafe { std::fs::File::from_raw_fd(nix::unistd::dup(pty.master)?) };
+                    let master_writer = unsafe { std::fs::File::from_raw_fd(master_fd) };
+                    let master_reader = unsafe { std::fs::File::from_raw_fd(nix::unistd::dup(master_fd)?) };
                     (Box::new(master_writer), Box::new(master_reader))
                 }
             };
