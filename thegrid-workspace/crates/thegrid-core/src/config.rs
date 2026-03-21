@@ -53,7 +53,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api_key: "tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string(),
+            api_key: "Tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string(),
             device_name: String::new(),
             device_type: Self::default_device_type(),
             rdp_username: String::new(),
@@ -96,7 +96,7 @@ impl Config {
         
         // Fallback to hardcoded key if loaded one is empty
         if cfg.api_key.trim().is_empty() {
-            cfg.api_key = "tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string();
+            cfg.api_key = "Tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string();
         }
 
         log::info!("Config loaded from {:?}", path);
