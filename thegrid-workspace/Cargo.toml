@@ -45,3 +45,6 @@ chrono      = { version = "0.4",  features = ["serde"] }
 # NOTE: We do NOT use async in the egui update() loop. All async work is
 # offloaded to spawned threads that communicate back via std::sync::mpsc.
 tokio       = { version = "1",    features = ["full"] }
+
+# HTTP client — blocking feature used in spawned threads
+reqwest     = { version = "0.12", features = ["blocking", "json"] }

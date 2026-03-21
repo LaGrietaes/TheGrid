@@ -148,6 +148,30 @@ impl AgentServer {
             return Ok(());
         }
 
+        // ── ADB Mirroring Preparation ──
+        if method == "POST" && url == "/adb/enable" {
+            #[cfg(target_os = "linux")]
+            {
+                log::info!("Agent: attempting to enable ADB over TCP/IP 5555 (Termux)");
+                let output = std::process::Command::new("adb")
+                    .arg("tcpip").arg("5555")
+                    .output();
+                
+                let success = output.map(|o| o.status.success()).unwrap_or(false);
+                let msg = if success { "ADB 5555 enabled" } else { "Failed to enable ADB (is it installed?)" };
+                req.respond(Response::from_string(format!(r#"{{"ok":{},"message":"{}"}}"#, success, msg))
+                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                )?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                req.respond(Response::from_string(r#"{"ok":false,"message":"ADB local enabling only supported on Linux/Android nodes"}"#)
+                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                )?;
+            }
+            return Ok(());
+        }
+
         if method == "GET" && url.starts_with("/v1/sync") {
             let after: i64 = url.split("after=")
                 .nth(1)

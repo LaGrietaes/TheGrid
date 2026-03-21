@@ -21,6 +21,7 @@ serde_json    = { workspace = true }
 anyhow        = { workspace = true }
 log           = { workspace = true }
 chrono        = { workspace = true }
+reqwest       = { workspace = true }
 
 # GUI framework — eframe wraps egui with a native OS window
 # "default_fonts" includes the monospace Hack font used for brutalist aesthetic

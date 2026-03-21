@@ -184,4 +184,7 @@ pub enum AppEvent {
     // ── UI ─────────────────────────────────────────────────────────────────
     RequestRefresh,
     OpenSettings,
+
+    // ADB Mirroring Preparation
+    EnableAdb { ip: String, api_key: String },
 }

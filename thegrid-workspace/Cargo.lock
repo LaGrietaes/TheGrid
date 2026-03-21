@@ -4396,6 +4396,7 @@ dependencies = [
  "hostname 0.3.1",
  "image 0.24.9",
  "log",
+ "reqwest",
  "rfd",
  "serde",
  "serde_json",

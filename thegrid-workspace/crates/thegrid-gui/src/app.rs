@@ -1132,6 +1132,29 @@ impl TheGridApp {
                         self.set_status(msg);
                     }
                 }
+                AppEvent::EnableAdb { ip, api_key } => {
+                    let tx = self.event_tx.clone();
+                    std::thread::spawn(move || {
+                        let client = reqwest::blocking::Client::new();
+                        let url = format!("http://{}:47731/adb/enable", ip);
+                        match client.post(&url)
+                            .header("X-Api-Key", &api_key)
+                            .timeout(std::time::Duration::from_secs(5))
+                            .send() 
+                        {
+                            Ok(resp) => {
+                                if resp.status().is_success() {
+                                    log::info!("ADB enabled on remote node {}", ip);
+                                } else {
+                                    let _ = tx.send(AppEvent::Status(format!("ADB error: {}", resp.status())));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::Status(format!("ADB failed to reach node: {}", e)));
+                            }
+                        }
+                    });
+                }
                 AppEvent::RequestRefresh => { self.spawn_load_devices(); }
                 AppEvent::OpenSettings   => { self.settings.open = true; }
                 _ => {}
