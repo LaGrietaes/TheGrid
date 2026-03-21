@@ -87,7 +87,7 @@ impl AgentServer {
     fn handle_request(&self, mut req: Request) -> Result<()> {
         let method = req.method().to_string();
         let url    = req.url().to_string();
-        log::debug!("Agent {} {}", method, url);
+        log::info!("Agent {} {}", method, url);
 
         if url != "/ping" {
             let mut authorized = false;
