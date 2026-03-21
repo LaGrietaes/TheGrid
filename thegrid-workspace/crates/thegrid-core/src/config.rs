@@ -53,7 +53,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api_key: String::new(),
+            api_key: "tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string(),
             device_name: String::new(),
             device_type: Self::default_device_type(),
             rdp_username: String::new(),
@@ -91,8 +91,14 @@ impl Config {
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("Reading config from {:?}", path))?;
-        let cfg: Self = serde_json::from_str(&raw)
+        let mut cfg: Self = serde_json::from_str(&raw)
             .context("Parsing config JSON")?;
+        
+        // Fallback to hardcoded key if loaded one is empty
+        if cfg.api_key.trim().is_empty() {
+            cfg.api_key = "tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string();
+        }
+
         log::info!("Config loaded from {:?}", path);
         Ok(cfg)
     }

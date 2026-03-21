@@ -1,0 +1,60 @@
+[package]
+name        = "thegrid-gui"
+version     = "0.1.0"
+edition     = "2021"
+description = "THE GRID — Secure remote access hub (egui IMGUI binary)"
+
+# This is the executable that users run.
+[[bin]]
+name = "thegrid"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+thegrid-core = { path = "../thegrid-core" }
+thegrid-net  = { path = "../thegrid-net"  }
+thegrid-ai   = { path = "../thegrid-ai"   }
+
+# Shared workspace deps
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+anyhow        = { workspace = true }
+log           = { workspace = true }
+chrono        = { workspace = true }
+
+# GUI framework — eframe wraps egui with a native OS window
+# "default_fonts" includes the monospace Hack font used for brutalist aesthetic
+eframe        = { version = "0.27", default-features = true }
+egui          = "0.27"
+
+# Logging backend for the binary
+env_logger    = "0.11"
+
+# System info for node hardware metrics (CPU, RAM)
+sysinfo       = "0.30"
+
+# Clipboard read/write from GUI thread
+arboard       = "3"
+
+# Native file dialog (open/save)
+rfd           = "0.14"
+
+# Hostname for "this device" label
+hostname      = "0.3"
+
+# Platform config directories (%APPDATA% on Windows)
+# Used in app.rs to resolve the DB path: dirs::config_dir()/thegrid/index.db
+dirs          = "5"
+
+# Image processing (used for loading window icon)
+image         = "0.24"
+
+[profile.release]
+opt-level   = 3
+lto         = "thin"   # link-time optimization for smaller binary
+codegen-units = 1
+strip       = true     # strip debug symbols — reduces binary size ~30%
+
+[profile.dev]
+# Faster incremental builds during development
+opt-level   = 1
