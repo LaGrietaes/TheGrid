@@ -782,27 +782,26 @@ impl TheGridApp {
                 }
                 AppEvent::EnableAdb { ip, api_key } => {
                     let tx = self.event_tx.clone();
+                    let port = self.config.agent_port;
                     std::thread::spawn(move || {
                         let client = reqwest::blocking::Client::new();
-                        let url = format!("http://{}:47731/adb/enable", ip);
-                        println!("DEBUG: Sending EnableAdb request to {}", url);
+                        let url = format!("http://{}:{}/adb/enable", ip, port);
                         log::info!("Preparing remote node {} for mirroring...", ip);
                         
                         match client.post(&url)
-                            .header("X-Api-Key", &api_key)
+                            .header("X-Grid-Key", &api_key)
                             .timeout(std::time::Duration::from_secs(5))
                             .send() 
                         {
                             Ok(resp) => {
+                                if resp.status().is_success() {
                                     log::info!("ADB enabled on remote node {}. Connecting...", ip);
-                                    // Give adbd a moment to restart on port 5555
                                     std::thread::sleep(std::time::Duration::from_millis(1500));
                                     
-                                    // Explicitly run 'adb connect' first to handle authorization and status
                                     let _ = std::process::Command::new("adb")
                                         .arg("connect")
                                         .arg(format!("{}:5555", ip))
-                                        .output(); // Wait for it to finish
+                                        .output();
                                     
                                     std::thread::sleep(std::time::Duration::from_millis(500));
                                     
@@ -811,7 +810,7 @@ impl TheGridApp {
                                         .arg("--tcpip").arg(format!("{}:5555", ip))
                                         .spawn();
                                 } else {
-                                    let msg = format!("ADB enable failed ({}). Ensure 'android-tools' is installed on node.", resp.status());
+                                    let msg = format!("ADB enable failed ({}).", resp.status());
                                     let _ = tx.send(AppEvent::Status(msg));
                                 }
                             }
