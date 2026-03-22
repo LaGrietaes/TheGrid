@@ -69,7 +69,7 @@ impl Default for Config {
 }
 
 impl Config {
-    fn default_agent_port() -> u16 { 47731 }
+    fn default_agent_port() -> u16 { 5000 }
     fn default_true() -> bool { true }
     fn default_device_type() -> String { "Desktop".to_string() }
 
