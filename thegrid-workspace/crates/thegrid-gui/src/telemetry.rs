@@ -61,8 +61,32 @@ pub fn collect_local() -> NodeTelemetry {
     // AI capability: heuristic based on RAM
     let is_ai_capable = ram_total >= 8 * 1024 * 1024 * 1024; // 8 GB
 
+    // GPU info (experimental for Windows)
+    let mut gpu_name = None;
+    if cfg!(target_os = "windows") {
+        if let Ok(output) = std::process::Command::new("wmic")
+            .args(&["path", "win32_VideoController", "get", "name"])
+            .output() {
+                let s = String::from_utf8_lossy(&output.stdout);
+                let lines: Vec<&str> = s.lines().collect();
+                if lines.len() > 1 {
+                    gpu_name = Some(lines[1].trim().to_string());
+                }
+            }
+    }
+
+    // Drive details
+    let mut drive_infos = Vec::new();
+    for disk in &disks {
+        drive_infos.push(thegrid_core::models::DriveInfo {
+            name: disk.mount_point().to_string_lossy().to_string(),
+            used: disk.total_space() - disk.available_space(),
+            total: disk.total_space(),
+        });
+    }
+
     NodeTelemetry {
-        device_type: "Desktop".to_string(), // Fetched internally, GUI config owns the definitive value
+        device_type: "Desktop".to_string(), 
         cpu_pct,
         ram_used,
         ram_total,
@@ -70,7 +94,17 @@ pub fn collect_local() -> NodeTelemetry {
         disk_total,
         cpu_temp,
         is_ai_capable,
-        capabilities: Default::default(),
+        gpu_name,
+        gpu_pct: None,
+        gpu_mem_used: None,
+        gpu_mem_total: None,
+        ai_status: Some("Idle".into()),
+        ai_tokens_per_sec: None,
+        ai_thoughts: None,
+        capabilities: thegrid_core::models::DeviceCapabilities {
+            drives: drive_infos,
+            ..Default::default()
+        },
     }
 }
 
@@ -132,7 +166,7 @@ pub fn gauge_color(pct: f32) -> egui::Color32 {
 
 /// Draw a compact horizontal gauge bar.
 /// `label`: e.g. "CPU", `pct`: 0–100, `suffix`: e.g. "67%" or "8.2 GB / 16 GB"
-pub fn render_gauge(ui: &mut egui::Ui, label: &str, pct: f32, suffix: &str) {
+pub fn render_gauge(ui: &mut egui::Ui, label: &str, icon: Option<crate::theme::IconType>, pct: f32, suffix: &str) {
     use egui::RichText;
     use crate::theme::Colors;
 
@@ -140,6 +174,13 @@ pub fn render_gauge(ui: &mut egui::Ui, label: &str, pct: f32, suffix: &str) {
     let clamped = pct.clamp(0.0, 100.0);
 
     ui.horizontal(|ui| {
+        // Icon
+        if let Some(icon) = icon {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            crate::theme::draw_vector_icon(ui, rect, icon, Colors::TEXT_DIM);
+            ui.add_space(4.0);
+        }
+
         // Label
         ui.label(
             RichText::new(label)

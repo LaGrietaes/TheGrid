@@ -216,28 +216,10 @@ pub fn password_input<'a>(text: &'a mut String, hint: &str) -> egui::TextEdit<'a
         .desired_width(f32::INFINITY)
 }
 
-/// Status badge (ONLINE/OFFLINE/etc.)
-pub fn status_badge(ui: &mut Ui, label: &str, online: bool) {
-    let color = if online { Colors::GREEN } else { Colors::TEXT_MUTED };
-    let btn = egui::Button::new(
-        RichText::new(label).color(color).size(9.0).strong()
-    )
-    .fill(Color32::TRANSPARENT)
-    .stroke(Stroke::new(1.0, color));
-    ui.add(btn);
-}
 
-/// Colored indicator dot
-pub fn status_dot(ui: &mut Ui, online: bool) {
-    let color = if online { Colors::GREEN } else { Colors::TEXT_MUTED };
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-    ui.painter().circle_filled(rect.center(), 4.0, color);
-}
 
-/// Horizontal rule styled as a terminal separator
-pub fn separator(ui: &mut Ui) {
-    ui.add(egui::Separator::default().spacing(0.0));
-}
+
+
 
 pub enum IconType {
     RDP,
@@ -247,6 +229,14 @@ pub enum IconType {
     Desktop,
     Laptop,
     Server,
+    Cpu,
+    Ram,
+    Disk,
+    Gpu,
+    Ai,
+    Camera,
+    Microphone,
+    Speakers,
 }
 
 pub fn draw_vector_icon(ui: &mut Ui, rect: egui::Rect, icon: IconType, color: Color32) {
@@ -307,6 +297,64 @@ pub fn draw_vector_icon(ui: &mut Ui, rect: egui::Rect, icon: IconType, color: Co
             ui.painter().circle_filled(c + egui::vec2(s*0.3, -s*0.6), 1.5, color);
             ui.painter().circle_filled(c + egui::vec2(s*0.3, 0.6), 1.5, color);
         }
+        IconType::Cpu => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s, s)), egui::Rounding::ZERO, stroke);
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*0.4, s*0.4)), egui::Rounding::ZERO, stroke);
+            for i in -1..=1 {
+                let off = i as f32 * s * 0.35;
+                ui.painter().line_segment([c + egui::vec2(off, -s*0.7), c + egui::vec2(off, -s*0.5)], stroke);
+                ui.painter().line_segment([c + egui::vec2(off, s*0.5), c + egui::vec2(off, s*0.7)], stroke);
+                ui.painter().line_segment([c + egui::vec2(-s*0.7, off), c + egui::vec2(-s*0.5, off)], stroke);
+                ui.painter().line_segment([c + egui::vec2(s*0.5, off), c + egui::vec2(s*0.7, off)], stroke);
+            }
+        }
+        IconType::Ram => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*1.6, s*0.6)), egui::Rounding::ZERO, stroke);
+            for i in -2..=2 {
+                let off = i as f32 * s * 0.3;
+                ui.painter().line_segment([c + egui::vec2(off, -s*0.3), c + egui::vec2(off, 0.0)], stroke);
+            }
+        }
+        IconType::Disk => {
+            ui.painter().circle_stroke(c, s*0.7, stroke);
+            ui.painter().circle_stroke(c, s*0.2, stroke);
+            ui.painter().line_segment([c + egui::vec2(s*0.4, -s*0.4), c + egui::vec2(s*0.8, -s*0.8)], stroke);
+        }
+        IconType::Gpu => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*1.6, s*1.0)), egui::Rounding::ZERO, stroke);
+            ui.painter().circle_stroke(c, s*0.3, stroke);
+            ui.painter().line_segment([c + egui::vec2(-s*0.8, -s*0.5), c + egui::vec2(-s*0.6, -s*0.5)], stroke);
+        }
+        IconType::Ai => {
+            let r = s;
+            let mut points = vec![];
+            for i in 0..6 {
+                let angle = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
+                points.push(c + egui::vec2(r * angle.cos(), r * angle.sin()));
+            }
+            ui.painter().add(egui::Shape::closed_line(points, stroke));
+            ui.painter().circle_filled(c, s*0.3, color);
+        }
+        IconType::Camera => {
+            ui.painter().circle_stroke(c, s*0.8, stroke);
+            ui.painter().circle_stroke(c, s*0.3, stroke);
+            ui.painter().circle_filled(c, 1.5, color);
+        }
+        IconType::Microphone => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c - egui::vec2(0.0, s*0.2), egui::vec2(s*0.8, s*1.2)), egui::Rounding::same(s*0.4), stroke);
+            ui.painter().line_segment([c + egui::vec2(0.0, s*0.4), c + egui::vec2(0.0, s*0.8)], stroke);
+            ui.painter().line_segment([c + egui::vec2(-s*0.5, s*0.8), c + egui::vec2(s*0.5, s*0.8)], stroke);
+        }
+        IconType::Speakers => {
+            let points = vec![
+                c + egui::vec2(-s*0.2, -s*0.4),
+                c + egui::vec2(s*0.4, -s*0.8),
+                c + egui::vec2(s*0.4, s*0.8),
+                c + egui::vec2(-s*0.2, s*0.4),
+            ];
+            ui.painter().add(egui::Shape::closed_line(points, stroke));
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c - egui::vec2(s*0.5, 0.0), egui::vec2(s*0.6, s*0.6)), egui::Rounding::ZERO, stroke);
+        }
     }
 }
 
@@ -324,4 +372,36 @@ pub fn render_crt_icon(ui: &mut Ui, icon_type: IconType, size: f32, color: Color
     ui.ctx().request_repaint();
 
     response
+}
+
+/// Status badge (ONLINE/OFFLINE/etc.) with optional icon
+pub fn status_badge(ui: &mut Ui, label: &str, icon: Option<IconType>, active: bool) {
+    let color = if active { Colors::GREEN } else { Colors::TEXT_MUTED };
+    
+    egui::Frame::none()
+        .fill(Color32::TRANSPARENT)
+        .stroke(Stroke::new(1.0, color))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if let Some(icon) = icon {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    draw_vector_icon(ui, rect, icon, color);
+                    ui.add_space(4.0);
+                }
+                ui.label(RichText::new(label).color(color).size(9.0).strong());
+            });
+        });
+}
+
+/// Colored indicator dot
+pub fn status_dot(ui: &mut Ui, online: bool) {
+    let color = if online { Colors::GREEN } else { Colors::TEXT_MUTED };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// Horizontal rule styled as a terminal separator
+pub fn separator(ui: &mut Ui) {
+    ui.add(egui::Separator::default().spacing(0.0));
 }

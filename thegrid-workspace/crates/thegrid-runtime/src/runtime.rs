@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
-use anyhow::{Result, Context};
+use anyhow::Result;
 
-use thegrid_core::{AppEvent, Config, Database, FileWatcher, models::*};
+use thegrid_core::{AppEvent, Config, Database, FileWatcher};
 use thegrid_net::{AgentClient, AgentServer, TailscaleClient, WolSentry};
-use thegrid_ai::{SemanticSearch, FastEmbedProvider, EmbeddingProvider, AiNodeDetector};
+use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
 
 pub struct AppRuntime {
     pub config:       Arc<Mutex<Config>>,
@@ -92,10 +92,20 @@ impl AppRuntime {
         }
         server.spawn();
 
-        // Start AI if capable
-        if self.is_ai_node {
+        // Start AI if capable OR if provider URL is set (which overrides local specs)
+        let has_remote_provider = {
+            let cfg = self.config.lock().unwrap();
+            cfg.ai_provider_url.is_some()
+        };
+
+        if self.is_ai_node || has_remote_provider {
             self.spawn_semantic_initializer();
         }
+    }
+
+    pub fn refresh_ai_services(&self) {
+        log::info!("[Runtime] Refreshing AI services due to config change...");
+        self.spawn_semantic_initializer();
     }
 
     // --- Task Spawners (Migrated from app.rs) ---
@@ -118,10 +128,11 @@ impl AppRuntime {
             (cfg.agent_port, cfg.api_key.clone())
         };
         let tx = self.event_tx.clone();
+        let ip_addr = ip.clone();
         std::thread::spawn(move || {
             match AgentClient::new(&ip, port, api_key).and_then(|c| c.ping()) {
-                Ok(r)  => { let _ = tx.send(AppEvent::AgentPingOk(r)); }
-                Err(e) => { let _ = tx.send(AppEvent::AgentPingFailed(e.to_string())); }
+                Ok(response)  => { let _ = tx.send(AppEvent::AgentPingOk { ip: ip_addr, response }); }
+                Err(e) => { let _ = tx.send(AppEvent::AgentPingFailed { ip: ip_addr, error: e.to_string() }); }
             }
         });
     }
@@ -294,12 +305,26 @@ impl AppRuntime {
         let event_tx = self.event_tx.clone();
         let db       = self.db.clone();
         let semantic = self.semantic_search.clone();
+        let config   = self.config.clone();
         
         std::thread::spawn(move || {
-            match FastEmbedProvider::new() {
-                Ok(provider) => {
-                    let provider: Arc<dyn EmbeddingProvider> = Arc::new(provider);
-                    match SemanticSearch::new(provider) {
+            let (model, url) = {
+                let cfg = config.lock().unwrap();
+                (cfg.ai_model.clone(), cfg.ai_provider_url.clone())
+            };
+
+            let provider: Result<Arc<dyn EmbeddingProvider>> = if let Some(u) = url {
+                let m = model.unwrap_or_else(|| "llama3".to_string());
+                log::info!("[AI] Using remote HTTP provider {} at {}", m, u);
+                Ok(Arc::new(thegrid_ai::HttpEmbeddingProvider::new(m, u)))
+            } else {
+                log::info!("[AI] Initializing local provider...");
+                thegrid_ai::FastEmbedProvider::new().map(|p| Arc::new(p) as Arc<dyn EmbeddingProvider>)
+            };
+
+            match provider {
+                Ok(p) => {
+                    match SemanticSearch::new(p) {
                         Ok(mut search) => {
                             if let Ok(guard) = db.lock() {
                                 if let Ok(all) = guard.get_all_embeddings() {
@@ -320,7 +345,7 @@ impl AppRuntime {
                     }
                 }
                 Err(e) => {
-                    let _ = event_tx.send(AppEvent::SemanticFailed(format!("Model download: {}", e)));
+                    let _ = event_tx.send(AppEvent::SemanticFailed(format!("Provider init: {}", e)));
                 }
             }
         });
@@ -455,15 +480,20 @@ impl AppRuntime {
             (cfg.agent_port, cfg.api_key.clone())
         };
         let tx = self.event_tx.clone();
-            if let Ok(client) = AgentClient::new(&ip, port, api_key) {
-                if let Ok(telemetry) = client.get_telemetry() {
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.get_telemetry()) {
+                Ok(telemetry) => {
                     let _ = tx.send(AppEvent::TelemetryUpdate { 
                         device_id, 
                         ip: Some(ip), 
                         telemetry 
                     });
                 }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Status(format!("Telemetry failed ({}): {}", device_id, e)));
+                }
             }
+        });
     }
 
     pub fn spawn_wol(&self, device_name: String, mac_addr: String) {
@@ -484,6 +514,30 @@ impl AppRuntime {
             match result {
                 Ok(Ok(entries)) => { let _ = tx.send(AppEvent::TemporalLoaded(entries)); }
                 _ => {}
+            }
+        });
+    }
+
+    pub fn handle_remote_ai_embed(&self, text: String, response_tx: mpsc::Sender<Vec<f32>>) {
+        let semantic = self.semantic_search.clone();
+        std::thread::spawn(move || {
+            let lock = semantic.lock().unwrap();
+            if let Some(engine) = &*lock {
+                if let Ok(v) = engine.embed(&text) {
+                    let _ = response_tx.send(v);
+                }
+            }
+        });
+    }
+
+    pub fn handle_remote_ai_search(&self, query: String, k: usize, response_tx: mpsc::Sender<Vec<(i64, f32)>>) {
+        let semantic = self.semantic_search.clone();
+        std::thread::spawn(move || {
+            let lock = semantic.lock().unwrap();
+            if let Some(engine) = &*lock {
+                if let Ok(hits) = engine.search(&query, k) {
+                    let _ = response_tx.send(hits);
+                }
             }
         });
     }

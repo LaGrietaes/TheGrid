@@ -9,6 +9,8 @@ thegrid-core = { path = "../thegrid-core" }
 anyhow        = { workspace = true }
 log           = { workspace = true }
 serde         = { workspace = true }
+serde_json    = { workspace = true }
+reqwest       = { workspace = true }
 
 # ── Phase 4 dependencies (stubbed for now to allow building without C++ tools) ──
 # usearch     = "2.13"

@@ -53,10 +53,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api_key: "Tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string(),
-            device_name: String::new(),
+            api_key: "tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string(),
+            device_name: "0N3-DEV".to_string(),
             device_type: Self::default_device_type(),
-            rdp_username: String::new(),
+            rdp_username: "0N3-DEV".to_string(),
             agent_port: Self::default_agent_port(),
             watch_paths: Vec::new(),
             transfers_dir: None,
@@ -69,14 +69,19 @@ impl Default for Config {
 }
 
 impl Config {
-    fn default_agent_port() -> u16 { 47731 }
-    fn default_true() -> bool { true }
-    fn default_device_type() -> String { "Desktop".to_string() }
+    fn default_agent_port() -> u16 {
+        5000
+    }
+    fn default_true() -> bool {
+        true
+    }
+    fn default_device_type() -> String {
+        "Desktop".to_string()
+    }
 
     /// Returns the path to the config file, creating the directory if needed.
     pub fn config_path() -> Result<PathBuf> {
-        let base = dirs::config_dir()
-            .context("Could not determine config directory")?;
+        let base = dirs::config_dir().context("Could not determine config directory")?;
         let dir = base.join("thegrid");
         std::fs::create_dir_all(&dir)?;
         Ok(dir.join("config.json"))
@@ -91,12 +96,23 @@ impl Config {
         }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("Reading config from {:?}", path))?;
-        let mut cfg: Self = serde_json::from_str(&raw)
-            .context("Parsing config JSON")?;
-        
+        let mut cfg: Self = serde_json::from_str(&raw).context("Parsing config JSON")?;
+
+        // Normalize and trim API key
+        cfg.api_key = cfg.api_key.trim().to_string();
+
         // Fallback to hardcoded key if loaded one is empty
-        if cfg.api_key.trim().is_empty() {
-            cfg.api_key = "Tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string();
+        if cfg.api_key.is_empty() {
+            cfg.api_key =
+                "tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string();
+        }
+
+        // Migrate names to 0N3-DEV as requested
+        if cfg.device_name == "DEV-ON3" || cfg.device_name.is_empty() {
+            cfg.device_name = "0N3-DEV".to_string();
+        }
+        if cfg.rdp_username == "0N3-DEV" || cfg.rdp_username.is_empty() {
+             cfg.rdp_username = "0N3-DEV".to_string();
         }
 
         log::info!("Config loaded from {:?}", path);

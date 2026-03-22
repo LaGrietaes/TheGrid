@@ -109,6 +109,8 @@ pub struct ClipboardEntry {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentPingResponse {
     pub ok: bool,
+    #[serde(default)]
+    pub authorized: bool,
     pub hostname: String,
     pub device: String,
     pub version: String,
@@ -151,7 +153,21 @@ pub struct NodeTelemetry {
     pub disk_total: u64,
     pub cpu_temp: Option<f32>,
     pub is_ai_capable: bool,
+    pub gpu_name: Option<String>,
+    pub gpu_pct: Option<f32>,
+    pub gpu_mem_used: Option<u64>,
+    pub gpu_mem_total: Option<u64>,
+    pub ai_status: Option<String>,
+    pub ai_tokens_per_sec: Option<f32>,
+    pub ai_thoughts: Option<String>,
     pub capabilities: DeviceCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DriveInfo {
+    pub name: String,
+    pub used: u64,
+    pub total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,7 +176,7 @@ pub struct DeviceCapabilities {
     pub has_camera: bool,
     pub has_microphone: bool,
     pub has_speakers: bool,
-    pub drives: Vec<String>,
+    pub drives: Vec<DriveInfo>,
     pub has_rdp: bool,
     pub has_file_access: bool,
 }
@@ -173,6 +189,12 @@ impl NodeTelemetry {
     pub fn disk_pct(&self) -> f32 {
         if self.disk_total == 0 { return 0.0; }
         self.disk_used as f32 / self.disk_total as f32 * 100.0
+    }
+    pub fn gpu_mem_pct(&self) -> f32 {
+        match (self.gpu_mem_used, self.gpu_mem_total) {
+            (Some(u), Some(t)) if t > 0 => u as f32 / t as f32 * 100.0,
+            _ => 0.0,
+        }
     }
 }
 

@@ -14,10 +14,10 @@ pub enum AppEvent {
 
     // ── Agent (remote THE GRID instance) ──────────────────────────────────
     /// Ping to a remote agent succeeded
-    AgentPingOk(AgentPingResponse),
+    AgentPingOk { ip: String, response: AgentPingResponse },
 
     /// Ping to a remote agent failed
-    AgentPingFailed(String),
+    AgentPingFailed { ip: String, error: String },
 
     /// Remote file list fetched
     RemoteFilesLoaded(Vec<RemoteFile>),

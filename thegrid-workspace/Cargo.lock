@@ -4361,7 +4361,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "log",
+ "reqwest",
  "serde",
+ "serde_json",
  "sysinfo 0.33.1",
  "thegrid-core",
 ]

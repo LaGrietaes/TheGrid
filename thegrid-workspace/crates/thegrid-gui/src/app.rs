@@ -28,13 +28,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use egui::{Color32, Context, RichText};
 
-use thegrid_core::{AppEvent, Config, Database, FileWatcher};
+use thegrid_core::{AppEvent, Config};
 use thegrid_core::models::*;
-use thegrid_net::{TailscaleClient, RdpLauncher, AgentClient, AgentServer, WolSentry};
+use thegrid_net::{TailscaleClient, RdpLauncher, AgentClient};
 use thegrid_net::rdp::RdpResolution;
 use thegrid_runtime::AppRuntime;
 
@@ -168,6 +168,9 @@ pub struct TheGridApp {
 
     /// New in Node Enhancement: tracks active terminal sessions
     terminal_sessions: HashMap<String, TerminalView>,
+
+    /// New in Node Enhancement: tracks the provider URL being typed in the UI
+    remote_url_edit: String,
 }
 
 impl TheGridApp {
@@ -235,6 +238,7 @@ impl TheGridApp {
             local_hostname,
             current_remote_path: PathBuf::new(),
             remote_model_edit: String::new(),
+            remote_url_edit: String::new(),
             terminal_sessions: HashMap::new(),
         }
     }
@@ -273,7 +277,9 @@ impl TheGridApp {
         });
     }
 
-    fn spawn_ping(&self, ip: String) {
+    fn spawn_ping(&mut self, ip: String, device_name: String) {
+        let now = std::time::Instant::now();
+        self.telemetry_last_poll.insert(device_name, now);
         self.runtime.spawn_ping(ip);
     }
 
@@ -363,10 +369,6 @@ impl TheGridApp {
         }
     }
 
-    /// Initialize the semantic search engine in a background thread.
-    fn spawn_semantic_initializer(&self) {
-        self.runtime.spawn_semantic_initializer();
-    }
 
     /// Background worker that processes files and generates embeddings.
     fn spawn_embedding_worker(&self) {
@@ -414,9 +416,6 @@ impl TheGridApp {
 
     /// Send a Wake-on-LAN magic packet.
     /// `mac_addr` format: "AA:BB:CC:DD:EE:FF"
-    fn spawn_wol(&mut self, device_name: String, mac_addr: String) {
-        self.runtime.spawn_wol(device_name, mac_addr);
-    }
 
     /// Load recent files from SQLite for the Timeline view.
     fn spawn_load_timeline(&mut self) {
@@ -485,9 +484,6 @@ impl TheGridApp {
     }
 
     // Helper: set_status from a non-&mut self context (used in spawner closures)
-    fn set_status_clone(&self, msg: String) {
-        let _ = self.event_tx.send(AppEvent::Status(msg));
-    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Event processor — drains mpsc channel every frame
@@ -498,7 +494,7 @@ impl TheGridApp {
             match event {
 
                 // ── Devices ───────────────────────────────────────────────────
-                AppEvent::DevicesLoaded(devices) => {
+                AppEvent::DevicesLoaded(mut devices) => {
                     self.devices_loading     = false;
                     self.tailscale_connected = true;
                     let n = devices.len();
@@ -512,8 +508,27 @@ impl TheGridApp {
                         }
                     }
 
+                     // Prioritize the local node by moving it to the top of the list
+                    let local_name = self.config.device_name.clone();
+                    if let Some(local_idx) = devices.iter().position(|d| d.name == local_name) {
+                        let local_node = devices.remove(local_idx);
+                        devices.insert(0, local_node);
+                    }
+
                     self.devices = devices;
                     self.set_status(format!("{} nodes discovered", n));
+
+                    // Automatically ping every discovered device to determine online status
+                    let mut initial_pings = Vec::new();
+                    for d in &self.devices {
+                        if let Some(ip) = d.primary_ip() {
+                            initial_pings.push((ip.to_string(), d.name.clone()));
+                        }
+                    }
+                    for (ip, name) in initial_pings {
+                        log::info!("Automatic ping for discovered device: {} at {}", name, ip);
+                        self.spawn_ping(ip, name);
+                    }
 
                     // Start local telemetry collection immediately after first load
                     self.spawn_collect_local_telemetry();
@@ -545,13 +560,27 @@ impl TheGridApp {
                 }
 
                 // ── Agent ─────────────────────────────────────────────────────
-                AppEvent::AgentPingOk(resp) => {
+                AppEvent::AgentPingOk { ip, response } => {
                     self.is_tg_agent = true;
-                    self.push_toast(Toast::ok(format!("⬡ Agent online: {}", resp.device)));
+                    if response.authorized {
+                        self.push_toast(Toast::ok(format!("⬡ Agent online: {} (v{})", response.device, response.version)));
+                        
+                        // Find the device ID for this IP to trigger telemetry
+                        let device_id = self.devices.iter()
+                            .find(|d| d.primary_ip() == Some(&ip))
+                            .map(|d| d.id.clone())
+                            .unwrap_or_else(|| response.device.clone());
+                            
+                        self.runtime.spawn_get_telemetry(ip, device_id);
+                    } else {
+                        self.push_toast(Toast::info(format!("⬡ Agent online: {} (v{}) - Limited Access (Key Mismatch)", response.device, response.version)));
+                        self.set_status("Authentication mismatch: please check your api_key");
+                    }
                 }
-                AppEvent::AgentPingFailed(err) => {
+                AppEvent::AgentPingFailed { ip: _, error } => {
                     self.is_tg_agent = false;
-                    self.push_toast(Toast::err(format!("Agent ping failed: {}", err)));
+                    self.push_toast(Toast::err(format!("Agent ping failed: {}", error)));
+                    self.set_status(format!("Ping failed. Check port {} and firewall.", self.config.agent_port));
                 }
 
                 // ── File transfer ─────────────────────────────────────────────
@@ -734,6 +763,14 @@ impl TheGridApp {
                     self.search.receive_results(self.search.query_gen, results);
                 }
 
+                // ── Phase 4: Remote AI Request Handling (for node side) ────────
+                AppEvent::RemoteAiEmbedRequest { text, response_tx } => {
+                    self.runtime.handle_remote_ai_embed(text, response_tx);
+                }
+                AppEvent::RemoteAiSearchRequest { query, k, response_tx } => {
+                    self.runtime.handle_remote_ai_search(query, k, response_tx);
+                }
+
                 // ── Phase 3: Telemetry ────────────────────────────────────────
                 AppEvent::TelemetryUpdate { device_id, ip, telemetry } => {
                     // Mark local telemetry as no longer pending
@@ -775,8 +812,44 @@ impl TheGridApp {
                         if let Ok(n) = msg["index_count:".len()..].parse::<u64>() {
                             self.index_stats.total_files = n;
                         }
+                    } else if msg.starts_with("config_update:") {
+                        // Format: config_update:model="...",url="..."
+                        // Simple parser for node-side config syncing
+                        let parts = &msg["config_update:".len()..];
+                        let mut model = None;
+                        let mut url = None;
+                        
+                        for part in parts.split(',') {
+                            if part.starts_with("model=") {
+                                let val = part["model=".len()..].trim_matches('"').to_string();
+                                if val != "None" && !val.is_empty() { model = Some(val); }
+                            } else if part.starts_with("url=") {
+                                let val = part["url=".len()..].trim_matches('"').to_string();
+                                if val != "None" && !val.is_empty() { url = Some(val); }
+                            }
+                        }
+
+                        let mut cfg = self.config.clone();
+                        let mut changed = false;
+                        if model.is_some() { cfg.ai_model = model; changed = true; }
+                        if url.is_some() { cfg.ai_provider_url = url; changed = true; }
+                        
+                        if changed {
+                            log::info!("[Node] Updating local config from remote command: {:?}", cfg);
+                            let _ = cfg.save();
+                            {
+                                let mut runtime_cfg = self.runtime.config.lock().unwrap();
+                                *runtime_cfg = cfg.clone();
+                            }
+                            self.config = cfg;
+                            self.runtime.refresh_ai_services();
+                        }
+
                     } else if !msg.starts_with("search_gen:") {
                         // Regular status messages go to the status bar
+                        if msg.to_lowercase().contains("failed") || msg.to_lowercase().contains("error") {
+                            self.push_toast(Toast::err(msg.clone()));
+                        }
                         self.set_status(msg);
                     }
                 }
@@ -1103,7 +1176,7 @@ impl TheGridApp {
 
         if actions.ping {
             self.push_toast(Toast::info(format!("Pinging {}...", ip)));
-            self.spawn_ping(ip.to_string());
+            self.spawn_ping(ip.to_string(), device_id.to_string());
         }
 
         if actions.load_clipboard {
@@ -1232,14 +1305,6 @@ impl TheGridApp {
         });
     }
 
-    fn spawn_send_terminal_input(&self, ip: String, session_id: String, data: Vec<u8>) {
-        let api_key = self.config.api_key.clone();
-        std::thread::spawn(move || {
-            if let Ok(client) = AgentClient::new(&ip, 3030, api_key) {
-                let _ = client.send_terminal_input(&session_id, &data);
-            }
-        });
-    }
 
     fn spawn_launch_scrcpy(&self, ip: String) {
         let api_key = self.config.api_key.clone();
@@ -1297,16 +1362,32 @@ impl eframe::App for TheGridApp {
             }
         }
 
-        // 5. Periodic local telemetry refresh (every 30s)
-        // We rate-limit in spawn_collect_local_telemetry itself, so this is safe to call often
-        if self.screen == Screen::Dashboard
-            && !self.local_telemetry_pending
-            && self.telemetry_last_poll
-                .get(&self.config.device_name)
-                .map(|t| t.elapsed().as_secs() > 30)
-                .unwrap_or(true)
-        {
+        // 5. Periodic telemetry and ping refresh (every 30s)
+        let mut ping_targets = Vec::new(); // (ip, name)
+        let mut local_telemetry_needed = false;
+
+        for d in &self.devices {
+            if let Some(ip) = d.primary_ip() {
+                let last_poll = self.telemetry_last_poll.get(&d.name);
+                let needs_poll = last_poll.map(|t| t.elapsed().as_secs() > 60).unwrap_or(true);
+                
+                if needs_poll {
+                    if d.name == self.config.device_name {
+                        if !self.local_telemetry_pending {
+                            local_telemetry_needed = true;
+                        }
+                    } else {
+                        ping_targets.push((ip.to_string(), d.name.clone()));
+                    }
+                }
+            }
+        }
+
+        if local_telemetry_needed {
             self.spawn_collect_local_telemetry();
+        }
+        for (ip, name) in ping_targets {
+            self.spawn_ping(ip, name);
         }
 
         // 6. Screen dispatch
@@ -1383,6 +1464,7 @@ impl eframe::App for TheGridApp {
                         self.remote_files.clear();
                         self.current_remote_path = PathBuf::new();
                         self.remote_model_edit = String::new();
+                        self.remote_url_edit = String::new();
                         self.is_tg_agent = false;
                     }
                 }
@@ -1440,7 +1522,9 @@ impl eframe::App for TheGridApp {
                                 telemetry:      telem_snap.as_ref(),
                                 current_remote_path: &mut self.current_remote_path,
                                 remote_model_edit: &mut self.remote_model_edit,
+                                remote_url_edit: &mut self.remote_url_edit,
                                 terminal_view: self.terminal_sessions.get_mut(&device.id),
+                                local_device_name: &self.config.device_name,
                             };
 
                             // Pass timeline state into the render
