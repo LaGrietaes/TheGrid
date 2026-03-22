@@ -51,6 +51,9 @@ dirs          = "5"
 # Image processing (used for loading window icon)
 image         = "0.24"
 
+[build-dependencies]
+winres = "0.1"
+
 [profile.release]
 opt-level   = 3
 lto         = "thin"   # link-time optimization for smaller binary

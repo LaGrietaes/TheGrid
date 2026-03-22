@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use anyhow::Result;
@@ -21,6 +22,7 @@ pub struct AppRuntime {
     
     // State
     pub is_ai_node: bool,
+    pub agent_shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
 impl AppRuntime {
@@ -64,6 +66,7 @@ impl AppRuntime {
             semantic_search: Arc::new(Mutex::new(None)),
             remote_ai_nodes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             is_ai_node,
+            agent_shutdown: Arc::new(Mutex::new(None)),
         };
 
         Ok(runtime)
@@ -90,7 +93,6 @@ impl AppRuntime {
                 server = server.with_tailscale(Arc::new(ts_client));
             }
         }
-        server.spawn();
 
         // Start AI if capable OR if provider URL is set (which overrides local specs)
         let has_remote_provider = {
@@ -101,6 +103,30 @@ impl AppRuntime {
         if self.is_ai_node || has_remote_provider {
             self.spawn_semantic_initializer();
         }
+
+        let mut shutdown_lock = self.agent_shutdown.lock().unwrap();
+        *shutdown_lock = Some(server.shutdown_handle());
+        server.spawn();
+    }
+
+    pub fn restart_services(&self) {
+        log::info!("[Runtime] Restarting agent services...");
+        
+        // 1. Signal old server to stop
+        let old_shutdown = {
+            let mut lock = self.agent_shutdown.lock().unwrap();
+            lock.take()
+        };
+        
+        if let Some(s) = old_shutdown {
+            log::debug!("[Runtime] Sending shutdown signal to old agent...");
+            s.store(true, Ordering::Relaxed);
+            // Give it a moment to release the port
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+
+        // 2. Start new services with fresh config
+        self.start_services();
     }
 
     pub fn refresh_ai_services(&self) {

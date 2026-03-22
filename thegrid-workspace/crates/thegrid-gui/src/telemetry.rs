@@ -103,6 +103,7 @@ pub fn collect_local() -> NodeTelemetry {
         ai_thoughts: None,
         capabilities: thegrid_core::models::DeviceCapabilities {
             drives: drive_infos,
+            has_rdp: thegrid_net::win_sys::is_rdp_enabled(),
             ..Default::default()
         },
     }

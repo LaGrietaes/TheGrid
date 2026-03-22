@@ -395,8 +395,7 @@ pub fn status_badge(ui: &mut Ui, label: &str, icon: Option<IconType>, active: bo
 }
 
 /// Colored indicator dot
-pub fn status_dot(ui: &mut Ui, online: bool) {
-    let color = if online { Colors::GREEN } else { Colors::TEXT_MUTED };
+pub fn status_dot(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }

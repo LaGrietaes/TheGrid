@@ -65,6 +65,8 @@ pub struct DetailState<'a> {
     pub terminal_view:      Option<&'a mut crate::views::terminal::TerminalView>,
     /// New in Dashboard Optimization: Name of the local device to detect (LOCAL)
     pub local_device_name:  &'a str,
+    /// New in Connectivity Fixes: Agent status
+    pub status:             crate::app::NodeStatus,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -100,6 +102,8 @@ pub struct DetailActions {
     pub create_terminal:      bool,
     pub send_terminal_input:  Option<Vec<u8>>,
     pub launch_scrcpy:        bool,
+    pub enable_rdp:           bool,
+    pub launch_ssh:           bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,7 +114,7 @@ pub struct DetailActions {
 /// Returns: (clicked device index, refresh requested)
 pub fn render_device_panel(
     ui: &mut Ui,
-    devices: &[TailscaleDevice],
+    devices_with_status: &[(TailscaleDevice, crate::app::NodeStatus)],
     telemetries: &std::collections::HashMap<String, thegrid_core::models::NodeTelemetry>,
     selected_idx: Option<usize>,
     filter: &mut String,
@@ -143,7 +147,7 @@ pub fn render_device_panel(
                         *needs_refresh = true;
                     }
                     ui.label(
-                        RichText::new(format!("{}", devices.len()))
+                        RichText::new(format!("{}", devices_with_status.len()))
                             .color(Colors::TEXT_DIM).size(9.0)
                     );
                 });
@@ -185,7 +189,7 @@ pub fn render_device_panel(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
-            if devices.is_empty() {
+            if devices_with_status.is_empty() {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new("◌").color(Colors::TEXT_MUTED).size(24.0));
@@ -198,7 +202,7 @@ pub fn render_device_panel(
                 return;
             }
 
-            for (idx, device) in devices.iter().enumerate() {
+            for (idx, (device, status)) in devices_with_status.iter().enumerate() {
                 let matches = filter_lower.is_empty()
                     || device.hostname.to_lowercase().contains(&filter_lower)
                     || device.name.to_lowercase().contains(&filter_lower)
@@ -207,8 +211,13 @@ pub fn render_device_panel(
                 if !matches { continue; }
 
                 let is_selected = selected_idx == Some(idx);
-                let is_online   = device.is_likely_online();
                 let bg          = if is_selected { Colors::BG_ACTIVE } else { Color32::TRANSPARENT };
+                
+                let status_color = match status {
+                    crate::app::NodeStatus::GridActive => Colors::GREEN,
+                    crate::app::NodeStatus::Reachable  => Colors::AMBER,
+                    crate::app::NodeStatus::Offline    => Colors::TEXT_MUTED,
+                };
 
                 let resp = egui::Frame::none()
                     .fill(bg)
@@ -227,7 +236,7 @@ pub fn render_device_panel(
                             );
                         }
                         ui.horizontal(|ui| {
-                            theme::status_dot(ui, is_online);
+                            theme::status_dot(ui, status_color);
                             ui.add_space(2.0);
                             
                             // Sidebar Row Vector Icon (using telemetry lookup)
@@ -238,7 +247,7 @@ pub fn render_device_panel(
                                 "Server" => theme::IconType::Server,
                                 _ => theme::IconType::Desktop,
                             };
-                            theme::draw_vector_icon(ui, icon_rect, icon_type, if is_online { Colors::GREEN } else { Colors::TEXT_MUTED });
+                            theme::draw_vector_icon(ui, icon_rect, icon_type, status_color);
                             
                             ui.add_space(6.0);
                             ui.vertical(|ui| {
@@ -293,6 +302,62 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
             actions.ping = true;
         }
     });
+
+    // ── Grid Reachability Banner ──
+    if s.status == crate::app::NodeStatus::Reachable {
+        ui.add_space(8.0);
+        egui::Frame::none()
+            .fill(Colors::BG_WIDGET)
+            .stroke(egui::Stroke::new(1.0, Colors::AMBER))
+            .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("⚠").color(Colors::AMBER).size(14.0));
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("AGENT UNREACHABLE").color(Colors::TEXT).size(10.0).strong());
+                        ui.label(RichText::new("The machine is online but THE GRID agent isn't responding.").color(Colors::TEXT_DIM).size(9.0));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.horizontal(|ui| {
+                            if s.device.os.to_lowercase().contains("windows") {
+                                if theme::micro_button(ui, "LAUNCH RDP").clicked() {
+                                    actions.launch_rdp = true;
+                                }
+                            }
+                            if theme::micro_button(ui, "TRY SSH").clicked() {
+                                actions.launch_ssh = true;
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
+    // ── RDP Enablement Banner ──
+    let has_rdp = s.telemetry.map(|t| t.capabilities.has_rdp).unwrap_or(false);
+    if !has_rdp && s.device.os.to_lowercase().contains("windows") {
+        ui.add_space(8.0);
+        egui::Frame::none()
+            .fill(Colors::BG_WIDGET)
+            .stroke(egui::Stroke::new(1.0, Colors::AMBER))
+            .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("⚠").color(Colors::AMBER).size(14.0));
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("REMOTE DESKTOP IS DISABLED").color(Colors::TEXT).size(10.0).strong());
+                        ui.label(RichText::new("RDP must be enabled on the target Windows machine to connect.").color(Colors::TEXT_DIM).size(9.0));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::primary_button(ui, "ENABLE RDP").clicked() {
+                            actions.enable_rdp = true;
+                        }
+                    });
+                });
+            });
+    }
 
     if s.is_tg_agent {
         ui.add_space(8.0);

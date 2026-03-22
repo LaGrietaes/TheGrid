@@ -9,6 +9,8 @@ use std::io::{Read, Write};
 #[cfg(windows)]
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use thegrid_core::{AppEvent, models::*, Config};
 use ascii::AsciiStr;
 
@@ -30,6 +32,7 @@ pub struct AgentServer {
     ts_client: Option<Arc<TailscaleClient>>,
     config: Config,
     terminal_sessions: Mutex<HashMap<String, TerminalSession>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl AgentServer {
@@ -48,7 +51,12 @@ impl AgentServer {
             ts_client: None,
             config,
             terminal_sessions: Mutex::new(HashMap::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn shutdown_handle(&self) -> Arc<AtomicBool> {
+        self.shutdown.clone()
     }
 
     pub fn with_tailscale(mut self, client: Arc<TailscaleClient>) -> Self {
@@ -82,11 +90,24 @@ impl AgentServer {
         let server = Server::http(&addr)
             .map_err(|e| anyhow::anyhow!("Starting HTTP server on {}: {}", addr, e))?;
 
-        for request in server.incoming_requests() {
-            if let Err(e) = self.handle_request(request) {
-                log::warn!("Agent request error: {}", e);
+        let shutdown = self.shutdown.clone();
+        for _ in 0.. {
+            if shutdown.load(Ordering::Relaxed) { break; }
+            
+            match server.recv_timeout(Duration::from_millis(500)) {
+                Ok(Some(request)) => {
+                    if let Err(e) = self.handle_request(request) {
+                        log::warn!("Agent request error: {}", e);
+                    }
+                }
+                Ok(None) => {}, // Timeout, continue
+                Err(e) => {
+                    log::error!("Agent server error: {}", e);
+                    break;
+                }
             }
         }
+        log::info!("Agent server on port {} has stopped.", self.port);
         Ok(())
     }
 
@@ -557,29 +578,35 @@ impl AgentServer {
             return Ok(());
         }
 
-        // ── Remote Config Update ──
-        if method == "POST" && url == "/v1/config" {
-            let mut body = String::new();
-            req.as_reader().read_to_string(&mut body)?;
-
-            #[derive(serde::Deserialize)]
-            struct ConfigUpdate {
-                ai_model: Option<String>,
-                ai_provider_url: Option<String>,
+        // ── Remote RDP Enablement ──
+        if method == "POST" && url == "/v1/rdp/enable" {
+            #[cfg(windows)]
+            {
+                log::info!("Agent: attempting to enable Windows Remote Desktop (RDP)");
+                match crate::win_sys::enable_rdp() {
+                    Ok(_) => {
+                        let msg = "RDP enabled successfully".to_string();
+                        log::info!("{}", msg);
+                        req.respond(Response::from_string(format!(r#"{{"ok":true,"message":{}}}"#, serde_json::to_string(&msg).unwrap()))
+                            .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                        )?;
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to enable RDP: {}", e);
+                        log::error!("{}", msg);
+                        req.respond(Response::from_string(format!(r#"{{"ok":false,"message":{}}}"#, serde_json::to_string(&msg).unwrap()))
+                            .with_status_code(500)
+                            .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                        )?;
+                    }
+                }
             }
-
-            if let Ok(update) = serde_json::from_str::<ConfigUpdate>(&body) {
-                log::info!("Agent: receiving remote config update (model: {:?}, url: {:?})", 
-                    update.ai_model, update.ai_provider_url);
-                
-                let _ = self.event_tx.send(AppEvent::Status(format!("config_update:model={:?},url={:?}", 
-                    update.ai_model, update.ai_provider_url)));
-                
-                req.respond(Response::from_string(r#"{"ok":true}"#)
+            #[cfg(not(windows))]
+            {
+                req.respond(Response::from_string(r#"{"ok":false,"message":"RDP enabling only supported on Windows nodes"}"#)
+                    .with_status_code(400)
                     .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
                 )?;
-            } else {
-                req.respond(Response::from_string(r#"{"error":"invalid json"}"#).with_status_code(400))?;
             }
             return Ok(());
         }
@@ -799,6 +826,15 @@ impl AgentClient {
         Ok(dest_file)
     }
 
+    pub fn enable_rdp(&self) -> Result<()> {
+        let url = format!("{}/v1/rdp/enable", self.base_url);
+        let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).send().context("Requesting RDP enablement")?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(())
+    }
+
     pub fn remote_embed(&self, text: &str) -> Result<Vec<f32>> {
         let url = format!("{}/v1/ai/embed", self.base_url);
         let body = serde_json::json!({ "text": text });
@@ -902,7 +938,7 @@ fn collect_telemetry(config: &Config) -> NodeTelemetry {
         has_microphone: true,    // Stubbed for now as agreed
         has_speakers: true,      // Stubbed for now as agreed
         drives: drive_infos,
-        has_rdp: config.enable_rdp,
+        has_rdp: crate::win_sys::is_rdp_enabled(),
         has_file_access: config.enable_file_access,
     };
 

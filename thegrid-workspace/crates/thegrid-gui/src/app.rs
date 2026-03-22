@@ -92,6 +92,13 @@ impl Toast {
 // THE GRID App — owns ALL application state
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NodeStatus {
+    Offline,      // Tailscale says it's off
+    Reachable,    // Tailscale says it's on, but Agent not responding
+    GridActive    // Agent is responding
+}
+
 pub struct TheGridApp {
     // ── State machine ─────────────────────────────────────────────────────────
     screen: Screen,
@@ -277,9 +284,9 @@ impl TheGridApp {
         });
     }
 
-    fn spawn_ping(&mut self, ip: String, device_name: String) {
+    fn spawn_ping(&mut self, ip: String, device_id: String) {
         let now = std::time::Instant::now();
-        self.telemetry_last_poll.insert(device_name, now);
+        self.telemetry_last_poll.insert(device_id, now);
         self.runtime.spawn_ping(ip);
     }
 
@@ -334,6 +341,18 @@ impl TheGridApp {
             match AgentClient::new(&ip, port, api_key).and_then(|c| c.update_config(model, url)) {
                 Ok(_) => { let _ = tx.send(AppEvent::RemoteConfigUpdated { device_id }); }
                 Err(e) => { let _ = tx.send(AppEvent::RemoteConfigFailed { device_id, error: e.to_string() }); }
+            }
+        });
+    }
+
+    fn spawn_enable_rdp(&self, ip: String, device_id: String) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.enable_rdp()) {
+                Ok(_)  => { let _ = tx.send(AppEvent::RdpEnabled { device_id }); }
+                Err(e) => { let _ = tx.send(AppEvent::RdpFailed { device_id, error: e.to_string() }); }
             }
         });
     }
@@ -799,6 +818,26 @@ impl TheGridApp {
                     self.push_toast(Toast::err(format!("WoL failed: {}", reason)));
                 }
 
+                // ── RDP Support ───────────────────────────────────────────────
+                AppEvent::EnableRdp { ip, device_id } => {
+                    self.spawn_enable_rdp(ip, device_id);
+                    self.set_status("Enabling RDP on remote node...");
+                }
+                AppEvent::RdpEnabled { device_id } => {
+                    self.push_toast(Toast::ok("RDP enabled successfully"));
+                    self.set_status("RDP is now active");
+                    // Force a telemetry refresh to update the UI button
+                    if let Some(d) = self.devices.iter().find(|d| d.id == device_id) {
+                        if let Some(ip) = d.primary_ip() {
+                            self.spawn_get_telemetry(ip.to_string(), device_id);
+                        }
+                    }
+                }
+                AppEvent::RdpFailed { device_id: _, error } => {
+                    self.push_toast(Toast::err(format!("RDP Enablement failed: {}", error)));
+                    self.set_status(format!("Error: {}", error));
+                }
+
                 // ── Phase 3: Timeline ─────────────────────────────────────────
                 AppEvent::TemporalLoaded(entries) => {
                     self.timeline.entries = entries;
@@ -1258,15 +1297,31 @@ impl TheGridApp {
         if actions.load_timeline {
             self.spawn_load_timeline();
         }
+
+        if actions.enable_rdp {
+            self.spawn_enable_rdp(ip.to_string(), device_id.to_string());
+        }
+
+        if actions.launch_ssh {
+            // Tailscale SSH: ssh <ip>
+            #[cfg(target_os = "windows")]
+            let _ = std::process::Command::new("cmd")
+                .args(&["/C", "start", "ssh", ip])
+                .spawn();
+            
+            #[cfg(not(target_os = "windows"))]
+            let _ = std::process::Command::new("ssh").arg(ip).spawn();
+        }
     }
 
     // ── Remote Terminal Spawners ─────────────────────────────────────────────
 
     fn spawn_create_terminal_session(&mut self, ip: String, device_id: String) {
+        let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            match AgentClient::new(&ip, 3030, api_key) {
+            match AgentClient::new(&ip, port, api_key) {
                 Ok(client) => match client.create_terminal_session() {
                     Ok(session_id) => {
                         let _ = tx.send(AppEvent::RemoteTerminalCreated { device_id, session_id });
@@ -1285,11 +1340,12 @@ impl TheGridApp {
     fn spawn_poll_terminal_output(&self, device_id: String, session_id: String) {
         let ip = self.devices.iter().find(|d| d.id == device_id).and_then(|d| d.primary_ip().map(|s| s.to_string()));
         let Some(ip) = ip else { return; };
+        let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
         let tx = self.event_tx.clone();
 
         std::thread::spawn(move || {
-            if let Ok(client) = AgentClient::new(&ip, 3030, api_key) {
+            if let Ok(client) = AgentClient::new(&ip, port, api_key) {
                 loop {
                     match client.get_terminal_output(&session_id) {
                         Ok(data) => {
@@ -1309,6 +1365,18 @@ impl TheGridApp {
     fn spawn_launch_scrcpy(&self, ip: String) {
         let api_key = self.config.api_key.clone();
         let _ = self.event_tx.send(AppEvent::EnableAdb { ip, api_key });
+    }
+
+    pub fn get_node_status(&self, device_id: &str) -> NodeStatus {
+        let device = self.devices.iter().find(|d| d.id == device_id);
+        let is_reachable = device.map(|d| d.is_likely_online()).unwrap_or(false);
+        if !is_reachable { return NodeStatus::Offline; }
+        
+        let last_poll = self.telemetry_last_poll.get(device_id);
+        // If we've heard from the agent in the last 2.5 minutes, consider it active
+        let is_active = last_poll.map(|t| t.elapsed().as_secs() < 150).unwrap_or(false);
+        
+        if is_active { NodeStatus::GridActive } else { NodeStatus::Reachable }
     }
 }
 
@@ -1368,7 +1436,7 @@ impl eframe::App for TheGridApp {
 
         for d in &self.devices {
             if let Some(ip) = d.primary_ip() {
-                let last_poll = self.telemetry_last_poll.get(&d.name);
+                let last_poll = self.telemetry_last_poll.get(&d.id);
                 let needs_poll = last_poll.map(|t| t.elapsed().as_secs() > 60).unwrap_or(true);
                 
                 if needs_poll {
@@ -1377,7 +1445,7 @@ impl eframe::App for TheGridApp {
                             local_telemetry_needed = true;
                         }
                     } else {
-                        ping_targets.push((ip.to_string(), d.name.clone()));
+                        ping_targets.push((ip.to_string(), d.id.clone()));
                     }
                 }
             }
@@ -1386,8 +1454,8 @@ impl eframe::App for TheGridApp {
         if local_telemetry_needed {
             self.spawn_collect_local_telemetry();
         }
-        for (ip, name) in ping_targets {
-            self.spawn_ping(ip, name);
+        for (ip, id) in ping_targets {
+            self.spawn_ping(ip, id);
         }
 
         // 6. Screen dispatch
@@ -1444,9 +1512,13 @@ impl eframe::App for TheGridApp {
                         .stroke(egui::Stroke::new(1.0, Colors::BORDER))
                     )
                     .show(ctx, |ui| {
+                        let devices_with_status: Vec<_> = self.devices.iter().map(|d| {
+                            (d.clone(), self.get_node_status(&d.id))
+                        }).collect();
+
                         device_clicked = crate::views::dashboard::render_device_panel(
                             ui,
-                            &self.devices,
+                            &devices_with_status,
                             &telemetry_snap,
                             self.selected_idx,
                             &mut self.device_filter,
@@ -1507,6 +1579,7 @@ impl eframe::App for TheGridApp {
                             let watch_snap   = self.runtime.config.lock().unwrap().watch_paths.clone();
                             let telem_snap   = telemetry_snap.get(&device.id).cloned();
 
+                            let status = self.get_node_status(&device.id);
                             let mut detail = DetailState {
                                 device:         &device,
                                 active_tab:     &mut self.active_tab,
@@ -1525,17 +1598,13 @@ impl eframe::App for TheGridApp {
                                 remote_url_edit: &mut self.remote_url_edit,
                                 terminal_view: self.terminal_sessions.get_mut(&device.id),
                                 local_device_name: &self.config.device_name,
+                                status,
                             };
 
                             // Pass timeline state into the render
                             let actions = crate::views::dashboard::render_detail_panel_with_timeline(
                                 ui, &mut detail, &mut self.timeline, &self.index_stats
                             );
-
-                            // Auto-fetch telemetry when viewing a device
-                            if let Some(ip) = device.primary_ip() {
-                                self.spawn_get_telemetry(ip.to_string(), device.id.clone());
-                            }
 
                             if let Some(ip) = device.primary_ip().map(|s| s.to_string()) {
                                 self.handle_detail_actions(actions, &ip, &device.id);
@@ -1583,9 +1652,16 @@ impl eframe::App for TheGridApp {
                             }
                             drop(watcher_lock);
                             
+                            let needs_restart = new_config.api_key != self.config.api_key || new_config.agent_port != self.config.agent_port;
+                            
                             self.config = new_config.clone();
                             // Keep runtime config in sync
                             *self.runtime.config.lock().unwrap() = new_config;
+                            
+                            if needs_restart {
+                                self.runtime.restart_services();
+                            }
+                            
                             self.spawn_load_devices();
                         }
                         Err(e) => self.push_toast(Toast::err(format!("Save failed: {}", e))),

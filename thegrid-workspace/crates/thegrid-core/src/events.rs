@@ -201,4 +201,9 @@ pub enum AppEvent {
 
     // ADB Mirroring Preparation
     EnableAdb { ip: String, api_key: String },
+
+    // RDP Support
+    EnableRdp { ip: String, device_id: String },
+    RdpEnabled { device_id: String },
+    RdpFailed { device_id: String, error: String },
 }
