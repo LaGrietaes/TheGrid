@@ -1278,6 +1278,7 @@ impl TheGridApp {
         }
 
         if actions.launch_scrcpy {
+            self.push_toast(Toast::info("Initializing Screen Mirroring (scrcpy)..."));
             self.spawn_launch_scrcpy(ip.to_string());
         }
 

@@ -246,7 +246,7 @@ pub fn render_device_panel(
                             let d_lower = device.display_name().to_lowercase();
                             
                             let device_type = telemetries.get(&device.id).map(|t| t.device_type.as_str()).unwrap_or("Desktop");
-                            let icon_type = if h_lower.contains("nubia") {
+                            let icon_type = if h_lower.contains("nubia") || d_lower.contains("nubia") {
                                 theme::IconType::Tablet
                             } else if h_lower.contains("nothing") || d_lower.contains("nothing") {
                                 theme::IconType::Smartphone
@@ -385,10 +385,10 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
             });
     }
 
-    if s.is_tg_agent {
+    if s.is_tg_agent && s.device.os.to_lowercase().contains("android") {
         ui.add_space(8.0);
         ui.columns(3, |cols| {
-            if action_card(&mut cols[0], theme::IconType::Desktop, "SCREEN MIRROR", "Launch Scrcpy (ADB over IP)") {
+            if action_card(&mut cols[0], theme::IconType::Tablet, "SCREEN MIRROR", "Launch Scrcpy (ADB over IP)") {
                 actions.launch_scrcpy = true;
             }
             // Future slots

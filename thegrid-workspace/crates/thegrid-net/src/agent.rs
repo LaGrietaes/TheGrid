@@ -14,7 +14,7 @@ use std::time::Duration;
 use thegrid_core::{AppEvent, models::*, Config};
 use ascii::AsciiStr;
 
-const AGENT_VERSION: &str = "0.1.1";
+const AGENT_VERSION: &str = "0.3.0";
 
 
 use crate::tailscale::TailscaleClient;

@@ -114,8 +114,17 @@ fn main() -> Result<()> {
                 AppEvent::FileReceived { name, size } => {
                     log::info!("File received: {} ({} bytes)", name, size);
                 }
-                AppEvent::Status(msg) => {
-                    log::debug!("Status: {}", msg);
+                AppEvent::RemoteAiEmbedRequest { text, response_tx } => {
+                    log::info!("Handling remote AI embed request...");
+                    runtime.handle_remote_ai_embed(text, response_tx);
+                }
+                AppEvent::RemoteAiSearchRequest { query, k, response_tx } => {
+                    log::info!("Handling remote AI search request (k={})...", k);
+                    runtime.handle_remote_ai_search(query, k, response_tx);
+                }
+                AppEvent::RefreshAiServices => {
+                    log::info!("Refreshing AI services...");
+                    runtime.refresh_ai_services();
                 }
                 AppEvent::EnableAdb { .. } => {
                     log::info!("Enabling ADB over TCP/IP (port 5555)...");
@@ -137,9 +146,47 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                AppEvent::EnableRdp { .. } => {
+                    log::warn!("EnableRdp received: RDP enablement is not supported on this headless node.");
+                }
+                AppEvent::Status(msg) => {
+                    if msg.starts_with("config_update:") {
+                        let parts = &msg["config_update:".len()..];
+                        let mut model = None;
+                        let mut url = None;
+                        for part in parts.split(',') {
+                            if part.starts_with("model=") {
+                                let val = part["model=".len()..].trim_matches('"').to_string();
+                                if val != "None" && !val.is_empty() { model = Some(val); }
+                            } else if part.starts_with("url=") {
+                                let val = part["url=".len()..].trim_matches('"').to_string();
+                                if val != "None" && !val.is_empty() { url = Some(val); }
+                            }
+                        }
+
+                        let mut cfg = { runtime.config.lock().unwrap().clone() };
+                        let mut changed = false;
+                        if model.is_some() { cfg.ai_model = model; changed = true; }
+                        if url.is_some() { cfg.ai_provider_url = url; changed = true; }
+                        
+                        if changed {
+                            log::info!("Updating local config from remote command: {:?}", cfg);
+                            let _ = cfg.save();
+                            {
+                                let mut runtime_cfg = runtime.config.lock().unwrap();
+                                *runtime_cfg = cfg;
+                            }
+                            runtime.refresh_ai_services();
+                        }
+                    } else if msg.starts_with("index_count:") {
+                         log::info!("Remote index count update: {}", msg);
+                    } else {
+                        log::debug!("Status: {}", msg);
+                    }
+                }
                 _ => {
-                    // Ignore GUI events
-                    log::debug!("Ignored event: {:?}", event);
+                    // Ignore GUI-only events
+                    log::trace!("Ignored event: {:?}", event);
                 }
             }
         }
