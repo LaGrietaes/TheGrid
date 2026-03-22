@@ -50,11 +50,9 @@ impl RdpLauncher {
             let mut cmd = Command::new("mstsc.exe");
             cmd.arg(format!("/v:{}", ip));
 
-            if let Some(user) = username {
-                if !user.is_empty() {
-                    cmd.arg(format!("/u:{}", user));
-                }
-            }
+            // Windows mstsc.exe does NOT support a `/u:` parameter natively.
+            // If the user needs to authenticate, mstsc will display the credentials prompt automatically.
+            let _ = username; // Ignored for now. Future: write out a temporary .rdp file.
 
             if let RdpResolution::Custom(w, h) = resolution {
                 cmd.arg(format!("/w:{}", w));
