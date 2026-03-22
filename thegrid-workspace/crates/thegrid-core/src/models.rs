@@ -29,7 +29,7 @@ impl TailscaleDevice {
     pub fn primary_ip(&self) -> Option<&str> {
         self.addresses.iter()
             .find(|a| a.starts_with("100."))
-            .map(|s| s.as_str())
+            .map(|s| s.split('/').next().unwrap_or(s))
     }
 
     pub fn is_likely_online(&self) -> bool {
