@@ -17,6 +17,8 @@
 //   + Clipboard inbox items: click to populate clip_out for inspection
 // ═══════════════════════════════════════════════════════════════════════════════
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use egui::{Color32, RichText, Ui, ScrollArea};
 use thegrid_core::models::*;
 use crate::theme::{self, Colors};
@@ -125,6 +127,9 @@ pub fn render_device_panel(
     devices_with_status: &[(TailscaleDevice, crate::app::NodeStatus)],
     telemetries: &std::collections::HashMap<String, thegrid_core::models::NodeTelemetry>,
     selected_idx: Option<usize>,
+    selected_node_ids: &mut Vec<String>,
+    projects: &[Project],
+    categories: &[Category],
     filter: &mut String,
     needs_refresh: &mut bool,
     local_device_name: &str,
@@ -191,26 +196,14 @@ pub fn render_device_panel(
 
     ui.add(egui::Separator::default().spacing(0.0));
 
-    // ── Device list ───────────────────────────────────────────────────────────
     let filter_lower = filter.to_lowercase();
     ScrollArea::vertical()
-        .id_source("device_list_scroll") // FIX: id_source replaces deprecated id_source
+        .id_source("device_list_scroll")
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
-            if devices_with_status.is_empty() {
-                ui.add_space(40.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("◌").color(Colors::TEXT_MUTED).size(24.0));
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new("SCANNING NETWORK...")
-                            .color(Colors::TEXT_MUTED).size(10.0)
-                    );
-                });
-                return;
-            }
-
+            // ── Nodes Section ────────────────────────────────────────────────────────
+            ui.add_space(8.0);
             for (idx, (device, status)) in devices_with_status.iter().enumerate() {
                 let matches = filter_lower.is_empty()
                     || device.hostname.to_lowercase().contains(&filter_lower)
@@ -220,7 +213,11 @@ pub fn render_device_panel(
                 if !matches { continue; }
 
                 let is_selected = selected_idx == Some(idx);
-                let bg          = if is_selected { Colors::BG_ACTIVE } else { Color32::TRANSPARENT };
+                let is_in_cluster = selected_node_ids.contains(&device.id);
+                
+                let bg = if is_selected { Colors::BG_ACTIVE } 
+                         else if is_in_cluster { Color32::from_rgba_premultiplied(0, 150, 0, 30) }
+                         else { Color32::TRANSPARENT };
                 
                 let status_color = match status {
                     crate::app::NodeStatus::GridActive => Colors::GREEN,
@@ -245,10 +242,17 @@ pub fn render_device_panel(
                             );
                         }
                         ui.horizontal(|ui| {
+                            // Checkbox for cluster selection
+                            let mut checked = is_in_cluster;
+                            if ui.checkbox(&mut checked, "").changed() {
+                                if checked { selected_node_ids.push(device.id.clone()); }
+                                else { selected_node_ids.retain(|id| id != &device.id); }
+                            }
+
                             theme::status_dot(ui, status_color);
                             ui.add_space(2.0);
                             
-                            // Sidebar Row Vector Icon (using telemetry lookup + hostname overrides)
+                            // Sidebar Row Vector Icon
                             let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
                             let h_lower = device.hostname.to_lowercase();
                             let d_lower = device.display_name().to_lowercase();
@@ -276,39 +280,50 @@ pub fn render_device_panel(
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(device.display_name().to_uppercase())
-                                            .color(Colors::TEXT).size(11.0).strong()
+                                            .color(Colors::TEXT).size(10.0).strong()
                                     );
                                     
                                     if device.hostname == local_device_name {
                                         ui.add_space(4.0);
-                                        ui.label(
-                                            RichText::new("[LOCAL]")
-                                                .color(Colors::GREEN)
-                                                .size(8.0)
-                                                .strong()
-                                        );
+                                        ui.label(RichText::new("[LOCAL]").color(Colors::GREEN).size(7.0).strong());
                                     }
                                 });
                                 ui.label(
                                     RichText::new(device.primary_ip().unwrap_or("—"))
-                                        .color(Colors::TEXT_DIM).size(9.0)
+                                        .color(Colors::TEXT_DIM).size(8.0)
                                 );
                             });
                         });
                     }).response;
 
-                let interact = ui.interact(
-                    resp.rect,
-                    egui::Id::new(("dev_row", idx)),
-                    egui::Sense::click(),
-                );
-                if interact.hovered() && !is_selected {
-                    ui.painter().rect_stroke(
-                        resp.rect, egui::Rounding::ZERO,
-                        egui::Stroke::new(1.0, Colors::BORDER2),
-                    );
-                }
+                let interact = ui.interact(resp.rect, egui::Id::new(("dev_row", idx)), egui::Sense::click());
                 if interact.clicked() { clicked = Some(idx); }
+            }
+
+            // ── Projects Section ──────────────────────────────────────────────────
+            ui.add_space(16.0);
+            ui.label(RichText::new("// PROJECTS").color(Colors::GREEN).size(9.0).strong());
+            ui.add_space(4.0);
+            for project in projects {
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    if ui.selectable_label(false, RichText::new(format!("⬡ {}", project.name.to_uppercase())).color(Colors::TEXT).size(10.0)).clicked() {
+                        // Project filter logic (Phase 3 next)
+                    }
+                });
+            }
+
+            // ── Categories Section ────────────────────────────────────────────────
+            ui.add_space(16.0);
+            ui.label(RichText::new("// CATEGORIES").color(Colors::GREEN).size(9.0).strong());
+            ui.add_space(4.0);
+            for cat in categories {
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    if ui.selectable_label(false, RichText::new(format!("{} {}", cat.icon, cat.name.to_uppercase())).color(Colors::TEXT).size(10.0)).clicked() {
+                        // Category filter logic (Phase 3 next)
+                    }
+                });
             }
         });
 
@@ -1134,17 +1149,39 @@ pub fn render_detail_panel_with_timeline(
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Wake button for offline devices
-                    if !is_online {
-                        if crate::theme::micro_button(ui, "⚡ WAKE").clicked() {
-                            actions.wake_device = true;
-                        }
-                        ui.add_space(6.0);
-                    }
+                    // Start from far right
                     theme::status_badge(ui, if is_online { "ONLINE" } else { "OFFLINE" }, Some(theme::IconType::Pulse), is_online);
                     if s.is_tg_agent {
                         ui.add_space(8.0);
                         ui.label(RichText::new("⬡ AGENT").color(Colors::GREEN).size(9.0));
+                    }
+
+                    // Separation line
+                    ui.add_space(16.0);
+                    ui.painter().line_segment(
+                        [ui.max_rect().right_top() + egui::vec2(-80.0, 6.0), ui.max_rect().right_bottom() + egui::vec2(-80.0, -6.0)],
+                        egui::Stroke::new(1.0, Colors::BORDER)
+                    );
+                    ui.add_space(16.0);
+
+                    // ── Telemetry HUB (Header) ──
+                    if let Some(telem) = s.telemetry {
+                        // AI Status Badge (Compact)
+                        if let Some(status) = &telem.ai_status {
+                            let status_color = if status == "Processing" { Colors::AMBER } else if status == "Generating" { Colors::GREEN } else { Colors::TEXT_DIM };
+                            ui.label(RichText::new(status.to_uppercase()).color(status_color).size(9.0).strong());
+                            ui.label(RichText::new("AI:").color(Colors::TEXT_DIM).size(8.0).strong());
+                            ui.add_space(12.0);
+                        }
+
+                        // Disk
+                        crate::telemetry::render_gauge(ui, "DSK", None, telem.disk_pct(), &format!("{:.0}%", telem.disk_pct() * 100.0));
+                        ui.add_space(12.0);
+                        // RAM
+                        crate::telemetry::render_gauge(ui, "RAM", None, telem.ram_pct(), &format!("{:.0}%", telem.ram_pct() * 100.0));
+                        ui.add_space(12.0);
+                        // CPU
+                        crate::telemetry::render_gauge(ui, "CPU", None, telem.cpu_pct, &format!("{:.0}%", telem.cpu_pct * 100.0));
                     }
                 });
             });
@@ -1179,87 +1216,9 @@ pub fn render_detail_panel_with_timeline(
                     });
             }
 
-            // ── Telemetry gauges (Phase 3) ─────────────────────────────────
+            // ── Capabilities ──
             if let Some(telem) = s.telemetry {
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    ui.set_min_width(ui.available_width());
-                    // CPU gauge
-                    crate::telemetry::render_gauge(
-                        ui, "CPU", Some(crate::theme::IconType::Cpu),
-                        telem.cpu_pct,
-                        &format!("{:.0}%", telem.cpu_pct),
-                    );
-                    ui.add_space(16.0);
-                    // RAM gauge
-                    crate::telemetry::render_gauge(
-                        ui, "RAM", Some(crate::theme::IconType::Ram),
-                        telem.ram_pct(),
-                        &format!("{} / {}",
-                            crate::telemetry::fmt_bytes(telem.ram_used),
-                            crate::telemetry::fmt_bytes(telem.ram_total)
-                        ),
-                    );
-                    ui.add_space(16.0);
-                    // Disk gauge
-                    crate::telemetry::render_gauge(
-                        ui, "DISK", Some(crate::theme::IconType::Disk),
-                        telem.disk_pct(),
-                        &format!("{} / {}",
-                            crate::telemetry::fmt_bytes(telem.disk_used),
-                            crate::telemetry::fmt_bytes(telem.disk_total)
-                        ),
-                    );
-                    // AI badge
-                    if telem.is_ai_capable {
-                        ui.add_space(12.0);
-                        ui.label(RichText::new(format!("AI NODE {}", crate::icons::Glyphs::BRAND_HEX_F)).color(Colors::GREEN).size(8.0).strong());
-                    }
-                });
-
-                // GPU Gauge (New)
-                if let Some(gpu_name) = &telem.gpu_name {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        crate::telemetry::render_gauge(
-                            ui, "GPU", Some(crate::theme::IconType::Gpu),
-                            telem.gpu_pct.unwrap_or(0.0),
-                            &format!("{} ({:.0}%)", gpu_name, telem.gpu_pct.unwrap_or(0.0)),
-                        );
-                    });
-                }
-
-                // AI Status & Token Speed (New)
-                if let Some(status) = &telem.ai_status {
-                    ui.add_space(10.0);
-                    egui::Frame::none()
-                        .fill(Colors::BG_WIDGET)
-                        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-                        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                                theme::draw_vector_icon(ui, rect, theme::IconType::Ai, Colors::GREEN);
-                                ui.add_space(6.0);
-
-                                ui.label(RichText::new("AI STATUS:").color(Colors::TEXT_DIM).size(8.0).strong());
-                                let status_color = if status == "Processing" { Colors::AMBER } else if status == "Generating" { Colors::GREEN } else { Colors::TEXT_DIM };
-                                ui.label(RichText::new(status.to_uppercase()).color(status_color).size(9.0).strong());
-                                
-                                if let Some(tps) = telem.ai_tokens_per_sec {
-                                    ui.add_space(12.0);
-                                    ui.label(RichText::new(format!("{:.1} t/s", tps)).color(Colors::GREEN).size(9.0));
-                                }
-
-                                if let Some(thoughts) = &telem.ai_thoughts {
-                                    ui.add_space(8.0);
-                                    ui.label(RichText::new(format!("// {}", thoughts)).color(Colors::TEXT_DIM).size(8.0).italics());
-                                }
-                            });
-                        });
-                }
-
-                ui.add_space(12.0);
+                ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
                     if telem.capabilities.has_rdp {
                         theme::status_badge(ui, "RDP", Some(theme::IconType::RDP), true);
@@ -1288,6 +1247,12 @@ pub fn render_detail_panel_with_timeline(
                     if !telem.capabilities.drives.is_empty() {
                         let count = telem.capabilities.drives.len();
                         theme::status_badge(ui, &format!("STORAGE: {} UNITS", count), Some(theme::IconType::Disk), true);
+                    }
+                    
+                    // GPU name if present
+                    if let Some(gpu) = &telem.gpu_name {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(format!("GPU: {}", gpu)).color(Colors::TEXT_DIM).size(8.0));
                     }
                 });
             } else {
@@ -1367,6 +1332,151 @@ pub fn render_detail_panel_with_timeline(
         });
 
     actions
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cluster View (Phase 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cluster View (Phase 3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub struct ClusterActions {
+    pub load_node_path: Option<(String, PathBuf)>,
+}
+
+pub fn render_cluster_view(
+    ui: &mut Ui,
+    devices: &[TailscaleDevice],
+    telemetries: &HashMap<String, NodeTelemetry>,
+    cluster_paths: &mut HashMap<String, PathBuf>,
+    cluster_files: &HashMap<String, Vec<RemoteFile>>,
+    local_device_name: &str,
+) -> ClusterActions {
+    let mut actions = ClusterActions::default();
+    
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("// CLUSTER VIEW").color(Colors::GREEN).size(10.0).strong());
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!("{} NODES SYNCED", devices.len())).color(Colors::TEXT_DIM).size(9.0));
+    });
+    ui.add_space(16.0);
+
+    let num_nodes = devices.len();
+    let num_cols = if num_nodes > 2 { 2 } else { 1 };
+    
+    egui::Grid::new("cluster_grid")
+        .num_columns(num_cols)
+        .spacing([12.0, 12.0])
+        .min_col_width(ui.available_width() / num_cols as f32 - 12.0)
+        .show(ui, |ui| {
+            for (i, dev) in devices.iter().enumerate() {
+                ui.vertical(|ui| {
+                    if let Some(act) = render_cluster_node_explorer(
+                        ui, 
+                        dev, 
+                        telemetries.get(&dev.id), 
+                        cluster_paths.get(&dev.id),
+                        cluster_files.get(&dev.id).unwrap_or(&vec![]),
+                        local_device_name
+                    ) {
+                        actions.load_node_path = Some((dev.id.clone(), act));
+                    }
+                });
+                if (i + 1) % num_cols == 0 { ui.end_row(); }
+            }
+        });
+
+    actions
+}
+
+fn render_cluster_node_explorer(
+    ui: &mut Ui,
+    dev: &TailscaleDevice,
+    telem: Option<&NodeTelemetry>,
+    current_path: Option<&PathBuf>,
+    files: &[RemoteFile],
+    local_device_name: &str,
+) -> Option<PathBuf> {
+    let mut next_path = None;
+    let is_local = dev.hostname == local_device_name;
+    let bg = if is_local { Color32::from_rgba_premultiplied(0, 100, 0, 20) } else { Colors::BG_WIDGET };
+
+    egui::Frame::none()
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .inner_margin(egui::Margin::same(12.0))
+        .show(ui, |ui| {
+            ui.set_min_height(300.0);
+            
+            // Node Header
+            ui.horizontal(|ui| {
+                let status_color = if dev.is_likely_online() { Colors::GREEN } else { Colors::TEXT_DIM };
+                theme::status_dot(ui, status_color);
+                ui.label(RichText::new(dev.display_name().to_uppercase()).color(Colors::TEXT).size(10.0).strong());
+                if is_local {
+                    ui.label(RichText::new("[MASTER]").color(Colors::GREEN).size(8.0).strong());
+                }
+            });
+            ui.add_space(8.0);
+
+            // Drive Navigation
+            if let Some(t) = telem {
+                if !t.capabilities.drives.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("DRIVE:").color(Colors::TEXT_DIM).size(8.0));
+                        for drive in &t.capabilities.drives {
+                            if ui.selectable_label(false, &drive.name).clicked() {
+                                next_path = Some(PathBuf::from(&drive.name));
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+            }
+
+            // Path Bar
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("PATH:").color(Colors::TEXT_DIM).size(8.0));
+                let path_str = current_path.map(|p: &PathBuf| p.to_string_lossy().to_string()).unwrap_or_else(|| "/".to_string());
+                ui.label(RichText::new(path_str).color(Colors::TEXT).size(8.0));
+            });
+            ui.add_space(8.0);
+
+            // File List
+            ScrollArea::vertical()
+                .id_source(format!("scroll_{}", dev.id))
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    if files.is_empty() {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(RichText::new("// EMPTY OR LOADING").color(Colors::TEXT_DIM).size(7.0).italics());
+                        });
+                    } else {
+                        for file in files {
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                let icon = if file.is_dir { theme::IconType::Folder } else { theme::IconType::Disk };
+                                theme::draw_vector_icon(ui, icon_rect, icon, Colors::GREEN);
+                                ui.add_space(4.0);
+                                if ui.selectable_label(false, RichText::new(&file.name).size(9.0)).clicked() {
+                                    if file.is_dir {
+                                        let mut p = current_path.cloned().unwrap_or_else(|| PathBuf::from("/"));
+                                        p.push(&file.name);
+                                        next_path = Some(p);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+        });
+
+    next_path
 }
 
 fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, _actions: &mut DetailActions) {

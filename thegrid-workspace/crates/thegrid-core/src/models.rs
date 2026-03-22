@@ -275,3 +275,18 @@ pub enum PreviewKind {
     Pdf,
     UnSupported,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Category {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+}

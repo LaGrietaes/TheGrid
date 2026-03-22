@@ -114,6 +114,8 @@ pub struct TheGridApp {
     devices_loading:     bool,
     device_filter:       String,
     selected_idx:        Option<usize>,
+    /// Phase 3: IDs of nodes currently participating in a cluster operation
+    selected_node_ids:   Vec<String>,
     tailscale_connected: bool,
 
     // ── Per-device UI state ───────────────────────────────────────────────────
@@ -145,6 +147,13 @@ pub struct TheGridApp {
     viewport:         ViewportState,
 
     timeline: TimelineState,
+    /// Phase 3: Cluster View state (path per node)
+    cluster_paths:    HashMap<String, PathBuf>,
+    cluster_files:    HashMap<String, Vec<RemoteFile>>,
+
+    // ── Phase 3: Project & Category State ─────────────────────────────────────
+    projects:   Vec<Project>,
+    categories: Vec<Category>,
 
     mesh_sync_last_at: std::time::Instant,
 
@@ -255,6 +264,7 @@ impl TheGridApp {
             devices_loading: false,
             device_filter: String::new(),
             selected_idx: None,
+            selected_node_ids: Vec::new(),
             tailscale_connected: false,
             active_tab:     DashTab::default(),
             rdp_username,
@@ -282,11 +292,23 @@ impl TheGridApp {
             status_msg: "READY".into(),
             mesh_sync_last_at: std::time::Instant::now(),
             
+            projects: vec![
+                Project { id: "p1".into(), name: "THE GRID".into(), description: "Core System".into(), tags: vec!["#core".into(), "#system".into()] },
+                Project { id: "p2".into(), name: "RECON".into(), description: "Active Scanning".into(), tags: vec!["#net".into()] },
+            ],
+            categories: vec![
+                Category { id: "c1".into(), name: "MEDIA".into(), icon: "📽".into() },
+                Category { id: "c2".into(), name: "LOGS".into(), icon: "🗒".into() },
+                Category { id: "c3".into(), name: "DUMPS".into(), icon: "📦".into() },
+            ],
+            
             // --- Phase 4: UI state (kept in app) ---
             semantic_enabled:  false,
             semantic_loading:  true,
             embedding_progress: (0, 0),
             hashing_progress:   (0, 0),
+            cluster_paths: HashMap::new(),
+            cluster_files: HashMap::new(),
             local_hostname,
             current_remote_path: PathBuf::new(),
             remote_model_edit: String::new(),
@@ -364,6 +386,18 @@ impl TheGridApp {
 
     fn spawn_browse_remote_directory(&self, ip: String, device_id: String, path: PathBuf) {
         self.runtime.spawn_browse_remote_directory(ip, device_id, path);
+    }
+
+    /// Cluster View: browse a specific node's directory and store result in cluster_files
+    fn spawn_load_cluster_path(&self, device_id: String, path: PathBuf) {
+        // Find the IP for this device
+        if let Some(ip) = self.devices.iter()
+            .find(|d| d.id == device_id)
+            .and_then(|d| d.primary_ip())
+            .map(|s| s.to_string())
+        {
+            self.runtime.spawn_browse_remote_directory(ip, device_id, path);
+        }
     }
 
     fn spawn_download_remote_file_anywhere(&self, ip: String, path: PathBuf) {
@@ -726,6 +760,12 @@ impl TheGridApp {
                 }
 
                 AppEvent::RemoteBrowseLoaded { device_id, path, files } => {
+                    // Cluster view: update per-node file state if applicable
+                    if self.selected_node_ids.contains(&device_id) {
+                        self.cluster_files.insert(device_id.clone(), files.clone());
+                        self.cluster_paths.insert(device_id.clone(), path.clone());
+                    }
+                    // Single-node view: also update the legacy remote_files state
                     if self.selected_idx.and_then(|i| self.devices.get(i)).map(|d| d.id == device_id).unwrap_or(false) {
                         self.remote_files = files;
                         self.current_remote_path = path;
@@ -1792,6 +1832,9 @@ impl eframe::App for TheGridApp {
                             &devices_with_status,
                             &telemetry_snap,
                             self.selected_idx,
+                            &mut self.selected_node_ids,
+                            &self.projects,
+                            &self.categories,
                             &mut self.device_filter,
                             &mut needs_refresh,
                             &self.config.device_name,
@@ -1829,10 +1872,33 @@ impl eframe::App for TheGridApp {
                             return;
                         }
 
-                        // Clone device to release the borrow on self.devices
-                        let selected_device = self.selected_idx
-                            .and_then(|i| self.devices.get(i))
-                            .cloned();
+                        // ── Cluster View vs Single Detail View ────────────────────────
+                        let is_cluster = self.selected_node_ids.len() > 1;
+
+                        if is_cluster {
+                            let cluster_devices: Vec<TailscaleDevice> = self.devices.iter()
+                                .filter(|d| self.selected_node_ids.contains(&d.id))
+                                .cloned()
+                                .collect();
+
+                            let cluster_actions = crate::views::dashboard::render_cluster_view(
+                                ui,
+                                &cluster_devices,
+                                &telemetry_snap,
+                                &mut self.cluster_paths,
+                                &self.cluster_files,
+                                &self.config.device_name,
+                            );
+
+                            if let Some((node_id, path)) = cluster_actions.load_node_path {
+                                self.spawn_load_cluster_path(node_id, path);
+                            }
+                        } else {
+                            // Single device detail view (Existing logic)
+                            // Clone device to release the borrow on self.devices
+                            let selected_device = self.selected_idx
+                                .and_then(|i| self.devices.get(i))
+                                .cloned();
 
                         if let Some(device) = selected_device {
                             // If Timeline tab just became active, load it
@@ -1885,6 +1951,7 @@ impl eframe::App for TheGridApp {
                         } else {
                             crate::views::dashboard::render_empty_state(ui);
                         }
+                    }
                     });
 
                 // ── Overlays (rendered on top of everything) ──────────────────
