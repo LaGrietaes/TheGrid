@@ -61,9 +61,8 @@ impl RdpLauncher {
                 cmd.arg(format!("/h:{}", h));
             }
 
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x00000008); // DETACHED_PROCESS
-
+            // Run the process directly. mstsc is a GUI app, so it won't open a console.
+            // Using DETACHED_PROCESS breaks UI rendering and clipboard in Windows 11.
             cmd.spawn()
                 .map_err(|e| anyhow::anyhow!("Failed to launch mstsc.exe: {}", e))?;
 
