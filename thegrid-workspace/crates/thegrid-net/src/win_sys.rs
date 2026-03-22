@@ -68,12 +68,18 @@ pub fn enable_rdp() -> Result<()> {
 
         log::info!("Configuring firewall rules for Remote Desktop...");
         
-        // 3. Enable Firewall rules
-        let fw_status = Command::new("netsh")
+        // 3. Enable Firewall rules - try English and Spanish localized names
+        let fw_en = Command::new("netsh")
             .args(&["advfirewall", "firewall", "set", "rule", "group=\"remote desktop\"", "new", "enable=Yes"])
-            .status()?;
+            .status();
+            
+        let fw_es = Command::new("netsh")
+            .args(&["advfirewall", "firewall", "set", "rule", "group=\"escritorio remoto\"", "new", "enable=Yes"])
+            .status();
 
-        if !fw_status.success() {
+        if fw_en.map(|s| s.success()).unwrap_or(false) || fw_es.map(|s| s.success()).unwrap_or(false) {
+            log::info!("Successfully enabled Remote Desktop firewall rule group.");
+        } else {
             log::warn!("Failed to enable firewall rule group 'remote desktop'. You may need to enable it manually.");
         }
 
