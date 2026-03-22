@@ -484,6 +484,87 @@ impl AgentServer {
             return Ok(());
         }
 
+        if method == "DELETE" && url.starts_with("/v1/files") {
+            let enabled = {
+                let cfg = self.config.lock().unwrap();
+                cfg.enable_file_access
+            };
+            if !enabled {
+                req.respond(Response::from_string(r#"{"error":"forbidden"}"#).with_status_code(403))?;
+                return Ok(());
+            }
+            let path_str = url.split("path=").nth(1).unwrap_or("");
+            let path_str = urlencoding_decode(path_str);
+            let path = PathBuf::from(path_str);
+
+            if !path.exists() {
+                req.respond(Response::from_string(r#"{"error":"not found"}"#).with_status_code(404))?;
+            } else {
+                let res = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                match res {
+                    Ok(_) => req.respond(Response::from_string(r#"{"ok":true}"#))?,
+                    Err(e) => req.respond(Response::from_string(format!(r#"{{"error":"{}"}}"#, e)).with_status_code(500))?,
+                }
+            }
+            return Ok(());
+        }
+
+        if method == "POST" && url == "/v1/files/rename" {
+            #[derive(serde::Deserialize)]
+            struct RenameReq { path: String, new_name: String }
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body)?;
+            if let Ok(r) = serde_json::from_str::<RenameReq>(&body) {
+                let old_path = PathBuf::from(&r.path);
+                let mut new_path = old_path.clone();
+                new_path.set_file_name(&r.new_name);
+                
+                if old_path.exists() {
+                    match std::fs::rename(&old_path, &new_path) {
+                        Ok(_) => req.respond(Response::from_string(r#"{"ok":true}"#))?,
+                        Err(e) => req.respond(Response::from_string(format!(r#"{{"error":"{}"}}"#, e)).with_status_code(500))?,
+                    }
+                } else {
+                    req.respond(Response::from_string(r#"{"error":"not found"}"#).with_status_code(404))?;
+                }
+            } else {
+                req.respond(Response::from_string(r#"{"error":"bad request"}"#).with_status_code(400))?;
+            }
+            return Ok(());
+        }
+
+        if method == "POST" && url == "/v1/files/move" {
+            #[derive(serde::Deserialize)]
+            struct MoveReq { paths: Vec<String>, dest_dir: String }
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body)?;
+            if let Ok(m) = serde_json::from_str::<MoveReq>(&body) {
+                let dest_dir = PathBuf::from(&m.dest_dir);
+                if !dest_dir.exists() {
+                    std::fs::create_dir_all(&dest_dir)?;
+                }
+                let mut success = true;
+                for p in m.paths {
+                    let old_path = PathBuf::from(&p);
+                    if let Some(name) = old_path.file_name() {
+                        let new_path = dest_dir.join(name);
+                        if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                            log::error!("Move failed for {}: {}", p, e);
+                            success = false;
+                        }
+                    }
+                }
+                req.respond(Response::from_string(format!(r#"{{"ok":{}}}"#, success)))?;
+            } else {
+                req.respond(Response::from_string(r#"{"error":"bad request"}"#).with_status_code(400))?;
+            }
+            return Ok(());
+        }
+
         // ── Terminal Endpoints ──
         if method == "POST" && url == "/v1/terminal/session" {
             let (writer, mut reader): (Box<dyn Write + Send>, Box<dyn Read + Send>) = {
@@ -782,6 +863,37 @@ impl AgentClient {
         Ok(r.files)
     }
 
+
+
+    pub fn delete_file(&self, path: &str) -> Result<()> {
+        let url = format!("{}/v1/files?path={}", self.base_url, urlencoding_encode(path));
+        let resp = self.http.delete(&url).header("X-Grid-Key", &self.api_key).send()?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(())
+    }
+
+    pub fn rename_file(&self, path: &str, new_name: &str) -> Result<()> {
+        let url = format!("{}/v1/files/rename", self.base_url);
+        let body = serde_json::json!({ "path": path, "new_name": new_name });
+        let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).json(&body).send()?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(())
+    }
+
+    pub fn move_files(&self, paths: Vec<String>, dest_dir: &str) -> Result<()> {
+        let url = format!("{}/v1/files/move", self.base_url);
+        let body = serde_json::json!({ "paths": paths, "dest_dir": dest_dir });
+        let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).json(&body).send()?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(())
+    }
+
     pub fn download_file(&self, filename: &str, dest_dir: &Path) -> Result<PathBuf> {
         let url = format!("{}/files/{}", self.base_url, urlencoding_encode(filename));
         let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).send()?;
@@ -998,6 +1110,18 @@ fn collect_telemetry(config: &Config) -> NodeTelemetry {
             total,
         });
     }
+    
+    // BPW: Collect local IPs to identify wired/direct connections
+    let mut local_ips = Vec::new();
+    if let Ok(ifs) = get_if_addrs::get_if_addrs() {
+        for interface in ifs {
+            if !interface.is_loopback() {
+                if let std::net::IpAddr::V4(addr) = interface.ip() {
+                    local_ips.push(addr.to_string());
+                }
+            }
+        }
+    }
 
     let mut ai_models = Vec::new();
     if let Some(m) = &config.ai_model {
@@ -1043,6 +1167,7 @@ fn collect_telemetry(config: &Config) -> NodeTelemetry {
         gpu_pct: None,
         gpu_mem_used: None,
         gpu_mem_total: None,
+        local_ips,
         ai_status: Some("Idle".into()),
         ai_tokens_per_sec: None,
         ai_thoughts: None,

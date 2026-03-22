@@ -55,7 +55,10 @@ pub struct DetailState<'a> {
     /// Phase 3: live telemetry for this device (None = not yet fetched)
     pub telemetry:      Option<&'a thegrid_core::models::NodeTelemetry>,
     /// New in Node Enhancement: tracks the current directory being browsed
-    pub current_remote_path: &'a mut std::path::PathBuf,
+    #[allow(dead_code)]
+    pub _current_remote_path: &'a mut std::path::PathBuf,
+    /// Phase 2: File Manager State
+    pub file_manager: &'a mut crate::app::FileManagerState,
     /// New in Node Enhancement: tracks the model name being typed in the UI
     /// New in Node Enhancement: tracks the model name being typed in the UI
     pub remote_model_edit: &'a mut String,
@@ -104,6 +107,11 @@ pub struct DetailActions {
     pub launch_scrcpy:        bool,
     pub enable_rdp:           bool,
     pub launch_ssh:           bool,
+    pub fm_delete:            Option<Vec<String>>,
+    #[allow(dead_code)]
+    pub _fm_rename:            Option<(String, String)>,
+    #[allow(dead_code)]
+    pub _fm_move:              Option<(Vec<String>, std::path::PathBuf)>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -246,9 +254,9 @@ pub fn render_device_panel(
                             let d_lower = device.display_name().to_lowercase();
                             
                             let device_type = telemetries.get(&device.id).map(|t| t.device_type.as_str()).unwrap_or("Desktop");
-                            let icon_type = if h_lower.contains("nubia") || d_lower.contains("nubia") {
+                            let icon_type = if h_lower.contains("nubia") || d_lower.contains("nubia") || device_type == "Tablet" {
                                 theme::IconType::Tablet
-                            } else if h_lower.contains("nothing") || d_lower.contains("nothing") {
+                            } else if h_lower.contains("nothing") || d_lower.contains("nothing") || device_type == "Smartphone" || device_type == "Phone" {
                                 theme::IconType::Smartphone
                             } else {
                                 match device_type {
@@ -602,192 +610,94 @@ fn action_card(ui: &mut Ui, icon: theme::IconType, label: &str, sub: &str) -> bo
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_files_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
-    ui.columns(2, |cols| {
+    // Weighted layout: 30% Send, 70% File Manager
+    let total_width = ui.available_width();
+    let left_w = (total_width * 0.3).max(200.0);
+    let right_w = total_width - left_w - 12.0;
 
-        // ── Send column ───────────────────────────────────────────────────────
-        // ── Send column (Vector Arrow) ─────────────────────────────────────────
-        cols[0].horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-            let c = rect.center();
-            ui.painter().line_segment([c + egui::vec2(0.0, 5.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
-            ui.painter().line_segment([c + egui::vec2(-3.0, -2.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
-            ui.painter().line_segment([c + egui::vec2(3.0, -2.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
-            ui.add_space(4.0);
-            ui.label(RichText::new("SEND TO NODE").color(Colors::TEXT_DIM).size(9.0).strong());
-        });
-        cols[0].add_space(8.0);
+    ui.horizontal_top(|ui| {
+        // ── Left: Send column ──────────────────────────────────────────────────
+        ui.vertical(|ui| {
+            ui.set_min_width(left_w);
+            ui.set_max_width(left_w);
 
-        let hovering = cols[0].ctx().input(|i| !i.raw.hovered_files.is_empty());
-        let dz_stroke = if hovering {
-            egui::Stroke::new(1.0, Colors::GREEN)
-        } else {
-            egui::Stroke::new(1.0, Colors::BORDER)
-        };
-
-        egui::Frame::none()
-            .fill(Colors::BG_WIDGET)
-            .stroke(dz_stroke)
-            .inner_margin(egui::Margin::same(16.0))
-            .show(&mut cols[0], |ui| {
-                ui.set_min_size(egui::vec2(ui.available_width(), 80.0));
-                ui.vertical_centered(|ui| {
-                    // Vector Hexagon Placeholder
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
-                    let c = rect.center();
-                    let r = 10.0;
-                    let mut points = vec![];
-                    for i in 0..6 {
-                        let angle = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
-                        points.push(c + egui::vec2(r * angle.cos(), r * angle.sin()));
-                    }
-                    ui.painter().add(egui::Shape::convex_polygon(points, Color32::TRANSPARENT, egui::Stroke::new(1.5, Colors::TEXT_MUTED)));
-                    
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("DROP FILES HERE")
-                            .color(Colors::TEXT_MUTED).size(9.0)
-                    );
-                    ui.label(
-                        RichText::new("or SELECT FILES below")
-                            .color(Colors::TEXT_MUTED).size(8.0)
-                    );
-                });
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                let c = rect.center();
+                ui.painter().line_segment([c + egui::vec2(0.0, 5.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+                ui.painter().line_segment([c + egui::vec2(-3.0, -2.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+                ui.painter().line_segment([c + egui::vec2(3.0, -2.0), c + egui::vec2(0.0, -5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
+                ui.add_space(4.0);
+                ui.label(RichText::new("SEND TO NODE").color(Colors::TEXT_DIM).size(9.0).strong());
             });
+            ui.add_space(8.0);
 
-        cols[0].add_space(8.0);
-
-        // File queue status
-        for item in s.file_queue {
-            let (label, color) = match &item.status {
-                FileTransferStatus::Pending   => ("PENDING", Colors::TEXT_MUTED),
-                FileTransferStatus::Sending   => ("SENDING", Colors::AMBER),
-                FileTransferStatus::Done      => ("✓ DONE",  Colors::GREEN),
-                // FIX: was Failed(e) — 'e' unused, suppress warning with _
-                FileTransferStatus::Failed(_) => ("✗ FAIL",  Colors::RED),
+            let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
+            let dz_stroke = if hovering {
+                egui::Stroke::new(1.0, Colors::GREEN)
+            } else {
+                egui::Stroke::new(1.0, Colors::BORDER)
             };
-            cols[0].horizontal(|ui| {
-                ui.label(RichText::new(&item.name).color(Colors::TEXT).size(9.0));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(label).color(color).size(8.0));
-                    ui.label(
-                        RichText::new(fmt_bytes(item.size))
-                            .color(Colors::TEXT_DIM).size(8.0)
-                    );
-                });
-            });
-        }
 
-        cols[0].add_space(8.0);
-        if theme::secondary_button(&mut cols[0], "SELECT FILES").clicked() {
-            actions.select_files = true;
-        }
-
-        // ── Receive column ────────────────────────────────────────────────────
-        // ── Receive column (Vector Arrow) ──────────────────────────────────────
-        cols[1].horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-            let c = rect.center();
-            ui.painter().line_segment([c + egui::vec2(0.0, -5.0), c + egui::vec2(0.0, 5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
-            ui.painter().line_segment([c + egui::vec2(-3.0, 2.0), c + egui::vec2(0.0, 5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
-            ui.painter().line_segment([c + egui::vec2(3.0, 2.0), c + egui::vec2(0.0, 5.0)], egui::Stroke::new(1.2, Colors::TEXT_DIM));
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("RECEIVE FROM NODE")
-                    .color(Colors::TEXT_DIM).size(9.0).strong()
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if theme::micro_button(ui, "SCAN").clicked() {
-                    actions.scan_remote = true;
-                }
-            });
-        });
-        cols[1].add_space(8.0);
-
-        // Remote file list
-        egui::Frame::none()
-            .fill(Colors::BG_WIDGET)
-            .stroke(egui::Stroke::new(1.0, Colors::BORDER))
-            .show(&mut cols[1], |ui| {
-                ui.set_min_height(120.0);
-                
-                // ── Path breadcrumb / Back button ──
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    if s.current_remote_path.as_os_str().is_empty() {
-                        ui.label(RichText::new("NOT BROWSING REMOTE").color(Colors::TEXT_MUTED).size(9.0));
-                    } else {
-                        if theme::micro_button(ui, "ᐊ BACK").clicked() {
-                            let parent = s.current_remote_path.parent().unwrap_or(std::path::Path::new(""));
-                            actions.browse_remote = Some(parent.to_path_buf());
-                        }
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(s.current_remote_path.display().to_string()).color(Colors::CYAN).size(9.0).strong());
-                    }
-                });
-                ui.add(egui::Separator::default().spacing(4.0));
-
-                if s.remote_files.is_empty() {
+            egui::Frame::none()
+                .fill(Colors::BG_WIDGET)
+                .stroke(dz_stroke)
+                .inner_margin(egui::Margin::same(16.0))
+                .show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(ui.available_width(), 80.0));
                     ui.vertical_centered(|ui| {
-                        ui.add_space(16.0);
-                        ui.label(RichText::new("NO FILES OR NOT SCANNED").color(Colors::TEXT_MUTED).size(9.0));
-                        if theme::secondary_button(ui, "BROWSE ROOT").clicked() {
-                            actions.browse_remote = Some(std::path::PathBuf::new());
+                        let (rect, _) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                        let c = rect.center();
+                        let r = 10.0;
+                        let mut points = vec![];
+                        for i in 0..6 {
+                            let angle = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
+                            points.push(c + egui::vec2(r * angle.cos(), r * angle.sin()));
                         }
+                        ui.painter().add(egui::Shape::convex_polygon(points, Color32::TRANSPARENT, egui::Stroke::new(1.5, Colors::TEXT_MUTED)));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("DROP FILES HERE").color(Colors::TEXT_MUTED).size(9.0));
+                        ui.label(RichText::new("or SELECT FILES below").color(Colors::TEXT_MUTED).size(8.0));
                     });
-                } else {
-                    ScrollArea::vertical()
-                        .id_source("remote_file_list")
-                        .max_height(200.0)
-                        .show(ui, |ui| {
-                            for rf in s.remote_files {
-                                ui.add_space(2.0);
-                                ui.horizontal(|ui| {
-                                    let icon = if rf.is_dir { "📁" } else { "📄" };
-                                    ui.label(RichText::new(icon).color(Colors::TEXT_MUTED).size(9.0));
-                                    ui.add_space(4.0);
-                                    
-                                    let label_color = if rf.is_dir { Colors::CYAN } else { Colors::TEXT };
-                                    let resp = ui.add(egui::Label::new(RichText::new(&rf.name).color(label_color).size(10.0)).sense(egui::Sense::click()));
-                                    
-                                    if resp.clicked() {
-                                        if rf.is_dir {
-                                            let mut new_path = s.current_remote_path.clone();
-                                            new_path.push(&rf.name);
-                                            actions.browse_remote = Some(new_path);
-                                        }
-                                    }
+                });
 
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if !rf.is_dir {
-                                            // FIX: DL button for files
-                                            let dl_btn = ui.add(
-                                                egui::Button::new(RichText::new(format!("{} DL", crate::icons::Glyphs::DOWNLOAD)).color(Colors::TEXT_DIM).size(8.0))
-                                                .fill(Color32::TRANSPARENT).stroke(egui::Stroke::new(1.0, Colors::BORDER)).min_size(egui::vec2(0.0, 20.0))
-                                            );
-                                            if dl_btn.clicked() {
-                                                if s.current_remote_path.as_os_str().is_empty() {
-                                                    // Transfers dir fallback
-                                                    actions.download_file = Some(rf.name.clone());
-                                                } else {
-                                                    let mut full_path = s.current_remote_path.clone();
-                                                    full_path.push(&rf.name);
-                                                    actions.download_remote_file = Some(full_path);
-                                                }
-                                            }
-                                            ui.label(RichText::new(fmt_bytes(rf.size)).color(Colors::TEXT_DIM).size(8.0));
-                                        }
-                                    });
-                                });
-                                ui.add(egui::Separator::default().spacing(2.0));
-                            }
-                        });
-                }
-            });
+            ui.add_space(8.0);
+            for item in s.file_queue {
+                let (label, color) = match &item.status {
+                    FileTransferStatus::Pending   => ("PENDING", Colors::TEXT_MUTED),
+                    FileTransferStatus::Sending   => ("SENDING", Colors::AMBER),
+                    FileTransferStatus::Done      => ("✓ DONE",  Colors::GREEN),
+                    FileTransferStatus::Failed(_) => ("✗ FAIL",  Colors::RED),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&item.name).color(Colors::TEXT).size(9.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(label).color(color).size(8.0));
+                        ui.label(RichText::new(fmt_bytes(item.size)).color(Colors::TEXT_DIM).size(8.0));
+                    });
+                });
+            }
 
-        cols[1].add_space(8.0);
-        if theme::secondary_button(&mut cols[1], "OPEN INBOX FOLDER").clicked() {
-            actions.open_inbox = true;
-        }
+            ui.add_space(8.0);
+            if theme::secondary_button(ui, "SELECT FILES").clicked() {
+                actions.select_files = true;
+            }
+        });
+
+        ui.add_space(12.0);
+
+        // ── Right: HUD File Manager ────────────────────────────────────────────
+        ui.vertical(|ui| {
+            ui.set_min_width(right_w);
+            ui.set_max_width(right_w);
+            
+            crate::views::file_manager::render(ui, s, actions);
+            
+            ui.add_space(8.0);
+            if theme::secondary_button(ui, "OPEN INBOX FOLDER").clicked() {
+                actions.open_inbox = true;
+            }
+        });
     });
 
     // ── Transfer log ──────────────────────────────────────────────────────────
@@ -894,7 +804,7 @@ fn render_clipboard_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAc
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(&entry.sender)
-                                        .color(Colors::CYAN).size(8.0).strong()
+                                        .color(Colors::GREEN).size(8.0).strong()
                                 );
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -1007,7 +917,7 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
             // Cyan top accent bar
             let top = ui.next_widget_position();
             let bar = egui::Rect::from_min_size(top, egui::vec2(480.0, 2.0));
-            ui.painter().rect_filled(bar, egui::Rounding::ZERO, Colors::CYAN);
+            ui.painter().rect_filled(bar, egui::Rounding::ZERO, Colors::GREEN);
             ui.add_space(2.0);
 
             // Header row
@@ -1017,7 +927,7 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
                     ui.horizontal(|ui| {
                         ui.label(
                             RichText::new("// CONFIGURATION")
-                                .color(Colors::CYAN).size(10.0).strong()
+                                .color(Colors::GREEN).size(10.0).strong()
                         );
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -1149,7 +1059,7 @@ pub fn render_empty_state(ui: &mut Ui) {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn fmt_bytes(b: u64) -> String {
+pub fn fmt_bytes(b: u64) -> String {
     const K: u64 = 1024;
     if b < K           { format!("{} B", b) }
     else if b < K * K  { format!("{:.1} KB", b as f64 / K as f64) }
@@ -1216,7 +1126,7 @@ pub fn render_detail_panel_with_timeline(
                     });
                     ui.label(
                         RichText::new(s.device.primary_ip().unwrap_or("No Tailscale IP"))
-                            .color(Colors::CYAN).size(10.0)
+                            .color(Colors::GREEN).size(10.0)
                     );
                     ui.label(
                         RichText::new(format!("{} · {}", s.device.os.to_uppercase(), s.device.client_version))
@@ -1234,7 +1144,7 @@ pub fn render_detail_panel_with_timeline(
                     theme::status_badge(ui, if is_online { "ONLINE" } else { "OFFLINE" }, Some(theme::IconType::Pulse), is_online);
                     if s.is_tg_agent {
                         ui.add_space(8.0);
-                        ui.label(RichText::new("⬡ AGENT").color(Colors::CYAN).size(9.0));
+                        ui.label(RichText::new("⬡ AGENT").color(Colors::GREEN).size(9.0));
                     }
                 });
             });
@@ -1338,7 +1248,7 @@ pub fn render_detail_panel_with_timeline(
                                 
                                 if let Some(tps) = telem.ai_tokens_per_sec {
                                     ui.add_space(12.0);
-                                    ui.label(RichText::new(format!("{:.1} t/s", tps)).color(Colors::CYAN).size(9.0));
+                                    ui.label(RichText::new(format!("{:.1} t/s", tps)).color(Colors::GREEN).size(9.0));
                                 }
 
                                 if let Some(thoughts) = &telem.ai_thoughts {

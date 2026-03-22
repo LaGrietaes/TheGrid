@@ -218,7 +218,7 @@ fn render_day_separator(ui: &mut Ui, rel_label: &str, full_date: &str) {
 fn render_entry_row(ui: &mut Ui, e: &TemporalEntry, now: i64) -> egui::Response {
     let (kind_glyph, kind_color) = match e.event_kind {
         TemporalEventKind::Created  => (crate::icons::Glyphs::CREATED, Colors::GREEN),
-        TemporalEventKind::Modified => (crate::icons::Glyphs::MODIFIED, Colors::CYAN),
+        TemporalEventKind::Modified => (crate::icons::Glyphs::MODIFIED, Colors::GREEN),
         TemporalEventKind::Deleted  => (crate::icons::Glyphs::DELETED, Colors::RED),
     };
 

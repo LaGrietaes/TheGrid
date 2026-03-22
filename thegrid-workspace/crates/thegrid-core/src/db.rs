@@ -98,9 +98,31 @@ impl Database {
                 peer_ip   TEXT    NOT NULL,
                 filename  TEXT    NOT NULL,
                 size      INTEGER,
-                status    TEXT    NOT NULL,
-                timestamp INTEGER NOT NULL
+                status    TEXT    NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL
             );
+
+            -- ── Phase 2: Rules & Smart Filters ──────────────────────────
+            CREATE TABLE IF NOT EXISTS user_rules (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT    NOT NULL,
+                pattern     TEXT    NOT NULL,  -- Glob or Regex
+                project     TEXT,              -- Optional project association
+                tag         TEXT,              -- Optional tag association
+                is_active   INTEGER DEFAULT 1,
+                created_at  INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS file_tags (
+                file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                tag         TEXT,
+                project     TEXT,
+                is_manual   INTEGER DEFAULT 0, -- 1 if set by user, 0 if by rule
+                PRIMARY KEY(file_id, tag, project)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag);
+            CREATE INDEX IF NOT EXISTS idx_file_tags_project ON file_tags(project);
 
             CREATE TABLE IF NOT EXISTS known_devices (
                 device_id   TEXT PRIMARY KEY,
@@ -136,6 +158,7 @@ impl Database {
         path:        &Path,
         size:        u64,
         modified:    Option<i64>,
+        hash:        Option<&str>,
     ) -> Result<i64> {
         let name = path.file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -146,13 +169,14 @@ impl Database {
         let now = unix_now();
 
         self.conn.execute(
-            "INSERT INTO files (device_id, device_name, path, name, ext, size, modified, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO files (device_id, device_name, path, name, ext, size, modified, hash, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(device_id, path) DO UPDATE
                SET name        = excluded.name,
                    ext         = excluded.ext,
                    size        = excluded.size,
                    modified    = excluded.modified,
+                   hash        = COALESCE(excluded.hash, files.hash),
                    indexed_at  = excluded.indexed_at",
             params![
                 device_id,
@@ -162,15 +186,129 @@ impl Database {
                 ext.as_deref(),
                 size as i64,
                 modified,
+                hash,
                 now,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn update_file_hash(&self, id: i64, hash: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET hash = ?1 WHERE id = ?2",
+            params![hash, id]
+        )?;
+        Ok(())
+    }
+
+    pub fn get_duplicate_groups(&self) -> Result<Vec<(String, u64, Vec<FileSearchResult>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hash, size FROM files 
+             WHERE hash IS NOT NULL AND hash != '' AND hash NOT LIKE 'ERR_%'
+             GROUP BY hash, size 
+             HAVING COUNT(*) > 1"
+        )?;
+
+        let groups = stmt.query_map([], |row| {
+            let hash: String = row.get(0)?;
+            let size: i64    = row.get(1)?;
+            Ok((hash, size as u64))
+        })?;
+
+        let mut results = Vec::new();
+        for g in groups {
+            let (hash, size) = g?;
+            let mut file_stmt = self.conn.prepare(
+                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, 0.0 as rank 
+                 FROM files WHERE hash = ?1 AND size = ?2"
+            )?;
+            let files = file_stmt.query_map(params![hash, size as i64], |r| self.map_search_result(r))?;
+            let mut file_list = Vec::new();
+            for f in files { file_list.push(f?); }
+            results.push((hash, size, file_list));
+        }
+        Ok(results)
+    }
+
+    pub fn delete_file_by_id(&self, id: i64) -> Result<()> {
+        let _ = self.conn.execute("DELETE FROM embeddings WHERE file_id = ?1", params![id]);
+        self.conn.execute("DELETE FROM files WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn move_file(&self, id: i64, new_path: PathBuf) -> Result<()> {
+        let path_str = new_path.to_string_lossy();
+        let name = new_path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = new_path.extension()
+            .map(|e| e.to_string_lossy().to_lowercase());
+
+        self.conn.execute(
+            "UPDATE files SET path = ?1, name = ?2, ext = ?3 WHERE id = ?4",
+            params![path_str.as_ref(), name, ext, id]
+        )?;
+        Ok(())
+    }
+
+    // ── Phase 2: Rules & Smart Filters ────────────────────────────────────
+
+    pub fn add_rule(&self, name: &str, pattern: &str, project: Option<&str>, tag: Option<&str>) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO user_rules (name, pattern, project, tag, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, pattern, project, tag, unix_now()]
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn get_rules(&self) -> Result<Vec<(i64, String, String, Option<String>, Option<String>, bool)>> {
+        let mut stmt = self.conn.prepare("SELECT id, name, pattern, project, tag, is_active FROM user_rules")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get::<_, i32>(5)? != 0
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn delete_rule(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM user_rules WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn add_file_tag(&self, file_id: i64, tag: Option<&str>, project: Option<&str>, is_manual: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO file_tags (file_id, tag, project, is_manual) VALUES (?1, ?2, ?3, ?4)",
+            params![file_id, tag, project, if is_manual { 1 } else { 0 }]
+        )?;
+        Ok(())
+    }
+
+    pub fn get_file_tags(&self, file_id: i64) -> Result<Vec<(Option<String>, Option<String>)>> {
+        let mut stmt = self.conn.prepare("SELECT tag, project FROM file_tags WHERE file_id = ?1")?;
+        let rows = stmt.query_map(params![file_id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn remove_all_file_tags(&self, file_id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM file_tags WHERE file_id = ?1", params![file_id])?;
+        Ok(())
+    }
+
     pub fn get_files_after(&self, after: i64) -> Result<Vec<FileSearchResult>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, device_id, device_name, path, name, ext, size, modified, 0.0 as rank \
+            "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, 0.0 as rank \
              FROM files WHERE indexed_at > ?1 OR modified > ?1"
         )?;
         let rows = stmt.query_map(params![after], |row| self.map_search_result(row))?;
@@ -189,7 +327,8 @@ impl Database {
             ext:         row.get(5)?,
             size:        row.get::<_, i64>(6)? as u64,
             modified:    row.get(7)?,
-            rank:        row.get(8)?,
+            hash:        row.get(8)?,
+            rank:        row.get(9)?,
         })
     }
 
@@ -249,6 +388,23 @@ impl Database {
             |row| row.get(0)
         )?;
         Ok(n)
+    }
+
+    pub fn get_files_needing_hash(&self, limit: usize) -> Result<Vec<(i64, PathBuf)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path FROM files 
+             WHERE hash IS NULL OR hash = ''
+             LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            Ok((id, PathBuf::from(path)))
+        })?;
+        
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
     }
 
     pub fn save_embedding(&self, file_id: i64, model: &str, vector: &[f32]) -> Result<()> {
@@ -350,9 +506,7 @@ impl Database {
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as i64);
 
-                    if let Err(e) = self.index_file(
-                        device_id, device_name, &path, size, modified
-                    ) {
+                    if let Err(e) = self.index_file(device_id, device_name, &path, size, modified, None) {
                         log::warn!("[DB] Failed to index {:?}: {}", path, e);
                     }
 
@@ -383,7 +537,7 @@ impl Database {
                         let modified = meta.modified().ok()
                             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                             .map(|d| d.as_secs() as i64);
-                        if self.index_file(device_id, device_name, path, size, modified).is_ok() {
+                        if self.index_file(device_id, device_name, path, size, modified, None).is_ok() {
                             updated += 1;
                         }
                     }
@@ -412,7 +566,7 @@ impl Database {
 
         let sql = if device_filter.is_some() {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
-                    f.ext, f.size, f.modified, fts.rank
+                    f.ext, f.size, f.modified, f.hash, fts.rank
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
@@ -421,7 +575,7 @@ impl Database {
              LIMIT ?3"
         } else {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
-                    f.ext, f.size, f.modified, fts.rank
+                    f.ext, f.size, f.modified, f.hash, fts.rank
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
@@ -442,7 +596,8 @@ impl Database {
                 ext:         row.get(5)?,
                 size:        row.get::<_, i64>(6)? as u64,
                 modified:    row.get(7)?,
-                rank:        row.get(8)?,
+                hash:        row.get(8)?,
+                rank:        row.get(9)?,
             })
         };
 
@@ -467,13 +622,13 @@ impl Database {
         device_filter: Option<&str>,
     ) -> Result<Vec<TemporalEntry>> {
         let sql = if device_filter.is_some() {
-            "SELECT id, device_id, device_name, path, name, ext, size, modified
+            "SELECT id, device_id, device_name, path, name, ext, size, modified, hash
              FROM files
              WHERE device_id = ?1 AND modified IS NOT NULL
              ORDER BY modified DESC
              LIMIT ?2"
         } else {
-            "SELECT id, device_id, device_name, path, name, ext, size, modified
+            "SELECT id, device_id, device_name, path, name, ext, size, modified, hash
              FROM files
              WHERE modified IS NOT NULL
              ORDER BY modified DESC
@@ -494,6 +649,7 @@ impl Database {
                 ext:         row.get(5)?,
                 size:        row.get::<_, i64>(6)? as u64,
                 modified,
+                hash:        row.get(8)?,
                 event_kind:  TemporalEventKind::Modified,
             })
         };

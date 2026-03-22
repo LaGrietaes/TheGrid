@@ -148,6 +148,12 @@ pub enum AppEvent {
         total:   usize,
     },
 
+    /// Progress of the local background hashing generator.
+    HashingProgress {
+        hashed: usize,
+        total:  usize,
+    },
+
     /// A full directory scan completed.
     IndexComplete {
         device_id:   String,
@@ -209,4 +215,20 @@ pub enum AppEvent {
     
     // AI Lifecycle
     RefreshAiServices,
+
+    // ── Preview ────────────────────────────────────────────────────────────
+    /// Request a preview for a file
+    RequestFilePreview(FileSearchResult),
+    
+    /// File preview content loaded
+    FilePreviewLoaded {
+        file_id: i64,
+        content: String,
+        kind:    PreviewKind,
+    },
+    
+    // ── File Manager Operations ────────────────────────────────────────────
+    DeleteFiles { device_id: String, paths: Vec<String> },
+    RenameFile  { device_id: String, old_path: String, new_name: String },
+    MoveFiles   { device_id: String, paths: Vec<String>, dest_dir: String },
 }

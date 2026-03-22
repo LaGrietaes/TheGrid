@@ -15,6 +15,7 @@ pub mod db;
 pub mod events;
 pub mod models;
 pub mod watcher;
+pub mod utils;
 
 // Re-export the most-used types so callers can `use thegrid_core::*`
 pub use config::Config;
@@ -22,3 +23,4 @@ pub use db::Database;
 pub use events::AppEvent;
 pub use models::*;
 pub use watcher::FileWatcher;
+pub use utils::{hash_file, match_rules};

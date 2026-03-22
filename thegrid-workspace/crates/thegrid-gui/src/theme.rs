@@ -24,12 +24,12 @@ impl Colors {
     // Borders
     pub const BORDER:     Color32 = Color32::from_rgb(30,  30,  30);   // #1e1e1e
     pub const BORDER2:    Color32 = Color32::from_rgb(42,  42,  42);   // #2a2a2a
+    #[allow(dead_code)]
     pub const BORDER_FOC: Color32 = Color32::from_rgb(0,   255, 65);   // green focus ring
 
     // Accent colors
     pub const GREEN:      Color32 = Color32::from_rgb(0,   255, 65);   // #00ff41
     pub const GREEN_DIM:  Color32 = Color32::from_rgb(0,   128, 32);   // #008020
-    pub const CYAN:       Color32 = Color32::from_rgb(0,   229, 255);  // #00e5ff
     pub const AMBER:      Color32 = Color32::from_rgb(255, 214, 0);    // #ffd600
     pub const RED:        Color32 = Color32::from_rgb(255, 34,  68);   // #ff2244
 
@@ -103,7 +103,7 @@ fn build_visuals() -> Visuals {
     };
 
     // Hyperlink color
-    v.hyperlink_color = Colors::CYAN;
+    v.hyperlink_color = Colors::GREEN;
 
     // Override widget visuals for all states
     v.widgets = build_widgets();
@@ -224,6 +224,7 @@ pub fn password_input<'a>(text: &'a mut String, hint: &str) -> egui::TextEdit<'a
 pub enum IconType {
     RDP,
     Folder,
+    #[allow(dead_code)]
     Network,
     Pulse,
     Desktop,
@@ -419,6 +420,7 @@ pub fn status_dot(ui: &mut Ui, color: Color32) {
 }
 
 /// Horizontal rule styled as a terminal separator
+#[allow(dead_code)]
 pub fn separator(ui: &mut Ui) {
     ui.add(egui::Separator::default().spacing(0.0));
 }

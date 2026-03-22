@@ -12,3 +12,5 @@ pub mod dashboard;
 pub mod search;
 pub mod timeline;
 pub mod terminal;
+pub mod viewport;
+pub mod file_manager;

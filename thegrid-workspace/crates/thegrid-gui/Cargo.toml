@@ -28,6 +28,9 @@ reqwest       = { workspace = true }
 # "default_fonts" includes the monospace Hack font used for brutalist aesthetic
 eframe        = { version = "0.27", default-features = true }
 egui          = "0.27"
+egui_extras   = { version = "0.27", features = ["image", "svg"] }
+open        = "2.0"
+get_if_addrs = "0.5"
 
 # Logging backend for the binary
 env_logger    = "0.11"

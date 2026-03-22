@@ -81,7 +81,7 @@ impl Toast {
                duration: std::time::Duration::from_secs(5) }
     }
     fn info(m: impl Into<String>) -> Self {
-        Self { message: m.into(), color: Colors::CYAN,
+        Self { message: m.into(), color: Colors::GREEN,
                created: std::time::Instant::now(),
                duration: std::time::Duration::from_secs(3) }
     }
@@ -132,6 +132,9 @@ pub struct TheGridApp {
     /// The centralized engine for background tasks and services
     runtime: Arc<AppRuntime>,
 
+    // ── Phase 2: File Manager ─────────────────────────────────────────────────
+    file_manager: FileManagerState,
+    
     // ── Phase 3: SQLite index state (UI only) ─────────────────────────────────
     index_stats: IndexStats,
 
@@ -139,6 +142,7 @@ pub struct TheGridApp {
     search:           SearchPanelState,
     // Timestamp of last keypress — used for 300ms debounce
     search_keystroke: Option<std::time::Instant>,
+    viewport:         ViewportState,
 
     timeline: TimelineState,
 
@@ -148,6 +152,7 @@ pub struct TheGridApp {
     semantic_enabled:   bool,
     semantic_loading:   bool,
     embedding_progress: (usize, usize),
+    hashing_progress:   (usize, usize),
 
     // ── Phase 3: Telemetry cache ──────────────────────────────────────────────
     // key = Tailscale device_id, value = latest NodeTelemetry snapshot
@@ -178,6 +183,43 @@ pub struct TheGridApp {
 
     /// New in Node Enhancement: tracks the provider URL being typed in the UI
     remote_url_edit: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum FileViewMode {
+    #[default]
+    List,
+    Grid,
+}
+
+#[allow(dead_code)]
+pub struct FileManagerState {
+    pub current_path: std::path::PathBuf,
+    pub selected_files: std::collections::HashSet<String>,
+    pub view_mode: FileViewMode,
+    pub _show_hidden: bool,
+    pub _last_refresh: Option<std::time::Instant>,
+    pub _search_query: String,
+}
+impl Default for FileManagerState {
+    fn default() -> Self {
+        Self {
+            current_path: std::path::PathBuf::new(),
+            selected_files: std::collections::HashSet::new(),
+            view_mode: FileViewMode::List,
+            _show_hidden: false,
+            _last_refresh: None,
+            _search_query: String::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ViewportState {
+    pub active_file: Option<FileSearchResult>,
+    pub content:     String,
+    pub is_loading:  bool,
+    pub preview_kind: PreviewKind,
 }
 
 impl TheGridApp {
@@ -225,10 +267,12 @@ impl TheGridApp {
             transfer_log: Vec::new(),
             
             runtime,
+            file_manager: FileManagerState::default(),
             index_stats:  IndexStats::default(),
             search:           SearchPanelState::default(),
             search_keystroke: None,
             timeline: TimelineState::default(),
+            viewport: ViewportState::default(),
             telemetry_cache:     HashMap::new(),
             telemetry_last_poll: HashMap::new(),
             local_telemetry_pending: false,
@@ -242,6 +286,7 @@ impl TheGridApp {
             semantic_enabled:  false,
             semantic_loading:  true,
             embedding_progress: (0, 0),
+            hashing_progress:   (0, 0),
             local_hostname,
             current_remote_path: PathBuf::new(),
             remote_model_edit: String::new(),
@@ -307,8 +352,10 @@ impl TheGridApp {
         self.runtime.spawn_list_remote_files(ip);
     }
 
-    fn spawn_send_file(&self, ip: String, path: PathBuf, queue_idx: usize) {
-        self.runtime.spawn_send_file(ip, path, queue_idx);
+    fn spawn_send_file(&self, device_id: String, path: PathBuf, queue_idx: usize) {
+        let best_ip = self.find_best_ip(&device_id);
+        log::info!("BPW: Sending file to {} via {} (queue_idx={})", device_id, best_ip, queue_idx);
+        self.runtime.spawn_send_file(best_ip, path, queue_idx);
     }
 
     fn spawn_download_file(&self, ip: String, filename: String) {
@@ -341,6 +388,63 @@ impl TheGridApp {
             match AgentClient::new(&ip, port, api_key).and_then(|c| c.update_config(device_type, model, url)) {
                 Ok(_) => { let _ = tx.send(AppEvent::RemoteConfigUpdated { device_id }); }
                 Err(e) => { let _ = tx.send(AppEvent::RemoteConfigFailed { device_id, error: e.to_string() }); }
+            }
+        });
+    }
+
+    #[allow(dead_code)]
+    fn spawn_fm_delete(&self, ip: String, _device_id: String, paths: Vec<String>) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key) {
+                Ok(client) => {
+                    let mut count = 0;
+                    for path in paths {
+                        if let Err(e) = client.delete_file(&path) {
+                            let _ = tx.send(AppEvent::Status(format!("Delete failed: {}", e)));
+                        } else {
+                            count += 1;
+                        }
+                    }
+                    let _ = tx.send(AppEvent::Status(format!("{} items deleted", count)));
+                    let _ = tx.send(AppEvent::RequestRefresh);
+                }
+                Err(e) => { let _ = tx.send(AppEvent::Status(format!("Agent connection failed: {}", e))); }
+            }
+        });
+    }
+
+    #[allow(dead_code)]
+    fn spawn_fm_rename(&self, ip: String, _device_id: String, old_path: String, new_name: String) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.rename_file(&old_path, &new_name)) {
+                Ok(_) => {
+                    let _ = tx.send(AppEvent::Status("Item renamed".into()));
+                    let _ = tx.send(AppEvent::RequestRefresh);
+                }
+                Err(e) => { let _ = tx.send(AppEvent::Status(format!("Rename failed: {}", e))); }
+            }
+        });
+    }
+
+    #[allow(dead_code)]
+    fn spawn_fm_move(&self, ip: String, _device_id: String, paths: Vec<String>, dest_dir: PathBuf) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        let dest_str = dest_dir.to_string_lossy().to_string();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.move_files(paths, &dest_str)) {
+                Ok(_) => {
+                    let _ = tx.send(AppEvent::Status("Items moved".into()));
+                    let _ = tx.send(AppEvent::RequestRefresh);
+                }
+                Err(e) => { let _ = tx.send(AppEvent::Status(format!("Move failed: {}", e))); }
             }
         });
     }
@@ -392,6 +496,10 @@ impl TheGridApp {
     /// Background worker that processes files and generates embeddings.
     fn spawn_embedding_worker(&self) {
         self.runtime.spawn_embedding_worker();
+    }
+
+    fn spawn_hashing_worker(&self) {
+        self.runtime.spawn_background_hasher();
     }
 
     fn spawn_search(&mut self) {
@@ -731,6 +839,9 @@ impl TheGridApp {
                 AppEvent::EmbeddingProgress { indexed, total } => {
                     self.embedding_progress = (indexed, total);
                 }
+                AppEvent::HashingProgress { hashed, total } => {
+                    self.hashing_progress = (hashed, total);
+                }
 
                 AppEvent::SemanticFailed(err) => {
                     log::error!("Semantic AI failure: {}", err);
@@ -767,6 +878,9 @@ impl TheGridApp {
                     if !self.semantic_loading && self.runtime.is_ai_node {
                         self.spawn_embedding_worker();
                     }
+
+                    // Phase 2: Trigger background hashing
+                    self.spawn_hashing_worker();
                 }
                 AppEvent::IndexUpdated { paths_updated } => {
                     if paths_updated > 0 {
@@ -777,6 +891,9 @@ impl TheGridApp {
                         if !self.semantic_loading && self.runtime.is_ai_node {
                             self.spawn_embedding_worker();
                         }
+
+                        // Phase 2: Trigger background hashing
+                        self.spawn_hashing_worker();
                     }
                 }
 
@@ -849,8 +966,21 @@ impl TheGridApp {
                     self.timeline.mark_refreshed();
                 }
 
+                AppEvent::RequestRefresh => {
+                    if let Some(device) = self.selected_idx.and_then(|i| self.devices.get(i)) {
+                        if let Some(ip) = device.primary_ip().map(|s| s.to_string()) {
+                            if self.current_remote_path.as_os_str().is_empty() {
+                                self.spawn_list_remote_files(ip);
+                            } else {
+                                self.spawn_browse_remote_directory(ip, device.id.clone(), self.current_remote_path.clone());
+                            }
+                        }
+                    }
+                }
+
                 // ── UI / misc ─────────────────────────────────────────────────
                 AppEvent::Status(msg) => {
+                    self.set_status(&msg);
                     // Special-cased status messages used as piggyback channels
                     if msg.starts_with("index_count:") {
                         if let Ok(n) = msg["index_count:".len()..].parse::<u64>() {
@@ -970,10 +1100,73 @@ impl TheGridApp {
                         }
                     });
                 }
-                AppEvent::RequestRefresh => { self.spawn_load_devices(); }
                 AppEvent::OpenSettings   => { self.settings.open = true; }
+
+                // ── Preview ───────────────────────────────────────────────────
+                AppEvent::RequestFilePreview(file) => {
+                    self.viewport.active_file = Some(file.clone());
+                    self.viewport.is_loading = true;
+                    self.viewport.content.clear();
+                    self.spawn_fetch_preview(file);
+                }
+                AppEvent::FilePreviewLoaded { file_id: _, content, kind } => {
+                    self.viewport.is_loading = false;
+                    self.viewport.content = content;
+                    self.viewport.preview_kind = kind;
+                }
                 _ => {}
             }
+        }
+    }
+
+    fn spawn_fetch_preview(&self, file: thegrid_core::models::FileSearchResult) {
+        use thegrid_core::models::PreviewKind;
+        let tx = self.event_tx.clone();
+        
+        std::thread::spawn(move || {
+            // Determine PreviewKind based on extension
+            let ext = file.ext.clone().unwrap_or_default().to_lowercase();
+            let kind = match ext.as_str() {
+                "txt" | "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "md" | "json" | "toml" | "yaml" | "yml" | "iss" | "ps1" => PreviewKind::Text,
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => PreviewKind::Image,
+                "pdf" => PreviewKind::Pdf,
+                _ => PreviewKind::UnSupported
+            };
+
+            if kind == PreviewKind::Text {
+                match std::fs::read_to_string(&file.path) {
+                    Ok(content) => {
+                        let _ = tx.send(AppEvent::FilePreviewLoaded { file_id: file.id, content, kind });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::FilePreviewLoaded { file_id: file.id, content: format!("Error reading file: {}", e), kind: PreviewKind::UnSupported });
+                    }
+                }
+            } else {
+                let _ = tx.send(AppEvent::FilePreviewLoaded { file_id: file.id, content: String::new(), kind });
+            }
+        });
+    }
+
+    fn render_viewport_panel(&mut self, ctx: &egui::Context) {
+
+
+        if self.viewport.active_file.is_some() {
+            egui::SidePanel::right("viewport_panel")
+                .resizable(true)
+                .default_width(320.0)
+                .frame(egui::Frame::none().fill(Colors::BG_PANEL).stroke(egui::Stroke::new(1.0, Colors::BORDER2)))
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        if ui.button(RichText::new("✕ CLOSE").color(Colors::TEXT_DIM)).clicked() {
+                            self.viewport.active_file = None;
+                        }
+                    });
+                    ui.add_space(8.0);
+                    crate::views::viewport::show_viewport(ui, &mut self.viewport);
+                });
         }
     }
 
@@ -984,10 +1177,11 @@ impl TheGridApp {
     fn push_toast(&mut self, t: Toast) { self.toasts.push(t); }
     fn set_status(&mut self, msg: impl Into<String>) { self.status_msg = msg.into(); }
     fn selected_ip(&self) -> Option<String> {
-        self.selected_idx
-            .and_then(|i| self.devices.get(i))
-            .and_then(|d| d.primary_ip())
-            .map(|s| s.to_string())
+        self.selected_device().and_then(|d| d.primary_ip()).map(|s| s.to_string())
+    }
+
+    fn selected_device(&self) -> Option<&thegrid_core::TailscaleDevice> {
+        self.selected_idx.and_then(|i| self.devices.get(i))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1245,7 +1439,7 @@ impl TheGridApp {
                         status: FileTransferStatus::Sending,
                     });
                     self.transfer_log.push(TransferLogEntry::info(format!("Sending {}...", name)));
-                    self.spawn_send_file(ip.to_string(), path, idx);
+                    self.spawn_send_file(device_id.to_string(), path, idx);
                 }
             }
         }
@@ -1368,9 +1562,37 @@ impl TheGridApp {
     }
 
 
-    fn spawn_launch_scrcpy(&self, ip: String) {
-        let api_key = self.config.api_key.clone();
-        let _ = self.event_tx.send(AppEvent::EnableAdb { ip, api_key });
+    fn spawn_launch_scrcpy(&mut self, ip: String) {
+        log::info!("Checking for USB-connected devices for high-performance mirroring (BPW)...");
+        
+        // 1. Try to find a USB device first
+        let output = std::process::Command::new("adb").arg("devices").arg("-l").output();
+        let mut usb_serial = None;
+        if let Ok(out) = output {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for line in s.lines().skip(1) {
+                if line.contains("usb:") && !line.is_empty() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if !parts.is_empty() {
+                        usb_serial = Some(parts[0].to_string());
+                        break; 
+                    }
+                }
+            }
+        }
+
+        if let Some(serial) = usb_serial {
+            log::info!("BPW: Found USB device {}. Launching scrcpy via USB...", serial);
+            let _ = std::process::Command::new("scrcpy")
+                .arg("-s")
+                .arg(serial)
+                .spawn();
+            self.push_toast(Toast::ok("BPW: Mirroring via USB"));
+        } else {
+            log::info!("BPW: No USB device found. Falling back to Network Mirroring for {}", ip);
+            let api_key = self.config.api_key.clone();
+            let _ = self.event_tx.send(AppEvent::EnableAdb { ip, api_key });
+        }
     }
 
     pub fn get_node_status(&self, device_id: &str) -> NodeStatus {
@@ -1383,6 +1605,34 @@ impl TheGridApp {
         let is_active = last_poll.map(|t| t.elapsed().as_secs() < 150).unwrap_or(false);
         
         if is_active { NodeStatus::GridActive } else { NodeStatus::Reachable }
+    }
+
+    /// BPW: Identify the optimal IP for reaching a device (prefers LAN/Direct)
+    fn find_best_ip(&self, device_id: &str) -> String {
+        let device = self.devices.iter().find(|d| d.id == device_id);
+        let tailscale_ip = device.and_then(|d| d.primary_ip()).map(|s| s.to_string());
+        
+        if let Some(telemetry) = self.telemetry_cache.get(device_id) {
+            // Get local machine's IPs from its own telemetry
+            let local_node_id = self.devices.iter().find(|d| d.name == self.config.device_name).map(|d| &d.id);
+            let my_ips = local_node_id.and_then(|id| self.telemetry_cache.get(id)).map(|t| &t.local_ips);
+            
+            if let Some(my_ips) = my_ips {
+                for remote_ip in &telemetry.local_ips {
+                    for my_ip in my_ips {
+                        // Simple subnet check: match first 3 octets for 24-bit mask
+                        let r_parts: Vec<&str> = remote_ip.split('.').collect();
+                        let m_parts: Vec<&str> = my_ip.split('.').collect();
+                        if r_parts.len() == 4 && m_parts.len() == 4 && r_parts[..3] == m_parts[..3] {
+                            log::info!("BPW: Direct LAN connection detected targeting {} at {}", device_id, remote_ip);
+                            return remote_ip.clone();
+                        }
+                    }
+                }
+            }
+        }
+        
+        tailscale_ip.unwrap_or_else(|| "127.0.0.1".into())
     }
 }
 
@@ -1421,7 +1671,7 @@ impl eframe::App for TheGridApp {
             i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
         });
         if !dropped.is_empty() {
-            if let Some(ip) = self.selected_ip() {
+            if let Some(_ip) = self.selected_ip() {
                 for path in dropped {
                     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -1431,7 +1681,9 @@ impl eframe::App for TheGridApp {
                         status: FileTransferStatus::Sending,
                     });
                     self.transfer_log.push(TransferLogEntry::info(format!("Sending {}...", name)));
-                    self.spawn_send_file(ip.clone(), path, idx);
+                    if let Some(d) = self.selected_device() {
+                        self.spawn_send_file(d.id.clone(), path, idx);
+                    }
                 }
             }
         }
@@ -1613,7 +1865,8 @@ impl eframe::App for TheGridApp {
                                 is_tg_agent:    self.is_tg_agent,
                                 watch_paths:    &watch_snap,
                                 telemetry:      telem_snap.as_ref(),
-                                current_remote_path: &mut self.current_remote_path,
+                                _current_remote_path: &mut self.current_remote_path,
+                                file_manager: &mut self.file_manager,
                                 remote_model_edit: &mut self.remote_model_edit,
                                 remote_url_edit: &mut self.remote_url_edit,
                                 terminal_view: self.terminal_sessions.get_mut(&device.id),
@@ -1709,6 +1962,11 @@ impl eframe::App for TheGridApp {
                     }
                     self.push_toast(Toast::info(format!("Navigated to: {}", result.name)));
                 }
+                if let Some(result) = search_action.preview_result {
+                    let _ = self.event_tx.send(AppEvent::RequestFilePreview(result));
+                }
+
+                self.render_viewport_panel(ctx);
 
                 self.render_toasts(ctx);
 

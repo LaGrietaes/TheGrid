@@ -89,6 +89,8 @@ impl SearchPanelState {
 pub struct SearchAction {
     /// User wants to navigate to this device + file
     pub open_result: Option<FileSearchResult>,
+    /// User wants to preview this result
+    pub preview_result: Option<FileSearchResult>,
     /// User closed the panel
     pub closed: bool,
     /// Query changed — dispatch a new search
@@ -334,6 +336,9 @@ pub fn render(
                         for (i, result) in s.results.iter().enumerate() {
                             let resp = render_result_row(ui, result, i);
                             if resp.clicked() {
+                                action.preview_result = Some(result.clone());
+                            }
+                            if resp.double_clicked() {
                                 action.open_result = Some(result.clone());
                                 s.open = false;
                             }
@@ -398,7 +403,7 @@ fn render_result_row(ui: &mut Ui, r: &FileSearchResult, idx: usize) -> egui::Res
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new(r.device_name.to_uppercase())
-                            .color(Colors::CYAN).size(8.0).strong()
+                            .color(Colors::GREEN).size(8.0).strong()
                     );
                 });
             });

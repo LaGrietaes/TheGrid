@@ -84,6 +84,18 @@ pub fn collect_local() -> NodeTelemetry {
             total: disk.total_space(),
         });
     }
+    
+    // BPW: Local IPs
+    let mut local_ips = Vec::new();
+    if let Ok(ifs) = get_if_addrs::get_if_addrs() {
+        for interface in ifs {
+            if !interface.is_loopback() {
+                if let std::net::IpAddr::V4(addr) = interface.ip() {
+                    local_ips.push(addr.to_string());
+                }
+            }
+        }
+    }
 
     NodeTelemetry {
         device_type: "Desktop".to_string(), 
@@ -98,6 +110,7 @@ pub fn collect_local() -> NodeTelemetry {
         gpu_pct: None,
         gpu_mem_used: None,
         gpu_mem_total: None,
+        local_ips,
         ai_status: Some("Idle".into()),
         ai_tokens_per_sec: None,
         ai_thoughts: None,

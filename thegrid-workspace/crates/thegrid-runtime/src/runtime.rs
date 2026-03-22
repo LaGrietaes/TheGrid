@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use anyhow::Result;
 
-use thegrid_core::{AppEvent, Config, Database, FileWatcher};
+use thegrid_core::{AppEvent, Config, Database, FileWatcher, hash_file, match_rules};
 use thegrid_net::{AgentClient, AgentServer, TailscaleClient, WolSentry};
 use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
 
@@ -541,6 +541,70 @@ impl AppRuntime {
                 Ok(Ok(entries)) => { let _ = tx.send(AppEvent::TemporalLoaded(entries)); }
                 _ => {}
             }
+        });
+    }
+
+    pub fn spawn_background_hasher(&self) {
+        let db       = self.db.clone();
+        let event_tx = self.event_tx.clone();
+        
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting background hashing worker...");
+            let mut hashed = 0;
+
+            loop {
+                // Fetch a batch of files needing a hash
+                let batch = match db.lock() {
+                    Ok(guard) => guard.get_files_needing_hash(50).unwrap_or_default(),
+                    Err(_) => break,
+                };
+                
+                if batch.is_empty() { break; }
+                
+                for (fid, path) in batch {
+                    if path.exists() && path.is_file() {
+                        let hash_res = hash_file(&path);
+                        if let Ok(db_lock) = db.lock() {
+                            match hash_res {
+                                Ok(h) => {
+                                    let _ = db_lock.update_file_hash(fid, &h);
+                                    
+                                    // NEW: Apply Smart Filter Rules
+                                    if let Ok(rules) = db_lock.get_rules() {
+                                        let user_rules: Vec<_> = rules.into_iter().map(|r| {
+                                            thegrid_core::models::UserRule {
+                                                id: r.0, name: r.1, pattern: r.2, project: r.3, tag: r.4, is_active: r.5
+                                            }
+                                        }).collect();
+                                        
+                                        let matches = match_rules(&path, &user_rules, fid);
+                                        for m in matches {
+                                            let _ = db_lock.add_file_tag(fid, m.tag.as_deref(), m.project.as_deref(), false);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("[Runtime] Failed to hash {:?}: {}", path, e);
+                                    let _ = db_lock.update_file_hash(fid, "ERR_HASH_FAILED");
+                                }
+                            }
+                        }
+                    } else {
+                        if let Ok(db_lock) = db.lock() {
+                            let _ = db_lock.update_file_hash(fid, "ERR_NOT_FOUND");
+                        }
+                    }
+                    hashed += 1;
+                    if hashed % 25 == 0 {
+                        // Total is hard to estimate exactly, we just send current count
+                        let _ = event_tx.send(AppEvent::HashingProgress { hashed, total: hashed + 50 });
+                    }
+                }
+                
+                // Throttle to keep CPU usage reasonable
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            log::info!("[Runtime] Background hashing worker finished.");
         });
     }
 

@@ -126,6 +126,7 @@ pub struct FileSearchResult {
     pub ext: Option<String>,
     pub size: u64,
     pub modified: Option<i64>,
+    pub hash: Option<String>,
     pub rank: Option<f64>,
 }
 
@@ -157,6 +158,7 @@ pub struct NodeTelemetry {
     pub gpu_pct: Option<f32>,
     pub gpu_mem_used: Option<u64>,
     pub gpu_mem_total: Option<u64>,
+    pub local_ips: Vec<String>,
     pub ai_status: Option<String>,
     pub ai_tokens_per_sec: Option<f32>,
     pub ai_thoughts: Option<String>,
@@ -218,6 +220,7 @@ pub struct TemporalEntry {
     pub ext:         Option<String>,
     pub size:        u64,
     pub modified:    i64,
+    pub hash:        Option<String>,
     pub event_kind:  TemporalEventKind,
 }
 
@@ -243,4 +246,32 @@ impl TemporalEventKind {
             Self::Deleted  => "⊘",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserRule {
+    pub id: i64,
+    pub name: String,
+    pub pattern: String,
+    pub project: Option<String>,
+    pub tag: Option<String>,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleMatch {
+    pub rule_id: i64,
+    pub file_id: i64,
+    pub tag: Option<String>,
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum PreviewKind {
+    #[default]
+    None,
+    Text,
+    Image,
+    Pdf,
+    UnSupported,
 }

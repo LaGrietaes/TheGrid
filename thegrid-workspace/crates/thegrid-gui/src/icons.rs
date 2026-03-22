@@ -9,8 +9,10 @@ use egui::Color32;
 use crate::theme::Colors;
 
 /// Standard Glyph Set
+#[allow(dead_code)]
 pub struct Glyphs;
 
+#[allow(dead_code)]
 impl Glyphs {
     // Brand
     pub const BRAND_HEX:    &'static str = "⬡";    // Hexagon (logo)
@@ -80,7 +82,7 @@ pub fn ext_to_glyph(ext: Option<&str>) -> &'static str {
 pub fn ext_to_color(ext: Option<&str>) -> Color32 {
     match ext {
         Some("rs") | Some("go") | Some("py") => Colors::GREEN,
-        Some("pdf") | Some("doc") | Some("docx") => Colors::CYAN,
+        Some("pdf") | Some("doc") | Some("docx") => Colors::GREEN,
         Some("png") | Some("jpg") | Some("psd") | Some("fig") => Colors::AMBER,
         Some("mp4") | Some("mov") => Colors::RED,
         Some("zip") | Some("rar") => Colors::AMBER,

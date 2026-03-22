@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::PathBuf;
+
 use std::sync::mpsc;
 use thegrid_core::{AppEvent, Config};
 use thegrid_runtime::AppRuntime;
