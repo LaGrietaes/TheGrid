@@ -770,18 +770,39 @@ impl AgentServer {
     }
 
     pub fn list_any_dir(path: &Path) -> Vec<RemoteFile> {
-        std::fs::read_dir(path).map(|entries| {
-            entries.filter_map(|e| {
+        let entries = match std::fs::read_dir(path) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("[Browse] Cannot read {:?}: {}", path, e);
+                return vec![];
+            }
+        };
+        let mut files: Vec<RemoteFile> = entries
+            .filter_map(|e| {
                 let e = e.ok()?;
-                let meta = e.metadata().ok()?;
+                // Skip entries we can't stat (permissions, broken symlinks, etc.)
+                let meta = match e.metadata() {
+                    Ok(m) => m,
+                    Err(_) => return None,
+                };
+                let name = e.file_name().to_string_lossy().to_string();
+                // Skip hidden dot-files on non-Windows
+                #[cfg(not(windows))]
+                if name.starts_with('.') { return None; }
                 Some(RemoteFile {
-                    name: e.file_name().to_string_lossy().to_string(),
-                    size: meta.len(),
+                    name,
+                    size: if meta.is_file() { meta.len() } else { 0 },
                     modified: meta.modified().ok().map(|t| chrono::DateTime::from(t)),
                     is_dir: meta.is_dir(),
                 })
-            }).collect()
-        }).unwrap_or_default()
+            })
+            .collect();
+        // Sort: dirs first, then by name
+        files.sort_by(|a, b| {
+            if a.is_dir != b.is_dir { b.is_dir.cmp(&a.is_dir) }
+            else { a.name.to_lowercase().cmp(&b.name.to_lowercase()) }
+        });
+        files
     }
 
     pub fn list_root_dir() -> Vec<RemoteFile> {
@@ -803,7 +824,35 @@ impl AgentServer {
         }
         #[cfg(not(windows))]
         {
-            Self::list_any_dir(Path::new("/"))
+            // On Linux/Android — surface key storage areas as top-level entries
+            let priority_paths = [
+                "/sdcard",              // Android primary storage (Termux)
+                "/storage/emulated/0", // Android internal storage
+                "/storage",            // Android all storage volumes
+                "/data/data/com.termux/files/home", // Termux home
+                "/",                   // Full root (may be restricted on Android)
+            ];
+            let mut dirs: Vec<RemoteFile> = Vec::new();
+            for p in &priority_paths {
+                let pb = Path::new(p);
+                // Only include paths that exist and are readable
+                if pb.exists() && std::fs::read_dir(pb).is_ok() {
+                    // Avoid duplicates
+                    if !dirs.iter().any(|d: &RemoteFile| d.name == *p) {
+                        dirs.push(RemoteFile {
+                            name: p.to_string(),
+                            size: 0,
+                            modified: None,
+                            is_dir: true,
+                        });
+                    }
+                }
+            }
+            // If nothing was found, fall back to listing /
+            if dirs.is_empty() {
+                dirs = Self::list_any_dir(Path::new("/"));
+            }
+            dirs
         }
     }
 
