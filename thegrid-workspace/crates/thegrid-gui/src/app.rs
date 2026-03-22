@@ -398,6 +398,70 @@ impl TheGridApp {
         self.runtime.spawn_browse_remote_directory(ip, device_id, path);
     }
 
+    /// Browse the LOCAL filesystem directly — no agent call needed.
+    fn spawn_local_browse(&self, device_id: String, path: PathBuf) {
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let browse_path = if path.as_os_str().is_empty() {
+                // No path — list drives on Windows, or / on other OS
+                #[cfg(target_os = "windows")]
+                {
+                    // List logical drives
+                    let drives: Vec<RemoteFile> = ('A'..='Z')
+                        .filter_map(|c| {
+                            let p = PathBuf::from(format!("{}:\\", c));
+                            if p.exists() {
+                                Some(RemoteFile {
+                                    name:   format!("{}:\\", c),
+                                    size:   0,
+                                    is_dir: true,
+                                    modified: None,
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let _ = tx.send(AppEvent::RemoteBrowseLoaded { device_id, path, files: drives });
+                    return;
+                }
+                #[cfg(not(target_os = "windows"))]
+                PathBuf::from("/")
+            } else {
+                path.clone()
+            };
+
+            match std::fs::read_dir(&browse_path) {
+                Ok(entries) => {
+                    let mut files: Vec<RemoteFile> = entries
+                        .filter_map(|e| e.ok())
+                        .filter_map(|entry| {
+                            let meta = entry.metadata().ok()?;
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            // Skip hidden files (starting with '.')
+                            if name.starts_with('.') { return None; }
+                            Some(RemoteFile {
+                                name:     name,
+                                size:     if meta.is_file() { meta.len() } else { 0 },
+                                is_dir:   meta.is_dir(),
+                                modified: None,
+                            })
+                        })
+                        .collect();
+                    // Sort: dirs first, then by name
+                    files.sort_by(|a, b| {
+                        if a.is_dir != b.is_dir { b.is_dir.cmp(&a.is_dir) }
+                        else { a.name.to_lowercase().cmp(&b.name.to_lowercase()) }
+                    });
+                    let _ = tx.send(AppEvent::RemoteBrowseLoaded { device_id, path: browse_path, files });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::RemoteBrowseFailed { device_id, error: e.to_string() });
+                }
+            }
+        });
+    }
+
     /// Cluster View: browse a specific node's directory and store result in cluster_files
     fn spawn_load_cluster_path(&self, device_id: String, path: PathBuf) {
         // Find the IP for this device
@@ -1495,11 +1559,28 @@ impl TheGridApp {
         }
 
         if actions.scan_remote {
-            self.spawn_list_remote_files(ip.to_string());
+            // For the local device, read the filesystem directly
+            let is_local = self.devices.iter()
+                .find(|d| d.id == device_id)
+                .map(|d| d.name == self.config.device_name || d.hostname == self.config.device_name)
+                .unwrap_or(false);
+            if is_local {
+                self.spawn_local_browse(device_id.to_string(), self.current_remote_path.clone());
+            } else {
+                self.spawn_list_remote_files(ip.to_string());
+            }
         }
 
         if let Some(path) = actions.browse_remote {
-            self.spawn_browse_remote_directory(ip.to_string(), device_id.to_string(), path);
+            let is_local = self.devices.iter()
+                .find(|d| d.id == device_id)
+                .map(|d| d.name == self.config.device_name || d.hostname == self.config.device_name)
+                .unwrap_or(false);
+            if is_local {
+                self.spawn_local_browse(device_id.to_string(), path);
+            } else {
+                self.spawn_browse_remote_directory(ip.to_string(), device_id.to_string(), path);
+            }
         }
 
         if let Some(filename) = actions.download_file {
