@@ -38,7 +38,7 @@ impl TailscaleDevice {
             None => false,
             Some(ts) => {
                 let age = Utc::now().signed_duration_since(*ts);
-                age.num_minutes() < 5
+                age.num_minutes() < 30
             }
         }
     }

@@ -284,10 +284,10 @@ impl TheGridApp {
         });
     }
 
-    fn spawn_ping(&mut self, ip: String, device_id: String) {
+    fn spawn_ping(&mut self, ip: String, device_id: String, manual: bool) {
         let now = std::time::Instant::now();
         self.telemetry_last_poll.insert(device_id, now);
-        self.runtime.spawn_ping(ip);
+        self.runtime.spawn_ping(ip, manual);
     }
 
     fn spawn_send_clipboard(&self, ip: String, content: String) {
@@ -333,12 +333,12 @@ impl TheGridApp {
         });
     }
 
-    fn spawn_update_remote_config(&self, ip: String, device_id: String, model: Option<String>, url: Option<String>) {
+    fn spawn_update_remote_config(&self, ip: String, device_id: String, device_type: Option<String>, model: Option<String>, url: Option<String>) {
         let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            match AgentClient::new(&ip, port, api_key).and_then(|c| c.update_config(model, url)) {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.update_config(device_type, model, url)) {
                 Ok(_) => { let _ = tx.send(AppEvent::RemoteConfigUpdated { device_id }); }
                 Err(e) => { let _ = tx.send(AppEvent::RemoteConfigFailed { device_id, error: e.to_string() }); }
             }
@@ -541,12 +541,12 @@ impl TheGridApp {
                     let mut initial_pings = Vec::new();
                     for d in &self.devices {
                         if let Some(ip) = d.primary_ip() {
-                            initial_pings.push((ip.to_string(), d.name.clone()));
+                            initial_pings.push((ip.to_string(), d.id.clone()));
                         }
                     }
-                    for (ip, name) in initial_pings {
-                        log::info!("Automatic ping for discovered device: {} at {}", name, ip);
-                        self.spawn_ping(ip, name);
+                    for (ip, id) in initial_pings {
+                        log::info!("Automatic ping for discovered device: {} ({})", id, ip);
+                        self.spawn_ping(ip, id, false);
                     }
 
                     // Start local telemetry collection immediately after first load
@@ -579,11 +579,12 @@ impl TheGridApp {
                 }
 
                 // ── Agent ─────────────────────────────────────────────────────
-                AppEvent::AgentPingOk { ip, response } => {
+                AppEvent::AgentPingOk { ip, response, manual } => {
                     self.is_tg_agent = true;
                     if response.authorized {
-                        self.push_toast(Toast::ok(format!("⬡ Agent online: {} (v{})", response.device, response.version)));
-                        
+                        if manual {
+                            self.push_toast(Toast::ok(format!("⬡ Agent online: {} (v{})", response.device, response.version)));
+                        }
                         // Find the device ID for this IP to trigger telemetry
                         let device_id = self.devices.iter()
                             .find(|d| d.primary_ip() == Some(&ip))
@@ -592,13 +593,17 @@ impl TheGridApp {
                             
                         self.runtime.spawn_get_telemetry(ip, device_id);
                     } else {
-                        self.push_toast(Toast::info(format!("⬡ Agent online: {} (v{}) - Limited Access (Key Mismatch)", response.device, response.version)));
+                        if manual {
+                            self.push_toast(Toast::info(format!("⬡ Agent online: {} (v{}) - Limited Access (Key Mismatch)", response.device, response.version)));
+                        }
                         self.set_status("Authentication mismatch: please check your api_key");
                     }
                 }
-                AppEvent::AgentPingFailed { ip: _, error } => {
+                AppEvent::AgentPingFailed { ip: _, error, manual } => {
                     self.is_tg_agent = false;
-                    self.push_toast(Toast::err(format!("Agent ping failed: {}", error)));
+                    if manual {
+                        self.push_toast(Toast::err(format!("Agent ping failed: {}", error)));
+                    }
                     self.set_status(format!("Ping failed. Check port {} and firewall.", self.config.agent_port));
                 }
 
@@ -1215,7 +1220,7 @@ impl TheGridApp {
 
         if actions.ping {
             self.push_toast(Toast::info(format!("Pinging {}...", ip)));
-            self.spawn_ping(ip.to_string(), device_id.to_string());
+            self.spawn_ping(ip.to_string(), device_id.to_string(), true);
         }
 
         if actions.load_clipboard {
@@ -1264,8 +1269,8 @@ impl TheGridApp {
             self.spawn_download_remote_file_anywhere(ip.to_string(), path);
         }
 
-        if let Some((model, url)) = actions.update_remote_config {
-            self.spawn_update_remote_config(ip.to_string(), device_id.to_string(), model, url);
+        if let Some((dt, model, url)) = actions.update_remote_config {
+            self.spawn_update_remote_config(ip.to_string(), device_id.to_string(), dt, model, url);
         }
 
         if actions.create_terminal {
@@ -1437,10 +1442,23 @@ impl eframe::App for TheGridApp {
         for d in &self.devices {
             if let Some(ip) = d.primary_ip() {
                 let last_poll = self.telemetry_last_poll.get(&d.id);
-                let needs_poll = last_poll.map(|t| t.elapsed().as_secs() > 60).unwrap_or(true);
+                
+                // Tiered polling: 15s for selected/local, 60s for active ones, 300s for idle/offline
+                let is_selected = self.selected_idx.and_then(|i| self.devices.get(i)).map(|sd| sd.id == d.id).unwrap_or(false);
+                let is_local = d.name == self.config.device_name;
+                
+                let interval = if is_selected || is_local {
+                    15 
+                } else if self.get_node_status(&d.id) == NodeStatus::GridActive {
+                    60
+                } else {
+                    300
+                };
+
+                let needs_poll = last_poll.map(|t| t.elapsed().as_secs() > interval).unwrap_or(true);
                 
                 if needs_poll {
-                    if d.name == self.config.device_name {
+                    if is_local {
                         if !self.local_telemetry_pending {
                             local_telemetry_needed = true;
                         }
@@ -1455,7 +1473,7 @@ impl eframe::App for TheGridApp {
             self.spawn_collect_local_telemetry();
         }
         for (ip, id) in ping_targets {
-            self.spawn_ping(ip, id);
+            self.spawn_ping(ip, id, false);
         }
 
         // 6. Screen dispatch
@@ -1523,6 +1541,7 @@ impl eframe::App for TheGridApp {
                             self.selected_idx,
                             &mut self.device_filter,
                             &mut needs_refresh,
+                            &self.config.device_name,
                         );
                     });
 

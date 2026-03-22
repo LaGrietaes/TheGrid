@@ -14,10 +14,10 @@ pub enum AppEvent {
 
     // ── Agent (remote THE GRID instance) ──────────────────────────────────
     /// Ping to a remote agent succeeded
-    AgentPingOk { ip: String, response: AgentPingResponse },
+    AgentPingOk { ip: String, response: AgentPingResponse, manual: bool },
 
     /// Ping to a remote agent failed
-    AgentPingFailed { ip: String, error: String },
+    AgentPingFailed { ip: String, error: String, manual: bool },
 
     /// Remote file list fetched
     RemoteFilesLoaded(Vec<RemoteFile>),
@@ -206,4 +206,7 @@ pub enum AppEvent {
     EnableRdp { ip: String, device_id: String },
     RdpEnabled { device_id: String },
     RdpFailed { device_id: String, error: String },
+    
+    // AI Lifecycle
+    RefreshAiServices,
 }

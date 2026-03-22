@@ -96,8 +96,8 @@ pub struct DetailActions {
     pub browse_remote:   Option<std::path::PathBuf>,
     /// New in Node Enhancement: download a file from any path
     pub download_remote_file: Option<std::path::PathBuf>,
-    /// New in Node Enhancement: update remote AI model config (model, url)
-    pub update_remote_config: Option<(Option<String>, Option<String>)>,
+    /// New in Node Enhancement: update remote AI model config (device_type, model, url)
+    pub update_remote_config: Option<(Option<String>, Option<String>, Option<String>)>,
     /// New in Node Enhancement: terminal actions
     pub create_terminal:      bool,
     pub send_terminal_input:  Option<Vec<u8>>,
@@ -119,6 +119,7 @@ pub fn render_device_panel(
     selected_idx: Option<usize>,
     filter: &mut String,
     needs_refresh: &mut bool,
+    local_device_name: &str,
 ) -> Option<usize> {
     let mut clicked = None;
 
@@ -239,22 +240,47 @@ pub fn render_device_panel(
                             theme::status_dot(ui, status_color);
                             ui.add_space(2.0);
                             
-                            // Sidebar Row Vector Icon (using telemetry lookup)
+                            // Sidebar Row Vector Icon (using telemetry lookup + hostname overrides)
                             let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            let h_lower = device.hostname.to_lowercase();
+                            let d_lower = device.display_name().to_lowercase();
+                            
                             let device_type = telemetries.get(&device.id).map(|t| t.device_type.as_str()).unwrap_or("Desktop");
-                            let icon_type = match device_type {
-                                "Laptop" => theme::IconType::Laptop,
-                                "Server" => theme::IconType::Server,
-                                _ => theme::IconType::Desktop,
+                            let icon_type = if h_lower.contains("nubia") {
+                                theme::IconType::Tablet
+                            } else if h_lower.contains("nothing") || d_lower.contains("nothing") {
+                                theme::IconType::Smartphone
+                            } else {
+                                match device_type {
+                                    "Laptop" => theme::IconType::Laptop,
+                                    "Server" => theme::IconType::Server,
+                                    "Tablet" => theme::IconType::Tablet,
+                                    "Smartphone" => theme::IconType::Smartphone,
+                                    "Phone" => theme::IconType::Smartphone,
+                                    "Chromebook" => theme::IconType::Chromebook,
+                                    _ => theme::IconType::Desktop,
+                                }
                             };
                             theme::draw_vector_icon(ui, icon_rect, icon_type, status_color);
                             
                             ui.add_space(6.0);
                             ui.vertical(|ui| {
-                                ui.label(
-                                    RichText::new(device.display_name().to_uppercase())
-                                        .color(Colors::TEXT).size(11.0).strong()
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(device.display_name().to_uppercase())
+                                            .color(Colors::TEXT).size(11.0).strong()
+                                    );
+                                    
+                                    if device.hostname == local_device_name {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new("[LOCAL]")
+                                                .color(Colors::GREEN)
+                                                .size(8.0)
+                                                .strong()
+                                        );
+                                    }
+                                });
                                 ui.label(
                                     RichText::new(device.primary_ip().unwrap_or("—"))
                                         .color(Colors::TEXT_DIM).size(9.0)
@@ -510,6 +536,7 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
         ui.add_space(8.0);
         if theme::secondary_button(ui, "UPDATE REMOTE CONFIG").clicked() {
             actions.update_remote_config = Some((
+                None, // device_type (no change from this UI)
                 Some(s.remote_model_edit.clone()), 
                 Some(s.remote_url_edit.clone())
             ));
@@ -1152,11 +1179,24 @@ pub fn render_detail_panel_with_timeline(
         .inner_margin(egui::Margin::symmetric(24.0, 14.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                let h_lower = s.device.hostname.to_lowercase();
+                let d_lower = s.device.display_name().to_lowercase();
                 let device_type = s.telemetry.map(|t| t.device_type.as_str()).unwrap_or("Desktop");
-                let icon_type = match device_type {
-                    "Laptop" => theme::IconType::Laptop,
-                    "Server" => theme::IconType::Server,
-                    _ => theme::IconType::Desktop,
+                
+                let icon_type = if h_lower.contains("nubia") {
+                    theme::IconType::Tablet
+                } else if h_lower.contains("nothing") || d_lower.contains("nothing") {
+                    theme::IconType::Smartphone
+                } else {
+                    match device_type {
+                        "Laptop" => theme::IconType::Laptop,
+                        "Server" => theme::IconType::Server,
+                        "Tablet" => theme::IconType::Tablet,
+                        "Smartphone" => theme::IconType::Smartphone,
+                        "Phone" => theme::IconType::Smartphone,
+                        "Chromebook" => theme::IconType::Chromebook,
+                        _ => theme::IconType::Desktop,
+                    }
                 };
                 crate::theme::render_crt_icon(ui, icon_type, 28.0, Colors::GREEN);
                 ui.add_space(12.0);
@@ -1198,6 +1238,36 @@ pub fn render_detail_panel_with_timeline(
                     }
                 });
             });
+
+            // ── Device Classification (Android) ──
+            if s.device.os.to_lowercase().contains("android") {
+                ui.add_space(8.0);
+                egui::Frame::none()
+                    .fill(Colors::BG_WIDGET)
+                    .inner_margin(egui::Margin::symmetric(24.0, 10.0))
+                    .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("CLASSIFY DEVICE:").color(Colors::TEXT_DIM).size(8.0).strong());
+                            ui.add_space(12.0);
+                            if theme::micro_button(ui, "PHONE").clicked() {
+                                actions.update_remote_config = Some((Some("Phone".into()), None, None));
+                            }
+                            ui.add_space(8.0);
+                            if theme::micro_button(ui, "TABLET").clicked() {
+                                actions.update_remote_config = Some((Some("Tablet".into()), None, None));
+                            }
+                            ui.add_space(8.0);
+                            if theme::micro_button(ui, "CHROMEBOOK").clicked() {
+                                actions.update_remote_config = Some((Some("Chromebook".into()), None, None));
+                            }
+                            
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new("// SETS ICON REMOTELY").color(Colors::TEXT_DIM).size(8.0).italics());
+                            });
+                        });
+                    });
+            }
 
             // ── Telemetry gauges (Phase 3) ─────────────────────────────────
             if let Some(telem) = s.telemetry {

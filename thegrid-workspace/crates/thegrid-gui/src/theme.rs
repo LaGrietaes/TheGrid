@@ -237,6 +237,9 @@ pub enum IconType {
     Camera,
     Microphone,
     Speakers,
+    Tablet,
+    Smartphone,
+    Chromebook,
 }
 
 pub fn draw_vector_icon(ui: &mut Ui, rect: egui::Rect, icon: IconType, color: Color32) {
@@ -354,6 +357,21 @@ pub fn draw_vector_icon(ui: &mut Ui, rect: egui::Rect, icon: IconType, color: Co
             ];
             ui.painter().add(egui::Shape::closed_line(points, stroke));
             ui.painter().rect_stroke(egui::Rect::from_center_size(c - egui::vec2(s*0.5, 0.0), egui::vec2(s*0.6, s*0.6)), egui::Rounding::ZERO, stroke);
+        }
+        IconType::Tablet => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*1.2, s*1.6)), egui::Rounding::same(s*0.1), stroke);
+            ui.painter().circle_stroke(c + egui::vec2(0.0, s*0.65), 1.5, stroke);
+        }
+        IconType::Smartphone => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*0.8, s*1.6)), egui::Rounding::same(s*0.1), stroke);
+            ui.painter().circle_stroke(c + egui::vec2(0.0, s*0.65), 1.2, stroke);
+        }
+        IconType::Chromebook => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c - egui::vec2(0.0, s*0.2), egui::vec2(s*1.6, s*1.1)), egui::Rounding::ZERO, stroke);
+            ui.painter().line_segment([c + egui::vec2(-s*0.9, s*0.5), c + egui::vec2(s*0.9, s*0.5)], stroke);
+            ui.painter().line_segment([c + egui::vec2(-s, s*0.5), c + egui::vec2(-s*1.1, s*0.7)], stroke);
+            ui.painter().line_segment([c + egui::vec2(s, s*0.5), c + egui::vec2(s*1.1, s*0.7)], stroke);
+            ui.painter().line_segment([c + egui::vec2(-s*1.1, s*0.7), c + egui::vec2(s*1.1, s*0.7)], stroke);
         }
     }
 }

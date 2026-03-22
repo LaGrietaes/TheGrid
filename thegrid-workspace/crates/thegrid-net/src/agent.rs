@@ -30,7 +30,7 @@ pub struct AgentServer {
     transfers_dir: PathBuf,
     event_tx: mpsc::Sender<AppEvent>,
     ts_client: Option<Arc<TailscaleClient>>,
-    config: Config,
+    config: Arc<Mutex<Config>>,
     terminal_sessions: Mutex<HashMap<String, TerminalSession>>,
     shutdown: Arc<AtomicBool>,
 }
@@ -41,7 +41,7 @@ impl AgentServer {
         api_key: String,
         transfers_dir: PathBuf,
         event_tx: mpsc::Sender<AppEvent>,
-        config: Config,
+        config: Arc<Mutex<Config>>,
     ) -> Self {
         Self { 
             port, 
@@ -235,11 +235,75 @@ impl AgentServer {
         }
 
         if method == "GET" && url == "/telemetry" {
-            let telemetry = collect_telemetry(&self.config);
+            let telemetry = {
+                let cfg = self.config.lock().unwrap();
+                collect_telemetry(&cfg)
+            };
             let json = serde_json::to_string(&telemetry).unwrap_or_default();
             req.respond(Response::from_string(json)
                 .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
             )?;
+            return Ok(());
+        }
+
+        if method == "POST" && url == "/v1/config" {
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body)?;
+
+            #[derive(serde::Deserialize)]
+            struct ConfigUpdate {
+                device_type: Option<String>,
+                ai_model: Option<String>,
+                ai_provider_url: Option<String>,
+            }
+
+            if let Ok(update) = serde_json::from_str::<ConfigUpdate>(&body) {
+                let (should_restart_ai, should_save) = {
+                    let mut cfg = self.config.lock().unwrap();
+                    let mut changed = false;
+                    let mut ai_changed = false;
+
+                    if let Some(dt) = update.device_type {
+                        if cfg.device_type != dt {
+                            cfg.device_type = dt;
+                            changed = true;
+                        }
+                    }
+                    if let Some(m) = update.ai_model {
+                        if cfg.ai_model != Some(m.clone()) {
+                            cfg.ai_model = Some(m);
+                            changed = true;
+                            ai_changed = true;
+                        }
+                    }
+                    if let Some(u) = update.ai_provider_url {
+                        if cfg.ai_provider_url != Some(u.clone()) {
+                            cfg.ai_provider_url = Some(u);
+                            changed = true;
+                            ai_changed = true;
+                        }
+                    }
+
+                    (ai_changed, changed)
+                };
+
+                if should_save {
+                    let cfg = self.config.lock().unwrap();
+                    if let Err(e) = cfg.save() {
+                        log::error!("Failed to save config after remote update: {}", e);
+                    }
+                    
+                    if should_restart_ai {
+                        let _ = self.event_tx.send(AppEvent::RefreshAiServices);
+                    }
+                }
+
+                req.respond(Response::from_string(r#"{"ok":true}"#)
+                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                )?;
+            } else {
+                req.respond(Response::from_string(r#"{"error":"invalid json"}"#).with_status_code(400))?;
+            }
             return Ok(());
         }
 
@@ -371,7 +435,11 @@ impl AgentServer {
 
         // ── NEW: Remote File Browsing ──
         if method == "GET" && url.starts_with("/v1/browse") {
-            if !self.config.enable_file_access {
+            let enabled = {
+                let cfg = self.config.lock().unwrap();
+                cfg.enable_file_access
+            };
+            if !enabled {
                 req.respond(Response::from_string(r#"{"error":"file access disabled"}"#).with_status_code(403))?;
                 return Ok(());
             }
@@ -394,7 +462,11 @@ impl AgentServer {
         }
 
         if method == "GET" && url.starts_with("/v1/read") {
-            if !self.config.enable_file_access {
+            let enabled = {
+                let cfg = self.config.lock().unwrap();
+                cfg.enable_file_access
+            };
+            if !enabled {
                 req.respond(Response::from_string(r#"{"error":"file access disabled"}"#).with_status_code(403))?;
                 return Ok(());
             }
@@ -865,9 +937,10 @@ impl AgentClient {
         resp.json().context("Parsing remote search response")
     }
 
-    pub fn update_config(&self, model: Option<String>, url: Option<String>) -> Result<()> {
+    pub fn update_config(&self, device_type: Option<String>, model: Option<String>, url: Option<String>) -> Result<()> {
         let endpoint = format!("{}/v1/config", self.base_url);
         let body = serde_json::json!({
+            "device_type": device_type,
             "ai_model": model,
             "ai_provider_url": url,
         });

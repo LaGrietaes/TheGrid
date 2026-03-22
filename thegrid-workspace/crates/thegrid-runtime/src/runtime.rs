@@ -85,7 +85,7 @@ impl AppRuntime {
             k.clone(),
             transfers_dir,
             self.event_tx.clone(),
-            c.clone()
+            Arc::clone(&self.config)
         );
 
         if !k.trim().is_empty() {
@@ -148,7 +148,7 @@ impl AppRuntime {
         });
     }
 
-    pub fn spawn_ping(&self, ip: String) {
+    pub fn spawn_ping(&self, ip: String, manual: bool) {
         let (port, api_key) = {
             let cfg = self.config.lock().unwrap();
             (cfg.agent_port, cfg.api_key.clone())
@@ -157,8 +157,8 @@ impl AppRuntime {
         let ip_addr = ip.clone();
         std::thread::spawn(move || {
             match AgentClient::new(&ip, port, api_key).and_then(|c| c.ping()) {
-                Ok(response)  => { let _ = tx.send(AppEvent::AgentPingOk { ip: ip_addr, response }); }
-                Err(e) => { let _ = tx.send(AppEvent::AgentPingFailed { ip: ip_addr, error: e.to_string() }); }
+                Ok(response)  => { let _ = tx.send(AppEvent::AgentPingOk { ip: ip_addr, response, manual }); }
+                Err(e) => { let _ = tx.send(AppEvent::AgentPingFailed { ip: ip_addr, error: e.to_string(), manual }); }
             }
         });
     }
