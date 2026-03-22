@@ -26,20 +26,25 @@ use thegrid_core::models::NodeTelemetry;
 /// between two CPU measurements for a meaningful utilisation number).
 /// Always call this from a background thread.
 pub fn collect_local() -> NodeTelemetry {
-    let mut sys = System::new_all();
+    // ── Pass 1: initialize CPU baseline ─────────────────────────────────────
+    let mut sys = System::new();
+    sys.refresh_cpu_usage();
 
-    // sysinfo needs a short window between two reads for accurate CPU %
-    // The sleep is inside sysinfo when you call refresh_cpu_usage() twice.
+    // sysinfo requires a short interval between two CPU reads for a meaningful
+    // utilisation delta. MINIMUM_CPU_UPDATE_INTERVAL is ~200ms on most platforms.
     std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+
+    // ── Pass 2: read accurate CPU usage after the delta window ───────────────
     sys.refresh_all();
 
-    // CPU: average across all logical cores
+    // CPU: average across all logical cores (sysinfo returns 0..100 per core)
     let cpu_pct = {
         let cpus = sys.cpus();
         if cpus.is_empty() {
             0.0
         } else {
-            cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32
+            let sum: f32 = cpus.iter().map(|c| c.cpu_usage()).sum();
+            (sum / cpus.len() as f32).clamp(0.0, 100.0)
         }
     };
 

@@ -1174,14 +1174,17 @@ pub fn render_detail_panel_with_timeline(
                             ui.add_space(12.0);
                         }
 
-                        // Disk
-                        crate::telemetry::render_gauge(ui, "DSK", None, telem.disk_pct(), &format!("{:.0}%", telem.disk_pct() * 100.0));
+                        // Disk — disk_pct() returns 0.0-1.0; render_gauge wants 0-100
+                        let dsk = telem.disk_pct() * 100.0;
+                        crate::telemetry::render_gauge(ui, "DSK", None, dsk, &format!("{:.0}%", dsk));
                         ui.add_space(12.0);
-                        // RAM
-                        crate::telemetry::render_gauge(ui, "RAM", None, telem.ram_pct(), &format!("{:.0}%", telem.ram_pct() * 100.0));
+                        // RAM — ram_pct() returns 0.0-1.0
+                        let ram = telem.ram_pct() * 100.0;
+                        crate::telemetry::render_gauge(ui, "RAM", None, ram, &format!("{:.0}%", ram));
                         ui.add_space(12.0);
-                        // CPU
-                        crate::telemetry::render_gauge(ui, "CPU", None, telem.cpu_pct, &format!("{:.0}%", telem.cpu_pct * 100.0));
+                        // CPU — cpu_pct is already 0-100 from sysinfo
+                        let cpu = telem.cpu_pct;
+                        crate::telemetry::render_gauge(ui, "CPU", None, cpu, &format!("{:.0}%", cpu));
                     }
                 });
             });
