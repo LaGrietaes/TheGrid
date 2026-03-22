@@ -203,22 +203,32 @@ pub enum FileViewMode {
 
 #[allow(dead_code)]
 pub struct FileManagerState {
-    pub current_path: std::path::PathBuf,
-    pub selected_files: std::collections::HashSet<String>,
-    pub view_mode: FileViewMode,
-    pub _show_hidden: bool,
-    pub _last_refresh: Option<std::time::Instant>,
-    pub _search_query: String,
+    pub current_path:    std::path::PathBuf,
+    pub selected_files:  std::collections::HashSet<String>,
+    pub view_mode:       FileViewMode,
+    pub _show_hidden:    bool,
+    pub _last_refresh:   Option<std::time::Instant>,
+    pub filter_query:    String,
+    pub sort_by_name:    bool,
+    pub sort_ascending:  bool,
+    /// Preview: the name of the file currently being previewed
+    pub preview_file:    Option<String>,
+    /// Preview: textual content (for text files, comes from the agent)
+    pub preview_content: Option<String>,
 }
 impl Default for FileManagerState {
     fn default() -> Self {
         Self {
-            current_path: std::path::PathBuf::new(),
-            selected_files: std::collections::HashSet::new(),
-            view_mode: FileViewMode::List,
-            _show_hidden: false,
-            _last_refresh: None,
-            _search_query: String::new(),
+            current_path:    std::path::PathBuf::new(),
+            selected_files:  std::collections::HashSet::new(),
+            view_mode:       FileViewMode::List,
+            _show_hidden:    false,
+            _last_refresh:   None,
+            filter_query:    String::new(),
+            sort_by_name:    true,
+            sort_ascending:  true,
+            preview_file:    None,
+            preview_content: None,
         }
     }
 }

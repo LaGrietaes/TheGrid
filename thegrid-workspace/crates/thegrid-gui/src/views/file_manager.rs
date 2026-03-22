@@ -1,151 +1,365 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// views/file_manager.rs — Brutalist HUD File Explorer
+// views/file_manager.rs — Brutalist HUD File Explorer  [v0.3 — Phase 3]
+//
+// Layout:
+//   [Drive Bar]  ← Drive picker from telemetry + manual path entry
+//   [Breadcrumb / Nav Bar]
+//   [Filter + Sort Toolbar]
+//   [File List (left 65%)]  |  [Preview / Metadata Panel (right 35%)]
 // ═══════════════════════════════════════════════════════════════════════════════
 
-use egui::{Color32, RichText, Ui, ScrollArea, Stroke, Margin, Pos2, Shape};
-
-use crate::theme::Colors;
+use egui::{Color32, RichText, Ui, ScrollArea, Stroke, Margin};
+use crate::theme::{self, Colors};
 use crate::views::dashboard::{DetailState, DetailActions};
 use crate::app::FileViewMode;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Entry point
+// ─────────────────────────────────────────────────────────────────────────────
+
 pub fn render(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
     ui.vertical(|ui| {
-        // ── HUD Header ────────────────────────────────────────────────────────
-        render_hud_header(ui, s, actions);
-        
-        ui.add_space(8.0);
+        // ── 1. Drive bar ──────────────────────────────────────────────────────
+        render_drive_bar(ui, s, actions);
+        ui.add_space(4.0);
 
-        // ── Main Content Area ─────────────────────────────────────────────────
-        egui::Frame::none()
-            .fill(Colors::BG_WIDGET)
-            .stroke(Stroke::new(1.0, Colors::BORDER))
-            .inner_margin(Margin::same(0.0))
-            .show(ui, |ui| {
-                // Background Static/Scanline Overlay (Subtle)
-                // render_scanlines(ui);
+        // ── 2. Breadcrumb navigation ──────────────────────────────────────────
+        render_nav_bar(ui, s, actions);
+        ui.add_space(4.0);
 
-                ui.vertical(|ui| {
-                    // Toolbar
-                    render_toolbar(ui, s, actions);
-                    
-                    ui.add(egui::Separator::default().spacing(0.0));
+        // ── 3. Toolbar (sort, filter, view mode) ──────────────────────────────
+        render_toolbar(ui, s, actions);
 
-                    // File List/Grid
-                    if s.file_manager.view_mode == FileViewMode::Grid {
-                        render_grid_view(ui, s, actions);
+        ui.add(egui::Separator::default().spacing(0.0));
+
+        // ── 4. Main content: file list + preview ──────────────────────────────
+        let avail = ui.available_width();
+        let preview_w = (avail * 0.32).min(280.0);
+        let list_w    = avail - preview_w - 8.0;
+
+        ui.horizontal_top(|ui| {
+            // File list
+            ui.vertical(|ui| {
+                ui.set_min_width(list_w);
+                ui.set_max_width(list_w);
+                egui::Frame::none()
+                    .fill(Colors::BG_WIDGET)
+                    .stroke(Stroke::new(1.0, Colors::BORDER))
+                    .show(ui, |ui| {
+                        if s.file_manager.view_mode == FileViewMode::Grid {
+                            render_grid_view(ui, s, actions);
+                        } else {
+                            render_list_view(ui, s, actions);
+                        }
+                    });
+            });
+
+            ui.add_space(8.0);
+
+            // Preview panel
+            ui.vertical(|ui| {
+                ui.set_min_width(preview_w);
+                ui.set_max_width(preview_w);
+                render_preview_panel(ui, s, actions);
+            });
+        });
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Drive Bar — shows drives from telemetry as clickable chips
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn render_drive_bar(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    egui::Frame::none()
+        .fill(Colors::BG_PANEL)
+        .stroke(Stroke::new(1.0, Colors::BORDER))
+        .inner_margin(Margin::symmetric(12.0, 6.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("DRIVES").color(Colors::TEXT_DIM).size(8.0).strong());
+                ui.add_space(8.0);
+
+                if let Some(telem) = s.telemetry {
+                    if !telem.capabilities.drives.is_empty() {
+                        for drive in &telem.capabilities.drives {
+                            let current_root = s.file_manager.current_path.to_string_lossy();
+                            let is_active = current_root.starts_with(&drive.name);
+                            let label_color = if is_active { Colors::GREEN } else { Colors::TEXT_DIM };
+                            let fill = if is_active { Color32::from_rgba_premultiplied(0, 180, 0, 30) } else { Colors::BG_WIDGET };
+
+                            egui::Frame::none()
+                                .fill(fill)
+                                .stroke(Stroke::new(1.0, if is_active { Colors::GREEN } else { Colors::BORDER }))
+                                .inner_margin(Margin::symmetric(8.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                        theme::draw_vector_icon(ui, r, theme::IconType::Disk, label_color);
+                                        ui.add_space(4.0);
+                                        let resp = ui.add(egui::Label::new(
+                                            RichText::new(&drive.name).color(label_color).size(9.0).strong()
+                                        ).sense(egui::Sense::click()));
+                                        if resp.clicked() {
+                                            let root = std::path::PathBuf::from(&drive.name);
+                                            s.file_manager.current_path = root.clone();
+                                            s.file_manager.selected_files.clear();
+                                            s.file_manager.preview_file = None;
+                                            s.file_manager.preview_content = None;
+                                            actions.browse_remote = Some(root);
+                                        }
+                                        // Usage bar
+                                        let pct = if drive.total > 0 {
+                                            (drive.used as f32 / drive.total as f32).clamp(0.0, 1.0)
+                                        } else { 0.0 };
+                                        ui.add_space(6.0);
+                                        let bar_rect = {
+                                            let (r, _) = ui.allocate_exact_size(egui::vec2(40.0, 5.0), egui::Sense::hover());
+                                            r
+                                        };
+                                        ui.painter().rect_filled(bar_rect, 1.0, Colors::BG);
+                                        let fill_w = bar_rect.width() * pct;
+                                        let fill_rect = egui::Rect::from_min_size(bar_rect.min, egui::vec2(fill_w, bar_rect.height()));
+                                        let bar_color = if pct > 0.85 { Colors::RED } else if pct > 0.6 { Colors::AMBER } else { Colors::GREEN };
+                                        ui.painter().rect_filled(fill_rect, 1.0, bar_color);
+                                    });
+                                });
+                            ui.add_space(4.0);
+                        }
                     } else {
-                        render_list_view(ui, s, actions);
+                        ui.label(RichText::new("// NO DRIVES — FETCH TELEMETRY FIRST").color(Colors::TEXT_MUTED).size(8.0).italics());
+                    }
+                } else {
+                    ui.label(RichText::new("// NO TELEMETRY — CLICK FETCH TELEMETRY IN ACTIONS").color(Colors::TEXT_MUTED).size(8.0).italics());
+                    if theme::micro_button(ui, "REFRESH").clicked() {
+                        actions.scan_remote = true;
+                    }
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::micro_button(ui, "SCAN").clicked() {
+                        actions.scan_remote = true;
+                    }
+                    ui.add_space(4.0);
+                    if theme::micro_button(ui, "↑ UP").clicked() {
+                        if let Some(parent) = s.file_manager.current_path.parent() {
+                            let p = parent.to_path_buf();
+                            actions.browse_remote = Some(p.clone());
+                            s.file_manager.current_path = p;
+                        }
                     }
                 });
             });
-    });
+        });
 }
 
-fn render_hud_header(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
-    let (rect, _response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 32.0),
-        egui::Sense::hover()
-    );
+// ─────────────────────────────────────────────────────────────────────────────
+// Breadcrumb navigation bar
+// ─────────────────────────────────────────────────────────────────────────────
 
-    let painter = ui.painter();
-    
-    // Angled background shape
-    let points = vec![
-        rect.left_top(),
-        rect.right_top() + egui::vec2(-10.0, 0.0),
-        rect.right_top() + egui::vec2(0.0, 10.0),
-        rect.right_bottom(),
-        rect.left_bottom(),
-    ];
-    painter.add(Shape::convex_polygon(points, Colors::BG_PANEL, Stroke::new(1.0, Colors::BORDER)));
+fn render_nav_bar(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    egui::Frame::none()
+        .fill(Colors::BG_PANEL)
+        .stroke(Stroke::new(1.0, Colors::BORDER))
+        .inner_margin(Margin::symmetric(12.0, 6.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Back button
+                let can_go_back = s.file_manager.current_path.parent().is_some()
+                    && s.file_manager.current_path != std::path::Path::new("");
+                ui.set_enabled(can_go_back);
+                if ui.button(RichText::new("◀").color(Colors::GREEN).size(10.0)).clicked() {
+                    let parent = s.file_manager.current_path.parent()
+                        .unwrap_or(std::path::Path::new(""))
+                        .to_path_buf();
+                    actions.browse_remote = Some(parent.clone());
+                    s.file_manager.current_path = parent;
+                    s.file_manager.selected_files.clear();
+                }
+                ui.set_enabled(true);
+                ui.add_space(6.0);
 
-    // Accent line
-    painter.line_segment(
-        [rect.left_top() + egui::vec2(2.0, 2.0), rect.left_top() + egui::vec2(30.0, 2.0)],
-        Stroke::new(2.0, Colors::GREEN)
-    );
+                // Breadcrumb segments
+                let path_str = s.file_manager.current_path.to_string_lossy().to_string();
+                if path_str.is_empty() {
+                    ui.label(RichText::new("/ root").color(Colors::TEXT_DIM).size(9.0));
+                } else {
+                    // Clone path to avoid borrow conflict when we later mutate it
+                    let path_clone = s.file_manager.current_path.clone();
+                    let mut accumulated = std::path::PathBuf::new();
+                    let parts: Vec<_> = path_clone.components().collect();
+                    for (i, part) in parts.iter().enumerate() {
+                        accumulated.push(part);
+                        let seg = part.as_os_str().to_string_lossy().to_string();
+                        let is_last = i == parts.len() - 1;
+                        let color = if is_last { Colors::GREEN } else { Colors::TEXT_DIM };
+                        let acc_copy = accumulated.clone();
+                        let resp = ui.add(egui::Label::new(
+                            RichText::new(format!("{}/", seg)).color(color).size(9.0).strong()
+                        ).sense(egui::Sense::click()));
+                        if resp.clicked() && !is_last {
+                            actions.browse_remote = Some(acc_copy.clone());
+                            s.file_manager.current_path = acc_copy;
+                            s.file_manager.selected_files.clear();
+                        }
+                    }
+                }
 
-    // Breadcrumbs
-    ui.put(rect.shrink2(egui::vec2(8.0, 4.0)), |ui: &mut Ui| {
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            if ui.button(RichText::new("ᐊ").color(Colors::GREEN).strong()).clicked() {
-                let parent = s.file_manager.current_path.parent().unwrap_or(std::path::Path::new(""));
-                actions.browse_remote = Some(parent.to_path_buf());
-                s.file_manager.current_path = parent.to_path_buf();
-            }
-            ui.add_space(4.0);
-            ui.label(RichText::new("NAV.").color(Colors::TEXT_DIM).size(9.0).strong());
-            ui.add_space(4.0);
-            
-            let path_str = s.file_manager.current_path.display().to_string();
-            ui.label(RichText::new(path_str.to_uppercase()).color(Colors::GREEN).size(10.0).strong());
-        }).response
-    });
+                // File count badge
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let n = s.remote_files.len();
+                    let sel = s.file_manager.selected_files.len();
+                    let badge = if sel > 0 {
+                        format!("{} selected / {} items", sel, n)
+                    } else {
+                        format!("{} items", n)
+                    };
+                    ui.label(RichText::new(badge).color(Colors::TEXT_DIM).size(8.0));
+                });
+            });
+        });
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Toolbar — filter, sort, view mode
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn render_toolbar(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
     ui.horizontal(|ui| {
         ui.set_height(28.0);
         ui.add_space(8.0);
 
-        // Selection Actions
-        if !s.file_manager.selected_files.is_empty() {
-             ui.label(RichText::new(format!("[{}] SELECTED", s.file_manager.selected_files.len())).color(Colors::AMBER).size(9.0).strong());
-             if ui.button(RichText::new("DELETE").color(Colors::RED).size(9.0).strong()).clicked() {
-                 let paths: Vec<String> = s.file_manager.selected_files.iter().cloned().collect();
-                 actions.fm_delete = Some(paths);
-                 s.file_manager.selected_files.clear();
-             }
-        } else {
-             ui.label(RichText::new("READY").color(Colors::TEXT_MUTED).size(9.0).strong());
+        // Search/filter
+        ui.label(RichText::new("FILTER:").color(Colors::TEXT_DIM).size(8.0));
+        ui.add(
+            egui::TextEdit::singleline(&mut s.file_manager.filter_query)
+                .desired_width(120.0)
+                .hint_text("filename...")
+                .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
+        );
+
+        ui.add_space(8.0);
+
+        // Sort
+        ui.label(RichText::new("SORT:").color(Colors::TEXT_DIM).size(8.0));
+        let sort_label = if s.file_manager.sort_ascending { "NAME ↑" } else { "NAME ↓" };
+        if ui.button(RichText::new(sort_label).size(8.0)).clicked() {
+            s.file_manager.sort_ascending = !s.file_manager.sort_ascending;
         }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            // View Mode Toggle
+            // View mode
             if s.file_manager.view_mode == FileViewMode::List {
-                if ui.button("GRID").clicked() { s.file_manager.view_mode = FileViewMode::Grid; }
+                if ui.button(RichText::new("⊞ GRID").size(8.0)).clicked() {
+                    s.file_manager.view_mode = FileViewMode::Grid;
+                }
             } else {
-                if ui.button("LIST").clicked() { s.file_manager.view_mode = FileViewMode::List; }
+                if ui.button(RichText::new("☰ LIST").size(8.0)).clicked() {
+                    s.file_manager.view_mode = FileViewMode::List;
+                }
             }
             ui.add_space(8.0);
-            if ui.button("REFRESH").clicked() { actions.scan_remote = true; }
+            // Selection actions
+            if !s.file_manager.selected_files.is_empty() {
+                ui.label(RichText::new(format!("[{}]", s.file_manager.selected_files.len())).color(Colors::AMBER).size(9.0).strong());
+                if ui.button(RichText::new("✗ DEL").color(Colors::RED).size(8.0)).clicked() {
+                    let paths: Vec<String> = s.file_manager.selected_files.iter().cloned().collect();
+                    actions.fm_delete = Some(paths);
+                    s.file_manager.selected_files.clear();
+                }
+            }
         });
     });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// List view
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn render_list_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    // Column header
+    egui::Frame::none()
+        .fill(Colors::BG_PANEL)
+        .inner_margin(Margin::symmetric(8.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("NAME").color(Colors::TEXT_DIM).size(8.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("SIZE").color(Colors::TEXT_DIM).size(8.0).strong());
+                    ui.add_space(40.0);
+                    ui.label(RichText::new("TYPE").color(Colors::TEXT_DIM).size(8.0).strong());
+                });
+            });
+        });
+    ui.add(egui::Separator::default().spacing(0.0));
+
     ScrollArea::vertical()
-        .id_source("fm_list")
+        .id_source("fm_list_v3")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             if s.remote_files.is_empty() {
                 ui.vertical_centered(|ui| {
                     ui.add_space(40.0);
-                    ui.label(RichText::new("VACUUM DETECTED").color(Colors::TEXT_MUTED).size(12.0).strong());
-                    ui.label(RichText::new("INITIALIZE SCAN TO DISCOVER DATA").color(Colors::TEXT_MUTED).size(9.0));
+                    ui.label(RichText::new("◌").color(Colors::TEXT_MUTED).size(20.0));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("DIRECTORY EMPTY OR NOT YET LOADED").color(Colors::TEXT_MUTED).size(9.0));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("← SELECT A DRIVE ABOVE TO START").color(Colors::TEXT_DIM).size(8.0).italics());
                 });
+                return;
             }
 
-            for rf in s.remote_files {
-                let is_selected = s.file_manager.selected_files.contains(&rf.name);
-                let bg = if is_selected { Colors::AMBER.gamma_multiply(0.1) } else { Color32::TRANSPARENT };
+            let query = s.file_manager.filter_query.to_lowercase();
+            let asc = s.file_manager.sort_ascending;
 
-                egui::Frame::none()
+            // Sort: dirs first, then files
+            let mut sorted: Vec<_> = s.remote_files.iter().collect();
+            sorted.sort_by(|a, b| {
+                if a.is_dir != b.is_dir {
+                    // dirs first
+                    b.is_dir.cmp(&a.is_dir)
+                } else if asc {
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                } else {
+                    b.name.to_lowercase().cmp(&a.name.to_lowercase())
+                }
+            });
+
+            for rf in sorted {
+                if !query.is_empty() && !rf.name.to_lowercase().contains(&query) { continue; }
+
+                let is_selected = s.file_manager.selected_files.contains(&rf.name);
+                let is_preview  = s.file_manager.preview_file.as_deref() == Some(&rf.name);
+                let bg = if is_selected {
+                    Colors::AMBER.gamma_multiply(0.12)
+                } else if is_preview {
+                    Color32::from_rgba_premultiplied(0, 150, 0, 15)
+                } else {
+                    Color32::TRANSPARENT
+                };
+
+                let resp = egui::Frame::none()
                     .fill(bg)
-                    .inner_margin(Margin::symmetric(8.0, 4.0))
+                    .inner_margin(Margin::symmetric(8.0, 5.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let icon = if rf.is_dir { "📁" } else { "📄" };
-                            ui.label(RichText::new(icon).color(Colors::TEXT_MUTED).size(11.0));
-                            ui.add_space(4.0);
+                            // Icon
+                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            let icon = if rf.is_dir { theme::IconType::Folder } else { theme::IconType::Disk };
+                            let icon_color = if rf.is_dir { Colors::GREEN } else { Colors::TEXT_DIM };
+                            theme::draw_vector_icon(ui, icon_rect, icon, icon_color);
+                            ui.add_space(6.0);
 
                             let label_color = if rf.is_dir { Colors::GREEN } else { Colors::TEXT };
-                            let resp = ui.add(egui::Label::new(RichText::new(&rf.name).color(label_color).size(11.0)).sense(egui::Sense::click()));
-                            
+                            let resp = ui.add(egui::Label::new(
+                                RichText::new(&rf.name).color(label_color).size(10.0)
+                            ).sense(egui::Sense::click()));
+
                             if resp.clicked() {
                                 if ui.input(|i| i.modifiers.ctrl) {
+                                    // Multi-select
                                     if is_selected { s.file_manager.selected_files.remove(&rf.name); }
                                     else { s.file_manager.selected_files.insert(rf.name.clone()); }
                                 } else if rf.is_dir {
@@ -154,88 +368,110 @@ fn render_list_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
                                     actions.browse_remote = Some(new_path.clone());
                                     s.file_manager.current_path = new_path;
                                     s.file_manager.selected_files.clear();
+                                    s.file_manager.preview_file = None;
+                                    s.file_manager.preview_content = None;
                                 } else {
-                                    // Select single file
+                                    // Single click: select + show in preview
                                     s.file_manager.selected_files.clear();
                                     s.file_manager.selected_files.insert(rf.name.clone());
+                                    s.file_manager.preview_file = Some(rf.name.clone());
+                                    s.file_manager.preview_content = None; // will load via agent
                                 }
                             }
 
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.add_space(8.0);
                                 if !rf.is_dir {
-                                    ui.label(RichText::new(crate::views::dashboard::fmt_bytes(rf.size)).color(Colors::TEXT_DIM).size(9.0));
-                                    if ui.button("↓").clicked() {
+                                    ui.label(RichText::new(crate::views::dashboard::fmt_bytes(rf.size))
+                                        .color(Colors::TEXT_DIM).size(8.0));
+                                    if ui.button(RichText::new("↓").size(8.0)).clicked() {
                                         let mut p = s.file_manager.current_path.clone();
                                         p.push(&rf.name);
                                         actions.download_remote_file = Some(p);
                                     }
+                                } else {
+                                    ui.label(RichText::new("DIR").color(Colors::TEXT_DIM).size(8.0));
+                                }
+                                // Type badge
+                                let ext = std::path::Path::new(&rf.name)
+                                    .extension()
+                                    .map(|e| e.to_string_lossy().to_uppercase())
+                                    .unwrap_or_default();
+                                if !ext.is_empty() {
+                                    ui.label(RichText::new(format!(".{}", ext)).color(Colors::TEXT_DIM).size(7.0));
                                 }
                             });
                         });
-                    });
-                ui.add(egui::Separator::default().spacing(0.0).grow(0.0));
+                    }).response;
+
+                // Hover glow
+                if resp.hovered() && !is_selected {
+                    ui.painter().rect_stroke(resp.rect, egui::Rounding::ZERO,
+                        Stroke::new(1.0, Colors::BORDER2.gamma_multiply(0.5)));
+                }
+
+                ui.add(egui::Separator::default().spacing(0.0));
             }
         });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Grid view
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn render_grid_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    if s.remote_files.is_empty() {
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            ui.label(RichText::new("◌").color(Colors::TEXT_MUTED).size(20.0));
+            ui.add_space(8.0);
+            ui.label(RichText::new("SELECT A DRIVE TO EXPLORE").color(Colors::TEXT_MUTED).size(9.0));
+        });
+        return;
+    }
+
+    let query = s.file_manager.filter_query.to_lowercase();
+
     ScrollArea::vertical()
-        .id_source("fm_grid")
+        .id_source("fm_grid_v3")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.add_space(8.0);
             let width = ui.available_width();
-            let cols = (width / 80.0) as usize;
-            let cols = cols.max(1);
+            let cols = ((width / 80.0) as usize).max(1);
 
-            egui::Grid::new("fm_grid_inner")
+            egui::Grid::new("fm_grid_inner_v3")
                 .spacing(egui::vec2(8.0, 8.0))
                 .show(ui, |ui| {
                     let mut count = 0;
                     for rf in s.remote_files {
+                        if !query.is_empty() && !rf.name.to_lowercase().contains(&query) { continue; }
+
                         let is_selected = s.file_manager.selected_files.contains(&rf.name);
-                        
+
                         ui.vertical_centered(|ui| {
                             let (rect, resp) = ui.allocate_exact_size(egui::vec2(70.0, 70.0), egui::Sense::click());
-                            
                             let painter = ui.painter();
-                            let bg = if is_selected { Colors::AMBER.gamma_multiply(0.2) } 
+                            let bg = if is_selected { Colors::AMBER.gamma_multiply(0.2) }
                                      else if resp.hovered() { Colors::BORDER.gamma_multiply(0.3) }
                                      else { Colors::BG_WIDGET };
-                            
                             painter.rect_filled(rect, 2.0, bg);
-                            if is_selected {
-                                painter.rect_stroke(rect, 2.0, Stroke::new(1.0, Colors::AMBER));
-                            } else {
-                                painter.rect_stroke(rect, 2.0, Stroke::new(1.0, Colors::BORDER));
-                            }
+                            painter.rect_stroke(rect, 2.0, Stroke::new(1.0, if is_selected { Colors::AMBER } else { Colors::BORDER }));
 
                             // Icon
                             let icon = if rf.is_dir { "📁" } else { "📄" };
-                            painter.text(
-                                rect.center() + egui::vec2(0.0, -8.0),
-                                egui::Align2::CENTER_CENTER,
-                                icon,
-                                egui::FontId::proportional(24.0),
-                                Colors::TEXT_MUTED
-                            );
+                            painter.text(rect.center() - egui::vec2(0.0, 8.0),
+                                egui::Align2::CENTER_CENTER, icon,
+                                egui::FontId::proportional(22.0), Colors::TEXT_MUTED);
 
-                            // Label (truncated)
-                            let mut display_name = rf.name.clone();
-                            if display_name.len() > 10 { display_name.truncate(8); display_name.push_str(".."); }
-                            painter.text(
-                                rect.center() + egui::vec2(0.0, 18.0),
-                                egui::Align2::CENTER_CENTER,
-                                display_name,
-                                egui::FontId::proportional(9.0),
-                                if rf.is_dir { Colors::GREEN } else { Colors::TEXT }
-                            );
+                            let mut name = rf.name.clone();
+                            if name.len() > 10 { name.truncate(8); name.push_str(".."); }
+                            painter.text(rect.center() + egui::vec2(0.0, 18.0),
+                                egui::Align2::CENTER_CENTER, name,
+                                egui::FontId::proportional(8.0),
+                                if rf.is_dir { Colors::GREEN } else { Colors::TEXT });
 
                             if resp.clicked() {
-                                if ui.input(|i| i.modifiers.ctrl) {
-                                    if is_selected { s.file_manager.selected_files.remove(&rf.name); }
-                                    else { s.file_manager.selected_files.insert(rf.name.clone()); }
-                                } else if rf.is_dir {
+                                if rf.is_dir {
                                     let mut new_path = s.file_manager.current_path.clone();
                                     new_path.push(&rf.name);
                                     actions.browse_remote = Some(new_path.clone());
@@ -244,6 +480,7 @@ fn render_grid_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
                                 } else {
                                     s.file_manager.selected_files.clear();
                                     s.file_manager.selected_files.insert(rf.name.clone());
+                                    s.file_manager.preview_file = Some(rf.name.clone());
                                 }
                             }
                         });
@@ -255,18 +492,130 @@ fn render_grid_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
         });
 }
 
-fn render_scanlines(ui: &mut Ui) {
-    let rect = ui.max_rect();
-    let painter = ui.painter();
-    
-    let color = Color32::from_rgba_premultiplied(0, 255, 65, 3); // Very subtle green (alpha 3)
-    let spacing = 8.0; // Increased spacing
-    let mut y = rect.top();
-    while y < rect.bottom() {
-        painter.line_segment(
-            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-            Stroke::new(1.0, color)
-        );
-        y += spacing;
+// ─────────────────────────────────────────────────────────────────────────────
+// Preview Panel — metadata + content preview for selected file
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn render_preview_panel(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    egui::Frame::none()
+        .fill(Colors::BG_PANEL)
+        .stroke(Stroke::new(1.0, Colors::BORDER))
+        .inner_margin(Margin::same(12.0))
+        .show(ui, |ui| {
+            ui.set_min_height(300.0);
+
+            // Header
+            ui.label(RichText::new("// PREVIEW").color(Colors::GREEN).size(9.0).strong());
+            ui.add(egui::Separator::default().spacing(4.0));
+            ui.add_space(4.0);
+
+            if let Some(fname) = &s.file_manager.preview_file.clone() {
+                // Find the remote file entry
+                let rf_opt = s.remote_files.iter().find(|f| &f.name == fname).cloned();
+
+                if let Some(rf) = rf_opt {
+                    // File name
+                    ui.label(RichText::new(&rf.name).color(Colors::TEXT).size(10.0).strong());
+                    ui.add_space(8.0);
+
+                    // Metadata rows
+                    let ext = std::path::Path::new(&rf.name)
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_uppercase())
+                        .unwrap_or_else(|| "—".to_string());
+
+                    meta_row(ui, "TYPE",  if rf.is_dir { "DIRECTORY" } else { &ext });
+                    if !rf.is_dir {
+                        meta_row(ui, "SIZE", &crate::views::dashboard::fmt_bytes(rf.size));
+                    }
+
+                    ui.add_space(12.0);
+
+                    if rf.is_dir {
+                        ui.label(RichText::new("// FOLDER — CLICK TO OPEN").color(Colors::TEXT_DIM).size(8.0).italics());
+                    } else {
+                        // Text preview or download
+                        let is_text = matches!(
+                            std::path::Path::new(&rf.name).extension()
+                                .map(|e| e.to_string_lossy().to_lowercase())
+                                .as_deref(),
+                            Some("txt" | "log" | "md" | "json" | "toml" | "yaml" | "yml" | "rs" | "py" | "js" | "ts" | "sh" | "csv" | "xml" | "html" | "css")
+                        );
+
+                        if is_text {
+                            if let Some(content) = &s.file_manager.preview_content {
+                                ui.label(RichText::new("// CONTENT PREVIEW").color(Colors::TEXT_DIM).size(8.0));
+                                ui.add_space(4.0);
+                                egui::Frame::none()
+                                    .fill(Colors::BG)
+                                    .stroke(Stroke::new(1.0, Colors::BORDER))
+                                    .inner_margin(Margin::same(8.0))
+                                    .show(ui, |ui| {
+                                        ScrollArea::vertical()
+                                            .id_source("preview_scroll")
+                                            .max_height(180.0)
+                                            .show(ui, |ui| {
+                                                ui.add(egui::Label::new(
+                                                    RichText::new(content).
+                                                        size(8.0).
+                                                        color(Colors::TEXT_DIM).
+                                                        monospace()
+                                                ).wrap(true));
+                                            });
+                                    });
+                            } else {
+                                ui.label(RichText::new("// LOADING PREVIEW...").color(Colors::TEXT_DIM).size(8.0).italics());
+                                // Request preview load via actions.download for small files
+                                // (future: dedicated preview action)
+                            }
+                        } else {
+                            // Binary / non-text file
+                            let category = categorize_file(&rf.name);
+                            ui.label(RichText::new(format!("// {} FILE", category)).color(Colors::TEXT_DIM).size(8.0).italics());
+                        }
+
+                        ui.add_space(12.0);
+                        // Download button
+                        if ui.button(RichText::new("↓ DOWNLOAD TO LOCAL").color(Colors::GREEN).size(9.0)).clicked() {
+                            let mut p = s.file_manager.current_path.clone();
+                            p.push(&rf.name);
+                            actions.download_remote_file = Some(p);
+                        }
+                    }
+                }
+            } else {
+                // Nothing selected
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(RichText::new("◌").color(Colors::TEXT_MUTED).size(18.0));
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("SELECT A FILE\nTO PREVIEW").color(Colors::TEXT_MUTED).size(8.0));
+                });
+            }
+        });
+}
+
+fn meta_row(ui: &mut Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{}:", label)).color(Colors::TEXT_DIM).size(8.0).strong());
+        ui.add_space(4.0);
+        ui.label(RichText::new(value).color(Colors::TEXT).size(9.0));
+    });
+    ui.add_space(2.0);
+}
+
+fn categorize_file(name: &str) -> &'static str {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "mp4" | "mkv" | "avi" | "mov" | "webm" => "VIDEO",
+        "mp3" | "flac" | "wav" | "ogg" | "m4a" => "AUDIO",
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" => "IMAGE",
+        "zip" | "tar" | "gz" | "rar" | "7z" => "ARCHIVE",
+        "pdf" => "PDF",
+        "exe" | "msi" | "deb" | "apk" => "BINARY",
+        _ => "BINARY",
     }
 }
