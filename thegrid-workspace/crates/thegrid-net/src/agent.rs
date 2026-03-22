@@ -310,23 +310,23 @@ impl AgentServer {
         if method == "POST" && url == "/adb/enable" {
             #[cfg(target_os = "linux")]
             {
-                log::info!("Agent: attempting to enable ADB over TCP/IP 5555 (Termux)");
-                match std::process::Command::new("adb")
+                log::info!("Agent: attempting to enable ADB over TCP/IP 5555 (Termux)");                match std::process::Command::new("adb")
                     .arg("tcpip").arg("5555")
                     .output() 
                 {
                     Ok(output) => {
                         let success = output.status.success();
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        let msg = if success { 
-                             "ADB 5555 enabled".to_string() 
-                        } else { 
-                            format!("Failed to enable ADB: {}{}", stdout, stderr) 
-                        };
+                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        let msg = format!("ADB result: success={}, stdout='{}', stderr='{}'", 
+                            success, stdout, stderr);
                         
-                        if success { log::info!("{}", msg); } else { log::error!("{}", msg); }
-
+                        if success { 
+                            log::info!("Agent: {}", msg); 
+                        } else { 
+                            log::error!("Agent: {}", msg); 
+                        }
+                        
                         req.respond(Response::from_string(format!(r#"{{"ok":{},"message":{}}}"#, 
                             success, serde_json::to_string(&msg).unwrap()))
                             .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
@@ -340,6 +340,7 @@ impl AgentServer {
                         )?;
                     }
                 }
+
             }
             #[cfg(not(target_os = "linux"))]
             {
