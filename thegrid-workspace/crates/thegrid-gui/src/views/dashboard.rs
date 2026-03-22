@@ -56,6 +56,8 @@ pub struct DetailState<'a> {
     pub watch_paths:    &'a [std::path::PathBuf],
     /// Phase 3: live telemetry for this device (None = not yet fetched)
     pub telemetry:      Option<&'a thegrid_core::models::NodeTelemetry>,
+    /// Phase 3: Smart Rules for filtering
+    pub smart_rules:    &'a [thegrid_core::models::SmartRule],
     /// New in Node Enhancement: tracks the current directory being browsed
     #[allow(dead_code)]
     pub _current_remote_path: &'a mut std::path::PathBuf,
@@ -130,6 +132,8 @@ pub fn render_device_panel(
     selected_node_ids: &mut Vec<String>,
     projects: &[Project],
     categories: &[Category],
+    smart_rules: &[thegrid_core::models::SmartRule],
+    active_rule: &mut Option<String>,
     filter: &mut String,
     needs_refresh: &mut bool,
     local_device_name: &str,
@@ -324,6 +328,33 @@ pub fn render_device_panel(
                         // Category filter logic (Phase 3 next)
                     }
                 });
+            }
+
+            // ── Smart Rules Section ───────────────────────────────────────────────
+            ui.add_space(16.0);
+            ui.label(RichText::new("// SMART RULES").color(Colors::GREEN).size(9.0).strong());
+            ui.add_space(4.0);
+            if smart_rules.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(16.0);
+                    ui.label(RichText::new("NO RULES").color(Colors::TEXT_DIM).size(9.0).italics());
+                });
+            } else {
+                for rule in smart_rules {
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        let is_active = *active_rule == Some(rule.id.clone());
+                        let color = if is_active { Colors::GREEN } else { Colors::TEXT };
+                        if ui.selectable_label(is_active, RichText::new(format!("⭍ {}", rule.name.to_uppercase())).color(color).size(10.0)).clicked() {
+                            // Toggle active rule
+                            if is_active {
+                                *active_rule = None;
+                            } else {
+                                *active_rule = Some(rule.id.clone());
+                            }
+                        }
+                    });
+                }
             }
         });
 
@@ -1357,6 +1388,7 @@ pub fn render_cluster_view(
     cluster_paths: &mut HashMap<String, PathBuf>,
     cluster_files: &HashMap<String, Vec<RemoteFile>>,
     local_device_name: &str,
+    active_rule: Option<&thegrid_core::models::SmartRule>,
 ) -> ClusterActions {
     let mut actions = ClusterActions::default();
     
@@ -1384,7 +1416,8 @@ pub fn render_cluster_view(
                         telemetries.get(&dev.id), 
                         cluster_paths.get(&dev.id),
                         cluster_files.get(&dev.id).unwrap_or(&vec![]),
-                        local_device_name
+                        local_device_name,
+                        active_rule
                     ) {
                         actions.load_node_path = Some((dev.id.clone(), act));
                     }
@@ -1403,6 +1436,7 @@ fn render_cluster_node_explorer(
     current_path: Option<&PathBuf>,
     files: &[RemoteFile],
     local_device_name: &str,
+    active_rule: Option<&thegrid_core::models::SmartRule>,
 ) -> Option<PathBuf> {
     let mut next_path = None;
     let is_local = dev.hostname == local_device_name;
@@ -1459,8 +1493,50 @@ fn render_cluster_node_explorer(
                             ui.add_space(20.0);
                             ui.label(RichText::new("// EMPTY OR LOADING").color(Colors::TEXT_DIM).size(7.0).italics());
                         });
-                    } else {
-                        for file in files {
+                        let mut filtered_files: Vec<_> = files.iter().filter(|rf| {
+                            if let Some(rule) = active_rule {
+                                let mut matches = true;
+                                for f in &rule.filters {
+                                    match f {
+                                        thegrid_core::models::SmartFilterType::Extension(ext) => {
+                                            if rf.is_dir { matches = false; break; }
+                                            let file_ext = std::path::Path::new(&rf.name)
+                                                .extension()
+                                                .map(|e| e.to_string_lossy().to_lowercase())
+                                                .unwrap_or_default();
+                                            if file_ext != ext.to_lowercase() { matches = false; break; }
+                                        }
+                                        thegrid_core::models::SmartFilterType::MinSize(ms) => {
+                                            if rf.is_dir || rf.size < *ms { matches = false; break; }
+                                        }
+                                        thegrid_core::models::SmartFilterType::MaxSize(ms) => {
+                                            if rf.is_dir || rf.size > *ms { matches = false; break; }
+                                        }
+                                        thegrid_core::models::SmartFilterType::ModifiedAfter(dt) => {
+                                            if let Some(m) = rf.modified { if m < *dt { matches = false; break; } } else { matches = false; break; }
+                                        }
+                                        thegrid_core::models::SmartFilterType::ModifiedBefore(dt) => {
+                                            if let Some(m) = rf.modified { if m > *dt { matches = false; break; } } else { matches = false; break; }
+                                        }
+                                        _ => {} 
+                                    }
+                                }
+                                matches
+                            } else {
+                                true
+                            }
+                        }).collect();
+                        
+                        // Sort: dirs first
+                        filtered_files.sort_by(|a, b| {
+                            if a.is_dir != b.is_dir {
+                                b.is_dir.cmp(&a.is_dir)
+                            } else {
+                                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                            }
+                        });
+
+                        for file in filtered_files {
                             ui.horizontal(|ui| {
                                 let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                                 let icon = if file.is_dir { theme::IconType::Folder } else { theme::IconType::Disk };

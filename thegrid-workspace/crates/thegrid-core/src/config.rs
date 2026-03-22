@@ -48,6 +48,18 @@ pub struct Config {
     /// Enable remote file access over the mesh
     #[serde(default = "Config::default_true")]
     pub enable_file_access: bool,
+
+    /// Phase 3: User-defined Custom Smart Rules for filtering files
+    #[serde(default)]
+    pub smart_rules: Vec<crate::models::SmartRule>,
+
+    /// Phase 3: User-defined Projects
+    #[serde(default)]
+    pub projects: Vec<crate::models::Project>,
+
+    /// Phase 3: User-defined Categories
+    #[serde(default)]
+    pub categories: Vec<crate::models::Category>,
 }
 
 impl Default for Config {
@@ -64,6 +76,15 @@ impl Default for Config {
             ai_provider_url: None,
             enable_rdp: true,
             enable_file_access: true,
+            smart_rules: Vec::new(),
+            projects: vec![
+                crate::models::Project { id: "p1".into(), name: "THE GRID".into(), description: "Core System".into(), tags: vec!["#core".into(), "#system".into()] },
+                crate::models::Project { id: "p2".into(), name: "RECON".into(), description: "Active Scanning".into(), tags: vec!["#net".into()] },
+            ],
+            categories: vec![
+                crate::models::Category { id: "c1".into(), name: "DOCUMENTS".into(), icon: "📄".into() },
+                crate::models::Category { id: "c2".into(), name: "MEDIA".into(), icon: "🎞".into() },
+            ],
         }
     }
 }

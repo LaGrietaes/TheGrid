@@ -151,9 +151,7 @@ pub struct TheGridApp {
     cluster_paths:    HashMap<String, PathBuf>,
     cluster_files:    HashMap<String, Vec<RemoteFile>>,
 
-    // ── Phase 3: Project & Category State ─────────────────────────────────────
-    projects:   Vec<Project>,
-    categories: Vec<Category>,
+    // ── Phase 3: Project & Category State (Now in config) ─────────────────────
 
     mesh_sync_last_at: std::time::Instant,
 
@@ -215,6 +213,8 @@ pub struct FileManagerState {
     pub preview_file:    Option<String>,
     /// Preview: textual content (for text files, comes from the agent)
     pub preview_content: Option<String>,
+    /// Active SmartRule ID for filtering the current view
+    pub active_rule:     Option<String>,
 }
 impl Default for FileManagerState {
     fn default() -> Self {
@@ -229,6 +229,7 @@ impl Default for FileManagerState {
             sort_ascending:  true,
             preview_file:    None,
             preview_content: None,
+            active_rule:     None,
         }
     }
 }
@@ -302,15 +303,7 @@ impl TheGridApp {
             status_msg: "READY".into(),
             mesh_sync_last_at: std::time::Instant::now(),
             
-            projects: vec![
-                Project { id: "p1".into(), name: "THE GRID".into(), description: "Core System".into(), tags: vec!["#core".into(), "#system".into()] },
-                Project { id: "p2".into(), name: "RECON".into(), description: "Active Scanning".into(), tags: vec!["#net".into()] },
-            ],
-            categories: vec![
-                Category { id: "c1".into(), name: "MEDIA".into(), icon: "📽".into() },
-                Category { id: "c2".into(), name: "LOGS".into(), icon: "🗒".into() },
-                Category { id: "c3".into(), name: "DUMPS".into(), icon: "📦".into() },
-            ],
+
             
             // --- Phase 4: UI state (kept in app) ---
             semantic_enabled:  false,
@@ -1924,8 +1917,10 @@ impl eframe::App for TheGridApp {
                             &telemetry_snap,
                             self.selected_idx,
                             &mut self.selected_node_ids,
-                            &self.projects,
-                            &self.categories,
+                            &self.config.projects,
+                            &self.config.categories,
+                            &self.config.smart_rules,
+                            &mut self.file_manager.active_rule,
                             &mut self.device_filter,
                             &mut needs_refresh,
                             &self.config.device_name,
@@ -1971,6 +1966,8 @@ impl eframe::App for TheGridApp {
                                 .filter(|d| self.selected_node_ids.contains(&d.id))
                                 .cloned()
                                 .collect();
+                            let active_rule = self.file_manager.active_rule.as_ref()
+                                .and_then(|id| self.config.smart_rules.iter().find(|r| &r.id == id));
 
                             let cluster_actions = crate::views::dashboard::render_cluster_view(
                                 ui,
@@ -1979,6 +1976,7 @@ impl eframe::App for TheGridApp {
                                 &mut self.cluster_paths,
                                 &self.cluster_files,
                                 &self.config.device_name,
+                                active_rule,
                             );
 
                             if let Some((node_id, path)) = cluster_actions.load_node_path {
@@ -2022,6 +2020,7 @@ impl eframe::App for TheGridApp {
                                 is_tg_agent:    self.is_tg_agent,
                                 watch_paths:    &watch_snap,
                                 telemetry:      telem_snap.as_ref(),
+                                smart_rules:    &self.config.smart_rules,
                                 _current_remote_path: &mut self.current_remote_path,
                                 file_manager: &mut self.file_manager,
                                 remote_model_edit: &mut self.remote_model_edit,

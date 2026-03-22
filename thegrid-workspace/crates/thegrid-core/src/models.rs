@@ -290,3 +290,21 @@ pub struct Category {
     pub name: String,
     pub icon: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SmartFilterType {
+    Extension(String),
+    MinSize(u64),
+    MaxSize(u64),
+    ModifiedAfter(chrono::DateTime<chrono::Utc>),
+    ModifiedBefore(chrono::DateTime<chrono::Utc>),
+    Project(String),
+    Category(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SmartRule {
+    pub id: String,
+    pub name: String,
+    pub filters: Vec<SmartFilterType>,
+}

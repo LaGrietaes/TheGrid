@@ -278,6 +278,9 @@ fn render_toolbar(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions)
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_list_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    let active_rule = s.file_manager.active_rule.as_ref()
+        .and_then(|id| s.smart_rules.iter().find(|r| &r.id == id));
+
     // Column header
     egui::Frame::none()
         .fill(Colors::BG_PANEL)
@@ -314,8 +317,38 @@ fn render_list_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
             let query = s.file_manager.filter_query.to_lowercase();
             let asc = s.file_manager.sort_ascending;
 
-            // Sort: dirs first, then files
-            let mut sorted: Vec<_> = s.remote_files.iter().collect();
+            // Filter & Sort
+            let mut sorted: Vec<_> = s.remote_files.iter().filter(|rf| {
+                if !query.is_empty() && !rf.name.to_lowercase().contains(&query) { return false; }
+                if let Some(rule) = active_rule {
+                    for f in &rule.filters {
+                        match f {
+                            thegrid_core::models::SmartFilterType::Extension(ext) => {
+                                if rf.is_dir { return false; }
+                                let file_ext = std::path::Path::new(&rf.name)
+                                    .extension()
+                                    .map(|e| e.to_string_lossy().to_lowercase())
+                                    .unwrap_or_default();
+                                if file_ext != ext.to_lowercase() { return false; }
+                            }
+                            thegrid_core::models::SmartFilterType::MinSize(ms) => {
+                                if rf.is_dir || rf.size < *ms { return false; }
+                            }
+                            thegrid_core::models::SmartFilterType::MaxSize(ms) => {
+                                if rf.is_dir || rf.size > *ms { return false; }
+                            }
+                            thegrid_core::models::SmartFilterType::ModifiedAfter(dt) => {
+                                if let Some(m) = rf.modified { if m < *dt { return false; } } else { return false; }
+                            }
+                            thegrid_core::models::SmartFilterType::ModifiedBefore(dt) => {
+                                if let Some(m) = rf.modified { if m > *dt { return false; } } else { return false; }
+                            }
+                            _ => {} // Project/Category tags not implemented yet
+                        }
+                    }
+                }
+                true
+            }).collect();
             sorted.sort_by(|a, b| {
                 if a.is_dir != b.is_dir {
                     // dirs first
@@ -328,7 +361,6 @@ fn render_list_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
             });
 
             for rf in sorted {
-                if !query.is_empty() && !rf.name.to_lowercase().contains(&query) { continue; }
 
                 let is_selected = s.file_manager.selected_files.contains(&rf.name);
                 let is_preview  = s.file_manager.preview_file.as_deref() == Some(&rf.name);
@@ -420,6 +452,9 @@ fn render_list_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn render_grid_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    let active_rule = s.file_manager.active_rule.as_ref()
+        .and_then(|id| s.smart_rules.iter().find(|r| &r.id == id));
+
     if s.remote_files.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
@@ -445,6 +480,36 @@ fn render_grid_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
                     let mut count = 0;
                     for rf in s.remote_files {
                         if !query.is_empty() && !rf.name.to_lowercase().contains(&query) { continue; }
+                        if let Some(rule) = active_rule {
+                            let mut matches = true;
+                            for f in &rule.filters {
+                                match f {
+                                    thegrid_core::models::SmartFilterType::Extension(ext) => {
+                                        if rf.is_dir { matches = false; break; }
+                                        let file_ext = std::path::Path::new(&rf.name)
+                                            .extension()
+                                            .map(|e| e.to_string_lossy().to_lowercase())
+                                            .unwrap_or_default();
+                                        if file_ext != ext.to_lowercase() { matches = false; break; }
+                                    }
+                                    thegrid_core::models::SmartFilterType::MinSize(ms) => {
+                                        if rf.is_dir || rf.size < *ms { matches = false; break; }
+                                    }
+                                    thegrid_core::models::SmartFilterType::MaxSize(ms) => {
+                                        if rf.is_dir || rf.size > *ms { matches = false; break; }
+                                    }
+                                    thegrid_core::models::SmartFilterType::ModifiedAfter(dt) => {
+                                        if let Some(m) = rf.modified { if m < *dt { matches = false; break; } } else { matches = false; break; }
+                                    }
+                                    thegrid_core::models::SmartFilterType::ModifiedBefore(dt) => {
+                                        if let Some(m) = rf.modified { if m > *dt { matches = false; break; } } else { matches = false; break; }
+                                    }
+                                    _ => {} 
+                                }
+                            }
+                            if !matches { continue; }
+                        }
+
 
                         let is_selected = s.file_manager.selected_files.contains(&rf.name);
 
