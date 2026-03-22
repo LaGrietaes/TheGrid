@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::process::Command;
 
 /// Resolution preset for RDP sessions.
