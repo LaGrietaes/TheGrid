@@ -41,6 +41,7 @@ impl Database {
                 size        INTEGER NOT NULL DEFAULT 0,
                 modified    INTEGER,
                 hash        TEXT,
+                ai_metadata TEXT,
                 indexed_at  INTEGER NOT NULL,
                 UNIQUE(device_id, path)
             );
@@ -197,6 +198,14 @@ impl Database {
         self.conn.execute(
             "UPDATE files SET hash = ?1 WHERE id = ?2",
             params![hash, id]
+        )?;
+        Ok(())
+    }
+
+    pub fn update_ai_metadata(&self, id: i64, metadata_json: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET ai_metadata = ?1 WHERE id = ?2",
+            params![metadata_json, id]
         )?;
         Ok(())
     }
@@ -400,6 +409,23 @@ impl Database {
             let id: i64 = row.get(0)?;
             let path: String = row.get(1)?;
             Ok((id, PathBuf::from(path)))
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn get_files_needing_media_ai(&self, limit: usize) -> Result<Vec<(i64, PathBuf)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path FROM files 
+             WHERE (ai_metadata IS NULL OR ai_metadata = '')
+               AND (ext IN ('jpg', 'jpeg', 'png', 'webp', 'mp4', 'mkv', 'mov', 'avi'))
+             LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let path_str: String = row.get(1)?;
+            Ok((id, PathBuf::from(path_str)))
         })?;
         
         let mut out = Vec::new();

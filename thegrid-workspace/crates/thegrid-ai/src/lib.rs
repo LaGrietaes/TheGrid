@@ -116,12 +116,49 @@ impl AiNodeDetector {
         sys.refresh_all();
         Self { sys }
     }
+
     pub fn is_ai_node(&self) -> bool {
         let total_ram_gb = self.sys.total_memory() / (1024 * 1024 * 1024);
-        total_ram_gb >= 8
+        total_ram_gb >= 8 || self.has_nvidia_gpu()
     }
-    pub fn capability_label(&self) -> &'static str {
-        if self.is_ai_node() { "AI NODE (STUBBED)" } else { "STANDARD" }
+
+    pub fn has_nvidia_gpu(&self) -> bool {
+        // Simple check for nvidia-smi presence and output
+        let output = std::process::Command::new("nvidia-smi")
+            .arg("--query-gpu=name")
+            .arg("--format=csv,noheader")
+            .output();
+
+        match output {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                s.contains("RTX") || s.contains("GTX") || s.contains("NVIDIA")
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn gpu_info(&self) -> Option<String> {
+        let output = std::process::Command::new("nvidia-smi")
+            .arg("--query-gpu=name,memory.total")
+            .arg("--format=csv,noheader")
+            .output();
+
+        match output {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if s.is_empty() { None } else { Some(s) }
+            }
+            Err(_) => None,
+        }
+    }
+
+    pub fn capability_label(&self) -> String {
+        let mut label = if self.is_ai_node() { "AI NODE" } else { "STANDARD" }.to_string();
+        if let Some(gpu) = self.gpu_info() {
+            label = format!("{} ({})", label, gpu);
+        }
+        label
     }
 }
 
@@ -156,3 +193,63 @@ impl SemanticSearch {
         Ok(Vec::new())
     }
 }
+
+/// Metadata extracted from media files (images, video) using AI models.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
+pub struct MediaMetadata {
+    pub description: String,
+    pub tags: Vec<String>,
+    pub dominant_colors: Vec<String>,
+    pub face_count: usize,
+    pub ocr_text: Option<String>,
+}
+
+/// Trait for analyzing media files.
+pub trait MediaAnalyzer: Send + Sync {
+    fn analyze(&self, path: &std::path::Path) -> Result<MediaMetadata>;
+}
+
+/// GPU-accelerated media analyzer (placeholder for actual CUDA/cuDNN logic).
+pub struct CudaMediaAnalyzer {
+    gpu_name: String,
+}
+
+impl CudaMediaAnalyzer {
+    pub fn new() -> Result<Self> {
+        let detector = AiNodeDetector::new();
+        if let Some(gpu) = detector.gpu_info() {
+            log::info!("[AI] Initializing CUDA Media Analyzer on {}", gpu);
+            Ok(Self { gpu_name: gpu })
+        } else {
+            Err(anyhow::anyhow!("No CUDA-capable GPU found for high-performance indexing."))
+        }
+    }
+}
+
+impl MediaAnalyzer for CudaMediaAnalyzer {
+    fn analyze(&self, path: &std::path::Path) -> Result<MediaMetadata> {
+        // Here we would normally load a CLIP or BLIP model and run it on the GPU.
+        // For now, we return a smart stub that represents what the 2070 would see.
+        log::info!("[AI] [{}] Analyzing media: {:?}", self.gpu_name, path);
+        
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let mut meta = MediaMetadata::default();
+        
+        match ext.as_str() {
+            "jpg" | "png" | "webp" => {
+                meta.description = "Photographic content detected (AI stub)".to_string();
+                meta.tags = vec!["photography".into(), "visual".into()];
+            }
+            "mp4" | "mkv" | "mov" => {
+                meta.description = "Video sequence (AI stub)".to_string();
+                meta.tags = vec!["motion".into(), "video".into()];
+            }
+            _ => {
+                meta.description = "Unsupported media type".to_string();
+            }
+        }
+        
+        Ok(meta)
+    }
+}
+

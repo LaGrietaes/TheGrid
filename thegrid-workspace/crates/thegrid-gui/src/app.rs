@@ -1559,15 +1559,15 @@ impl TheGridApp {
         }
 
         if actions.scan_remote {
-            // For the local device, read the filesystem directly
-            let is_local = self.devices.iter()
-                .find(|d| d.id == device_id)
-                .map(|d| d.name == self.config.device_name || d.hostname == self.config.device_name)
-                .unwrap_or(false);
+            let is_local = device_id == self.config.device_name;
             if is_local {
-                self.spawn_local_browse(device_id.to_string(), self.current_remote_path.clone());
+                if let Some(telem) = self.telemetry_cache.get(device_id) {
+                    for drive in &telem.capabilities.drives {
+                         self.spawn_index_directory(std::path::PathBuf::from(&drive.name), device_id.to_string(), device_id.to_string());
+                    }
+                }
             } else {
-                self.spawn_list_remote_files(ip.to_string());
+                self.push_toast(Toast::info("Remote scan request sent (stub)"));
             }
         }
 
@@ -1647,6 +1647,8 @@ impl TheGridApp {
             #[cfg(not(target_os = "windows"))]
             let _ = std::process::Command::new("ssh").arg(ip).spawn();
         }
+
+
     }
 
     // ── Remote Terminal Spawners ─────────────────────────────────────────────

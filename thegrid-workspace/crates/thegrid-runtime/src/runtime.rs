@@ -22,6 +22,7 @@ pub struct AppRuntime {
     
     // State
     pub is_ai_node: bool,
+    pub media_analyzer: Arc<Mutex<Option<Arc<dyn thegrid_ai::MediaAnalyzer>>>>,
     pub agent_shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
@@ -66,6 +67,7 @@ impl AppRuntime {
             semantic_search: Arc::new(Mutex::new(None)),
             remote_ai_nodes: Arc::new(Mutex::new(std::collections::HashMap::new())),
             is_ai_node,
+            media_analyzer: Arc::new(Mutex::new(None)),
             agent_shutdown: Arc::new(Mutex::new(None)),
         };
 
@@ -102,7 +104,20 @@ impl AppRuntime {
 
         if self.is_ai_node || has_remote_provider {
             self.spawn_semantic_initializer();
+            self.spawn_embedding_worker();
         }
+
+        // Phase 4: Media AI for GPU nodes
+        if self.is_ai_node {
+            if let Ok(analyzer) = thegrid_ai::CudaMediaAnalyzer::new() {
+                let mut lock = self.media_analyzer.lock().unwrap();
+                *lock = Some(Arc::new(analyzer));
+                self.spawn_media_analyzer_worker();
+            }
+        }
+
+        // Background indexing helpers
+        self.spawn_hashing_worker();
 
         let mut shutdown_lock = self.agent_shutdown.lock().unwrap();
         *shutdown_lock = Some(server.shutdown_handle());
@@ -402,7 +417,10 @@ impl AppRuntime {
                     Err(_) => break,
                 };
                 
-                if batch.is_empty() { break; }
+                if batch.is_empty() { 
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    continue;
+                }
                 
                 for (fid, text) in batch {
                     let mut success = false;
@@ -442,6 +460,140 @@ impl AppRuntime {
                     let _ = event_tx.send(AppEvent::EmbeddingProgress { indexed, total });
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+
+    pub fn spawn_hashing_worker(&self) {
+        let db = Arc::clone(&self.db);
+        let event_tx = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting background hashing worker...");
+            let batch_size = 50;
+            let mut hashed_count = 0;
+
+            loop {
+                // 1. Get files needing hashing
+                let batch = match db.lock() {
+                    Ok(guard) => match guard.get_files_needing_hash(batch_size) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!("[Runtime] Hashing error in DB: {}", e);
+                            break;
+                        }
+                    },
+                    Err(_) => break,
+                };
+
+                if batch.is_empty() {
+                    // Nothing to hash right now, wait and check again later (or exit if not needed anymore)
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    continue;
+                }
+
+                for (fid, path) in batch {
+                    if path.exists() && path.is_file() {
+                        match thegrid_core::hash_file(&path) {
+                            Ok(h) => {
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.update_file_hash(fid, &h);
+                                    hashed_count += 1;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[Runtime] Failed to hash {:?}: {}", path, e);
+                                // Mark as failed in DB so we don't retry forever
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.update_file_hash(fid, &format!("ERR_{}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        // File gone, remove from DB or mark as missing
+                        if let Ok(guard) = db.lock() {
+                            let _ = guard.delete_file_by_id(fid);
+                        }
+                    }
+                    
+                    if hashed_count % 10 == 0 {
+                        let _ = event_tx.send(AppEvent::Status(format!("Hashed {} files", hashed_count)));
+                    }
+                }
+                
+                // Yield to other threads
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+    }
+
+    pub fn spawn_media_analyzer_worker(&self) {
+        let db = Arc::clone(&self.db);
+        let event_tx = self.event_tx.clone();
+        let analyzer = Arc::clone(&self.media_analyzer);
+
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting background media analyzer worker...");
+            let batch_size = 10;
+            let mut analyzed_count = 0;
+
+            loop {
+                let az = {
+                    let lock = analyzer.lock().unwrap();
+                    lock.clone()
+                };
+
+                if az.is_none() {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    continue;
+                }
+                let az = az.unwrap();
+
+                let batch = match db.lock() {
+                    Ok(guard) => match guard.get_files_needing_media_ai(batch_size) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!("[Runtime] Media AI error in DB: {}", e);
+                            break;
+                        }
+                    },
+                    Err(_) => break,
+                };
+
+                if batch.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    continue;
+                }
+
+                for (fid, path) in batch {
+                    if path.exists() && path.is_file() {
+                        match az.analyze(&path) {
+                            Ok(meta) => {
+                                if let Ok(json) = serde_json::to_string(&meta) {
+                                    if let Ok(guard) = db.lock() {
+                                        let _ = guard.update_ai_metadata(fid, &json);
+                                        analyzed_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[Runtime] Failed to analyze media {:?}: {}", path, e);
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.update_ai_metadata(fid, &format!("{{\"error\":\"{}\"}}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        if let Ok(guard) = db.lock() {
+                            let _ = guard.delete_file_by_id(fid);
+                        }
+                    }
+
+                    if analyzed_count % 5 == 0 {
+                        let _ = event_tx.send(AppEvent::Status(format!("Analyzed {} media files with GPU", analyzed_count)));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
         });
     }
