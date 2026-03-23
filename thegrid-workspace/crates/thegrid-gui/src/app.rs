@@ -211,8 +211,10 @@ pub struct FileManagerState {
     pub sort_ascending:  bool,
     /// Preview: the name of the file currently being previewed
     pub preview_file:    Option<String>,
-    /// Preview: textual content (for text files, comes from the agent)
-    pub preview_content: Option<String>,
+    /// Preview: raw bytes content (comes from the agent)
+    pub preview_content: Option<Vec<u8>>,
+    /// Preview: OS-provided texture for image files
+    pub preview_texture: Option<egui::TextureHandle>,
     /// Active SmartRule ID for filtering the current view
     pub active_rule:     Option<String>,
 }
@@ -229,6 +231,7 @@ impl Default for FileManagerState {
             sort_ascending:  true,
             preview_file:    None,
             preview_content: None,
+            preview_texture: None,
             active_rule:     None,
         }
     }
@@ -824,6 +827,10 @@ impl TheGridApp {
                 }
                 AppEvent::RemoteFilesFailed(err) => {
                     self.push_toast(Toast::err(format!("File scan: {}", err)));
+                }
+
+                AppEvent::AgentFilePreviewLoaded(content) => {
+                    self.file_manager.preview_content = Some(content);
                 }
 
                 AppEvent::RemoteBrowseLoaded { device_id, path, files } => {
@@ -1581,6 +1588,10 @@ impl TheGridApp {
             self.spawn_download_file(ip.to_string(), filename);
         }
 
+        if let Some(path) = actions.preview_remote {
+            self.spawn_preview_remote_file(ip.to_string(), path);
+        }
+
         if let Some(path) = actions.download_remote_file {
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             self.transfer_log.push(TransferLogEntry::info(format!("Downloading {}...", name)));
@@ -1680,6 +1691,30 @@ impl TheGridApp {
                         Err(_) => break,
                     }
                     std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        });
+    }
+
+    fn spawn_preview_remote_file(&mut self, ip: String, path: std::path::PathBuf) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key) {
+                Ok(client) => match client.preview_file(&path.to_string_lossy()) {
+                    Ok(bytes) => {
+                        let _ = tx.send(AppEvent::AgentFilePreviewLoaded(bytes));
+                    }
+                    Err(e) => {
+                        let content = format!("Failed to read preview: {}", e);
+                        let _ = tx.send(AppEvent::AgentFilePreviewLoaded(content.into_bytes()));
+                    }
+                },
+                Err(e) => {
+                    let content = format!("Failed to connect: {}", e);
+                    let _ = tx.send(AppEvent::AgentFilePreviewLoaded(content.into_bytes()));
                 }
             }
         });

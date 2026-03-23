@@ -25,6 +25,9 @@ pub enum AppEvent {
     /// Remote file list fetch failed
     RemoteFilesFailed(String),
 
+    /// A remote file preview was loaded
+    AgentFilePreviewLoaded(Vec<u8>),
+
     /// A directory list was fetched from a remote node
     RemoteBrowseLoaded {
         device_id: String,

@@ -106,6 +106,7 @@ fn render_drive_bar(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
                                             s.file_manager.selected_files.clear();
                                             s.file_manager.preview_file = None;
                                             s.file_manager.preview_content = None;
+                                            s.file_manager.preview_texture = None; // clear previous texture
                                             actions.browse_remote = Some(root);
                                         }
                                         // Usage bar
@@ -379,8 +380,12 @@ fn render_list_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
                         ui.horizontal(|ui| {
                             // Icon
                             let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                            let icon = if rf.is_dir { theme::IconType::Folder } else { theme::IconType::Disk };
-                            let icon_color = if rf.is_dir { Colors::GREEN } else { Colors::TEXT_DIM };
+                            let (icon, icon_color) = if rf.is_dir {
+                                (theme::IconType::Folder, Colors::GREEN)
+                            } else {
+                                let ext = std::path::Path::new(&rf.name).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+                                theme::get_file_icon(&ext)
+                            };
                             theme::draw_vector_icon(ui, icon_rect, icon, icon_color);
                             ui.add_space(6.0);
 
@@ -402,12 +407,17 @@ fn render_list_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
                                     s.file_manager.selected_files.clear();
                                     s.file_manager.preview_file = None;
                                     s.file_manager.preview_content = None;
+                                    s.file_manager.preview_texture = None;
                                 } else {
                                     // Single click: select + show in preview
                                     s.file_manager.selected_files.clear();
                                     s.file_manager.selected_files.insert(rf.name.clone());
                                     s.file_manager.preview_file = Some(rf.name.clone());
+                                    let mut p = s.file_manager.current_path.clone();
+                                    p.push(&rf.name);
+                                    actions.preview_remote = Some(p);
                                     s.file_manager.preview_content = None; // will load via agent
+                                    s.file_manager.preview_texture = None;
                                 }
                             }
 
@@ -515,22 +525,25 @@ fn render_grid_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
 
                         ui.vertical_centered(|ui| {
                             let (rect, resp) = ui.allocate_exact_size(egui::vec2(70.0, 70.0), egui::Sense::click());
-                            let painter = ui.painter();
                             let bg = if is_selected { Colors::AMBER.gamma_multiply(0.2) }
                                      else if resp.hovered() { Colors::BORDER.gamma_multiply(0.3) }
                                      else { Colors::BG_WIDGET };
-                            painter.rect_filled(rect, 2.0, bg);
-                            painter.rect_stroke(rect, 2.0, Stroke::new(1.0, if is_selected { Colors::AMBER } else { Colors::BORDER }));
+                            ui.painter().rect_filled(rect, 2.0, bg);
+                            ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, if is_selected { Colors::AMBER } else { Colors::BORDER }));
 
                             // Icon
-                            let icon = if rf.is_dir { "📁" } else { "📄" };
-                            painter.text(rect.center() - egui::vec2(0.0, 8.0),
-                                egui::Align2::CENTER_CENTER, icon,
-                                egui::FontId::proportional(22.0), Colors::TEXT_MUTED);
+                            let icon_rect = egui::Rect::from_center_size(rect.center() - egui::vec2(0.0, 8.0), egui::vec2(16.0, 16.0));
+                            let (icon, icon_color) = if rf.is_dir {
+                                (theme::IconType::Folder, Colors::GREEN)
+                            } else {
+                                let ext = std::path::Path::new(&rf.name).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+                                theme::get_file_icon(&ext)
+                            };
+                            theme::draw_vector_icon(ui, icon_rect, icon, icon_color);
 
                             let mut name = rf.name.clone();
                             if name.len() > 10 { name.truncate(8); name.push_str(".."); }
-                            painter.text(rect.center() + egui::vec2(0.0, 18.0),
+                            ui.painter().text(rect.center() + egui::vec2(0.0, 18.0),
                                 egui::Align2::CENTER_CENTER, name,
                                 egui::FontId::proportional(8.0),
                                 if rf.is_dir { Colors::GREEN } else { Colors::TEXT });
@@ -546,6 +559,11 @@ fn render_grid_view(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
                                     s.file_manager.selected_files.clear();
                                     s.file_manager.selected_files.insert(rf.name.clone());
                                     s.file_manager.preview_file = Some(rf.name.clone());
+                                    let mut p = s.file_manager.current_path.clone();
+                                    p.push(&rf.name);
+                                    actions.preview_remote = Some(p);
+                                    s.file_manager.preview_content = None;
+                                    s.file_manager.preview_texture = None;
                                 }
                             }
                         });
@@ -599,16 +617,22 @@ fn render_preview_panel(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAc
                     if rf.is_dir {
                         ui.label(RichText::new("// FOLDER — CLICK TO OPEN").color(Colors::TEXT_DIM).size(8.0).italics());
                     } else {
-                        // Text preview or download
-                        let is_text = matches!(
-                            std::path::Path::new(&rf.name).extension()
+                        let ext_lower = std::path::Path::new(&rf.name).extension()
                                 .map(|e| e.to_string_lossy().to_lowercase())
-                                .as_deref(),
-                            Some("txt" | "log" | "md" | "json" | "toml" | "yaml" | "yml" | "rs" | "py" | "js" | "ts" | "sh" | "csv" | "xml" | "html" | "css")
+                                .unwrap_or_default();
+
+                        let is_text = matches!(
+                            ext_lower.as_str(),
+                            "txt" | "log" | "md" | "json" | "toml" | "yaml" | "yml" | "rs" | "py" | "js" | "ts" | "sh" | "csv" | "xml" | "html" | "css"
+                        );
+                        let is_image = matches!(
+                            ext_lower.as_str(),
+                            "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp"
                         );
 
                         if is_text {
-                            if let Some(content) = &s.file_manager.preview_content {
+                            if let Some(bytes) = &s.file_manager.preview_content {
+                                let content = String::from_utf8_lossy(bytes);
                                 ui.label(RichText::new("// CONTENT PREVIEW").color(Colors::TEXT_DIM).size(8.0));
                                 ui.add_space(4.0);
                                 egui::Frame::none()
@@ -618,7 +642,7 @@ fn render_preview_panel(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAc
                                     .show(ui, |ui| {
                                         ScrollArea::vertical()
                                             .id_source("preview_scroll")
-                                            .max_height(180.0)
+                                            .max_height(240.0)
                                             .show(ui, |ui| {
                                                 ui.add(egui::Label::new(
                                                     RichText::new(content).
@@ -629,9 +653,26 @@ fn render_preview_panel(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAc
                                             });
                                     });
                             } else {
-                                ui.label(RichText::new("// LOADING PREVIEW...").color(Colors::TEXT_DIM).size(8.0).italics());
-                                // Request preview load via actions.download for small files
-                                // (future: dedicated preview action)
+                                ui.label(RichText::new("// LOADING TEXT PREVIEW...").color(Colors::TEXT_DIM).size(8.0).italics());
+                            }
+                        } else if is_image {
+                            if let Some(texture) = &s.file_manager.preview_texture {
+                                ui.label(RichText::new("// IMAGE PREVIEW").color(Colors::TEXT_DIM).size(8.0));
+                                ui.add_space(4.0);
+                                ui.add(egui::Image::from_texture(texture).max_width(200.0).maintain_aspect_ratio(true));
+                            } else if let Some(bytes) = &s.file_manager.preview_content {
+                                // Try to load texture
+                                if let Ok(image) = image::load_from_memory(bytes) {
+                                    let size = [image.width() as usize, image.height() as usize];
+                                    let image_buffer = image.to_rgba8();
+                                    let pixels = image_buffer.as_flat_samples();
+                                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+                                    s.file_manager.preview_texture = Some(ui.ctx().load_texture("preview", color_image, Default::default()));
+                                } else {
+                                    ui.label(RichText::new("// FAILED TO DECODE IMAGE").color(Colors::RED).size(8.0).italics());
+                                }
+                            } else {
+                                ui.label(RichText::new("// LOADING IMAGE PREVIEW...").color(Colors::TEXT_DIM).size(8.0).italics());
                             }
                         } else {
                             // Binary / non-text file

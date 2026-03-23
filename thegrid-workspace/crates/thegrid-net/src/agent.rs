@@ -484,6 +484,38 @@ impl AgentServer {
             return Ok(());
         }
 
+        if method == "GET" && url.starts_with("/v1/preview") {
+            let enabled = {
+                let cfg = self.config.lock().unwrap();
+                cfg.enable_file_access
+            };
+            if !enabled {
+                req.respond(Response::from_string(r#"{"error":"file access disabled"}"#).with_status_code(403))?;
+                return Ok(());
+            }
+            let path_str = url.split("path=").nth(1).unwrap_or("");
+            let path_str = urlencoding_decode(path_str);
+            let path = PathBuf::from(path_str);
+
+            if path.exists() && path.is_file() {
+                // Read up to 16KB
+                let mut file = match std::fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        req.respond(Response::from_string("Permission denied").with_status_code(403))?;
+                        return Ok(());
+                    }
+                };
+                let mut buf = vec![0u8; 16 * 1024];
+                let bytes_read = file.read(&mut buf).unwrap_or(0);
+                buf.truncate(bytes_read);
+                req.respond(Response::from_data(buf))?;
+            } else {
+                req.respond(Response::from_string("Not found").with_status_code(404))?;
+            }
+            return Ok(());
+        }
+
         if method == "DELETE" && url.starts_with("/v1/files") {
             let enabled = {
                 let cfg = self.config.lock().unwrap();
@@ -954,6 +986,16 @@ impl AgentClient {
         let dest = dest_dir.join(filename);
         std::fs::write(&dest, &bytes)?;
         Ok(dest)
+    }
+
+    pub fn preview_file(&self, path: &str) -> Result<Vec<u8>> {
+        let url = format!("{}/v1/preview?path={}", self.base_url, urlencoding_encode(path));
+        let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).send()?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        let bytes = resp.bytes().context("Reading preview bytes")?;
+        Ok(bytes.to_vec())
     }
 
     pub fn upload_file(&self, path: &Path) -> Result<()> {

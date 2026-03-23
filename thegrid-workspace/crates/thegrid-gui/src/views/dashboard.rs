@@ -101,6 +101,7 @@ pub struct DetailActions {
     pub load_timeline:   bool,
     /// New in Node Enhancement: browse a specific remote path
     pub browse_remote:   Option<std::path::PathBuf>,
+    pub preview_remote:  Option<std::path::PathBuf>,
     /// New in Node Enhancement: download a file from any path
     pub download_remote_file: Option<std::path::PathBuf>,
     /// New in Node Enhancement: update remote AI model config (device_type, model, url)
@@ -1205,12 +1206,12 @@ pub fn render_detail_panel_with_timeline(
                             ui.add_space(12.0);
                         }
 
-                        // Disk — disk_pct() returns 0.0-1.0; render_gauge wants 0-100
-                        let dsk = telem.disk_pct() * 100.0;
+                        // Disk — disk_pct() returns 0.0-100.0
+                        let dsk = telem.disk_pct();
                         crate::telemetry::render_gauge(ui, "DSK", None, dsk, &format!("{:.0}%", dsk));
                         ui.add_space(12.0);
-                        // RAM — ram_pct() returns 0.0-1.0
-                        let ram = telem.ram_pct() * 100.0;
+                        // RAM — ram_pct() returns 0.0-100.0
+                        let ram = telem.ram_pct();
                         crate::telemetry::render_gauge(ui, "RAM", None, ram, &format!("{:.0}%", ram));
                         ui.add_space(12.0);
                         // CPU — cpu_pct is already 0-100 from sysinfo
@@ -1539,8 +1540,13 @@ fn render_cluster_node_explorer(
                         for file in filtered_files {
                             ui.horizontal(|ui| {
                                 let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                                let icon = if file.is_dir { theme::IconType::Folder } else { theme::IconType::Disk };
-                                theme::draw_vector_icon(ui, icon_rect, icon, Colors::GREEN);
+                                let (icon, color) = if file.is_dir { 
+                                    (theme::IconType::Folder, Colors::GREEN)
+                                } else { 
+                                    let ext = std::path::Path::new(&file.name).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+                                    theme::get_file_icon(&ext)
+                                };
+                                theme::draw_vector_icon(ui, icon_rect, icon, color);
                                 ui.add_space(4.0);
                                 if ui.selectable_label(false, RichText::new(&file.name).size(9.0)).clicked() {
                                     if file.is_dir {

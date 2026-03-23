@@ -221,6 +221,7 @@ pub fn password_input<'a>(text: &'a mut String, hint: &str) -> egui::TextEdit<'a
 
 
 
+#[allow(dead_code)]
 pub enum IconType {
     RDP,
     Folder,
@@ -241,6 +242,32 @@ pub enum IconType {
     Tablet,
     Smartphone,
     Chromebook,
+    FileUnknown,
+    FileExt(String),
+}
+
+pub fn get_file_icon(ext: &str) -> (IconType, Color32) {
+    if ext.is_empty() { return (IconType::FileUnknown, Colors::TEXT_DIM); }
+    let mut ext_lower = ext.to_lowercase();
+    if ext_lower.len() > 4 {
+        ext_lower.truncate(4);
+    }
+    match ext_lower.as_str() {
+        "txt" | "md" | "json" | "xml" | "yml" | "yaml" | "csv" | "log" | "doc" | "docx" => (IconType::FileExt(ext_lower), Colors::GREEN),
+        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "svg" => (IconType::FileExt(ext_lower), Colors::AMBER),
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" => (IconType::FileExt(ext_lower), Color32::from_rgb(30, 215, 96)),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" => (IconType::FileExt(ext_lower), Color32::from_rgb(255, 140, 0)),
+        "zip" | "tar" | "gz" | "rar" | "7z" | "bz2" => (IconType::FileExt(ext_lower), Color32::from_rgb(160, 160, 160)),
+        "rs" | "js" | "ts" | "py" | "c" | "cpp" | "h" | "go" | "html" | "css" | "sh" | "bash" | "bat" | "ps1" => (IconType::FileExt(ext_lower), Color32::from_rgb(46, 204, 113)),
+        "exe" | "msi" | "apk" | "dll" | "so" | "dylib" | "bin" => (IconType::FileExt(ext_lower), Colors::RED),
+        "pdf" => (IconType::FileExt(ext_lower), Color32::from_rgb(244, 15, 2)),   // Adobe Red
+        "ai"  => (IconType::FileExt(ext_lower), Color32::from_rgb(255, 154, 0)),  // AI Orange
+        "psd" => (IconType::FileExt(ext_lower), Color32::from_rgb(49, 197, 244)), // PS Blue
+        "indd" => (IconType::FileExt(ext_lower), Color32::from_rgb(255, 51, 102)), // ID Pink
+        "fig" => (IconType::FileExt(ext_lower), Color32::from_rgb(162, 89, 255)), // Figma Purple
+        "xls" | "xlsx" => (IconType::FileExt(ext_lower), Color32::from_rgb(39, 174, 96)), // Excel Green
+        _ => (IconType::FileExt(ext_lower), Colors::TEXT_DIM),
+    }
 }
 
 pub fn draw_vector_icon(ui: &mut Ui, rect: egui::Rect, icon: IconType, color: Color32) {
@@ -373,6 +400,17 @@ pub fn draw_vector_icon(ui: &mut Ui, rect: egui::Rect, icon: IconType, color: Co
             ui.painter().line_segment([c + egui::vec2(-s, s*0.5), c + egui::vec2(-s*1.1, s*0.7)], stroke);
             ui.painter().line_segment([c + egui::vec2(s, s*0.5), c + egui::vec2(s*1.1, s*0.7)], stroke);
             ui.painter().line_segment([c + egui::vec2(-s*1.1, s*0.7), c + egui::vec2(s*1.1, s*0.7)], stroke);
+        }
+
+        IconType::FileUnknown => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*1.2, s*1.6)), egui::Rounding::ZERO, stroke);
+            // Question markish
+            ui.painter().circle_stroke(c + egui::vec2(0.0, -s*0.2), s*0.2, stroke);
+            ui.painter().circle_filled(c + egui::vec2(0.0, s*0.4), 1.5, color);
+        }
+        IconType::FileExt(ref ext) => {
+            ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*1.8, s*1.8)), egui::Rounding::same(1.0), stroke);
+            ui.painter().text(c, egui::Align2::CENTER_CENTER, ext.to_uppercase(), egui::FontId::proportional(s * 0.9), color);
         }
     }
 }
