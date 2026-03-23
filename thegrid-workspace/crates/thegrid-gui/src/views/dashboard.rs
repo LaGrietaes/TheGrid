@@ -384,6 +384,20 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
         }
     });
 
+    ui.add_space(8.0);
+    ui.columns(3, |cols| {
+        if action_card(&mut cols[0], theme::IconType::Disk, "INDEX DRIVES", "Full local disk scan") {
+            actions.scan_remote = true;
+        }
+        if action_card(&mut cols[1], theme::IconType::Globe, "GLOBAL SYNC", "Pull from remote mesh") {
+            // This button triggers mesh sync immediately (implicit in app.rs if scan_remote is false?)
+            // For now, let's keep it simple.
+        }
+        if action_card(&mut cols[2], theme::IconType::Power, "WOL", "Send Wake-on-LAN") {
+            actions.wake_device = true;
+        }
+    });
+
     // ── Grid Reachability Banner ──
     if s.status == crate::app::NodeStatus::Reachable {
         ui.add_space(8.0);
@@ -1599,6 +1613,11 @@ fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, _actions: &mut DetailAct
                                     crate::telemetry::fmt_bytes(drive.total)
                                 )
                             );
+
+                            ui.add_space(8.0);
+                            if theme::secondary_button(ui, "⬡ SCAN DRIVE").clicked() {
+                                _actions.scan_remote = true;
+                            }
                         });
                     });
                 ui.add_space(8.0);

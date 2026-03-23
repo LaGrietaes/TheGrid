@@ -119,6 +119,7 @@ pub enum AppEvent {
         scanned: u64,
         total:   u64,
         current: String,
+        ext:     Option<String>,
     },
 
     /// Incoming request from a remote node for an index sync.
@@ -234,4 +235,8 @@ pub enum AppEvent {
     DeleteFiles { device_id: String, paths: Vec<String> },
     RenameFile  { device_id: String, old_path: String, new_name: String },
     MoveFiles   { device_id: String, paths: Vec<String>, dest_dir: String },
+
+    // Phase 4: Persistence & Idle
+    UserIdle(bool), // true if idle > 10m
+    RequestIdleWork,
 }

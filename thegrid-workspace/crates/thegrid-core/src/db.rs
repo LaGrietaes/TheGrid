@@ -103,6 +103,22 @@ impl Database {
                 created_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS index_checkpoints (
+                root_path           TEXT PRIMARY KEY,
+                last_indexed_path   TEXT NOT NULL,
+                total_files         INTEGER NOT NULL DEFAULT 0,
+                scanned_files       INTEGER NOT NULL DEFAULT 0,
+                completed           BOOLEAN NOT NULL DEFAULT 0,
+                updated_at          INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS index_queue (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_path  TEXT NOT NULL,
+                dir_path   TEXT NOT NULL,
+                UNIQUE(root_path, dir_path)
+            );
+
             -- ── Phase 2: Rules & Smart Filters ──────────────────────────
             CREATE TABLE IF NOT EXISTS user_rules (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -491,6 +507,37 @@ impl Database {
         Ok(sorted)
     }
 
+    pub fn enqueue_index_root(&self, root: &Path) -> Result<()> {
+        self.conn.execute("DELETE FROM index_queue WHERE root_path = ?", [root.to_string_lossy()])?;
+        self.conn.execute(
+            "INSERT INTO index_queue (root_path, dir_path) VALUES (?, ?)",
+            [root.to_string_lossy(), root.to_string_lossy()]
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO index_checkpoints (root_path, last_indexed_path, completed, updated_at) VALUES (?, ?, 0, ?)",
+            params![root.to_string_lossy(), root.to_string_lossy(), SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64]
+        )?;
+        Ok(())
+    }
+
+    pub fn get_next_index_task(&self) -> Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT root_path, dir_path FROM index_queue LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn complete_index_task(&self, root: &str, dir: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM index_queue WHERE root_path = ? AND dir_path = ?",
+            [root, dir]
+        )?;
+        Ok(())
+    }
+
     pub fn index_directory<F>(
         &self,
         device_id:   &str,
@@ -499,11 +546,19 @@ impl Database {
         mut progress_cb: F,
     ) -> Result<u64>
     where
-        F: FnMut(u64, &Path),
+        F: FnMut(u64, &Path, Option<&str>),
     {
+        // For 'spawn_index_directory' which calls this directly for full crawl:
+        // We ensure the root is in the queue if it's the first run, but for simplicity
+        // this method still uses a stack but yields to persistence every N files?
+        // No, let's keep this as the WORKER'S INNER LOOP.
+        
         let mut count = 0u64;
+        let root_str = root_dir.to_string_lossy();
+        
+        // Load checkpoint if exists
         let mut stack = vec![root_dir.to_path_buf()];
-
+        
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e)  => e,
@@ -521,13 +576,11 @@ impl Database {
                 };
 
                 if meta.is_dir() {
-                    let name = path.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy();
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
                     if should_skip_dir(&name) { continue; }
                     stack.push(path);
                 } else if meta.is_file() {
-                    let size     = meta.len();
+                    let size = meta.len();
                     let modified = meta.modified().ok()
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as i64);
@@ -537,11 +590,27 @@ impl Database {
                     }
 
                     count += 1;
-                    progress_cb(count, &path);
+                    let ext_str = path.extension().and_then(|e| e.to_str());
+                    progress_cb(count, &path, ext_str);
+                    
+                    // Persistence Point: Update checkpoint every 100 files
+                    if count % 100 == 0 {
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+                        self.conn.execute(
+                            "INSERT OR REPLACE INTO index_checkpoints (root_path, last_indexed_path, scanned_files, updated_at) VALUES (?, ?, ?, ?)",
+                            params![root_str.as_ref(), path.to_string_lossy(), count, now]
+                        )?;
+                    }
                 }
             }
         }
 
+        // Final completion mark
+        self.conn.execute(
+            "UPDATE index_checkpoints SET completed = 1, updated_at = ? WHERE root_path = ?",
+            params![SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64, root_str.as_ref()]
+        )?;
+        
         log::info!("[DB] Indexed {} files under {:?}", count, root_dir);
         Ok(count)
     }

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use anyhow::Result;
+use rusqlite::params;
 
 use thegrid_core::{AppEvent, Config, Database, FileWatcher, hash_file, match_rules};
 use thegrid_net::{AgentClient, AgentServer, TailscaleClient, WolSentry};
@@ -237,54 +238,192 @@ impl AppRuntime {
 
     pub fn spawn_index_directory(&self, path: PathBuf, device_id: String, device_name: String) {
         let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
         let tx = self.event_tx.clone();
+        
+        // Services/State clones for the worker
+        let semantic = Arc::clone(&self.semantic_search);
+        let remote_ai = Arc::clone(&self.remote_ai_nodes);
+        let analyzer = Arc::clone(&self.media_analyzer);
+        
+        let path_for_thread = path.clone();
 
-        std::thread::Builder::new()
-            .name(format!("tg-index-{}", path.display()))
-            .spawn(move || {
-                let start = std::time::Instant::now();
-                let result = {
-                    match db.lock() {
-                        Err(_) => { let _ = tx.send(AppEvent::Status("Index lock failed".into())); return; }
-                        Ok(guard) => {
-                            guard.index_directory(
-                                &device_id,
-                                &device_name,
-                                &path,
-                                |scanned, current| {
-                                    if scanned % 250 == 0 {
-                                        let current_str = current.file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .to_string();
-                                        let _ = tx.send(AppEvent::IndexProgress {
-                                            scanned,
-                                            total: scanned + 1,
-                                            current: current_str,
-                                        });
-                                    }
-                                }
-                            )
+        std::thread::spawn(move || {
+            let mut path = path_for_thread;
+            // Ensure Windows drive letters (e.g., "C:") have a trailing slash for proper walking
+            if path.to_string_lossy().len() == 2 && path.to_string_lossy().ends_with(':') {
+                path = PathBuf::from(format!("{}\\", path.to_string_lossy()));
+            }
+
+            if !path.exists() {
+                let _ = tx.send(AppEvent::Status(format!("Path does not exist: {:?}", path)));
+                return;
+            }
+
+            log::info!("[Runtime] Starting full index task for {:?}", path);
+            let _ = tx.send(AppEvent::Status(format!("Calculating total files for {}...", path.display())));
+
+            // Pass 1: Quick count over the entire tree
+            let total_count = jwalk::WalkDir::new(&path)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .count() as u64;
+
+            log::info!("[Runtime] Total files to index in {:?}: {}", path, total_count);
+            let _ = tx.send(AppEvent::Status(format!("Indexing {} files...", total_count)));
+
+            // Enqueue the root in the persistent queue
+            {
+                match db.lock() {
+                    Ok(guard) => {
+                        if let Err(e) = guard.enqueue_index_root(&path) {
+                            log::error!("Failed to enqueue index root: {}", e);
+                            return;
                         }
                     }
-                };
+                    Err(_) => { log::error!("DB LOCK FAILED"); return; }
+                }
+            }
 
-                match result {
-                    Ok(count) => {
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
-                        let _ = tx.send(AppEvent::IndexComplete {
-                            device_id,
-                            files_added: count,
-                            duration_ms: elapsed_ms,
+            // Immediately start processing the queue in this thread
+            // We pass the total_count as a hint for the progress bar
+            Self::do_process_index_queue(
+                db, 
+                config, 
+                tx, 
+                device_id, 
+                device_name, 
+                total_count,
+                semantic,
+                remote_ai,
+                analyzer
+            );
+        });
+    }
+
+    /// Process the persistent index queue until empty.
+    /// This is a static-like method to avoid lifetime issues when calling from a thread.
+    fn do_process_index_queue(
+        db:           Arc<Mutex<Database>>,
+        config:       Arc<Mutex<Config>>,
+        tx:           mpsc::Sender<AppEvent>,
+        device_id:    String,
+        device_name:  String,
+        total_hint:   u64,
+        semantic:     Arc<Mutex<Option<SemanticSearch>>>,
+        remote_ai:    Arc<Mutex<std::collections::HashMap<String, String>>>,
+        analyzer:     Arc<Mutex<Option<Arc<dyn thegrid_ai::MediaAnalyzer>>>>,
+    ) {
+        let start = std::time::Instant::now();
+        let mut scanned_count = 0u64;
+
+        loop {
+            let task = {
+                let guard = db.lock().unwrap();
+                guard.get_next_index_task().unwrap_or(None)
+            };
+
+            if let Some((root, dir_str)) = task {
+                let dir_path = PathBuf::from(&dir_str);
+                log::info!("[Runtime] Persistent scan: {:?}", dir_path);
+
+                let mut dir_count = 0;
+                match db.lock() {
+                    Ok(mut guard) => {
+                        // Scan dir and get subdirs
+                        let entries = match std::fs::read_dir(&dir_path) {
+                            Ok(e) => e,
+                            Err(_) => {
+                                // Mark as complete even if failed to avoid infinite loop
+                                let _ = guard.complete_index_task(&root, &dir_str);
+                                continue;
+                            }
+                        };
+
+                        let mut subdirs = vec![];
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let path = entry.path();
+                            let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+                            
+                            if meta.is_dir() {
+                                // Skip common temp dirs etc if needed (the core skip logic is in Database usually)
+                                subdirs.push(path);
+                            } else if meta.is_file() {
+                                let size = meta.len();
+                                let modified = meta.modified().ok()
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map(|d| d.as_secs() as i64);
+
+                                let _ = guard.index_file(&device_id, &device_name, &path, size, modified, None);
+                                dir_count += 1;
+                            }
+                        }
+
+                        // Enqueue subdirs
+                        for s in subdirs {
+                            let _ = guard.conn.execute(
+                                "INSERT OR IGNORE INTO index_queue (root_path, dir_path) VALUES (?, ?)",
+                                params![root.as_str(), s.to_string_lossy()]
+                            );
+                        }
+
+                        // Complete task
+                        let _ = guard.complete_index_task(&root, &dir_str);
+                        scanned_count += dir_count;
+
+                        // UI progress update
+                        let _ = tx.send(AppEvent::IndexProgress {
+                            scanned: scanned_count,
+                            total:   total_hint,
+                            current: dir_path.file_name().unwrap_or_default().to_string_lossy().into(),
+                            ext:     None,
                         });
                     }
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::Status(format!("Index error: {}", e)));
-                    }
+                    Err(_) => break,
                 }
-            })
-            .expect("spawning index thread");
+            } else {
+                break;
+            }
+        }
+
+        let _ = tx.send(AppEvent::IndexComplete {
+            device_id,
+            files_added: scanned_count,
+            duration_ms: start.elapsed().as_millis() as u64,
+        });
+
+        // Background worker triggers could go here
     }
+
+    pub fn spawn_idle_work(&self) {
+        log::info!("Idle worker triggered — looking for unfinished tasks");
+        let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
+        let tx = self.event_tx.clone();
+        
+        let semantic = Arc::clone(&self.semantic_search);
+        let remote_ai = Arc::clone(&self.remote_ai_nodes);
+        let analyzer = Arc::clone(&self.media_analyzer);
+
+        let device_id   = { config.lock().unwrap().device_name.clone() };
+        let device_name = device_id.clone();
+        
+        std::thread::spawn(move || {
+            Self::do_process_index_queue(
+                db, 
+                config, 
+                tx, 
+                device_id, 
+                device_name, 
+                0, // Reset scan total is unknown
+                semantic,
+                remote_ai,
+                analyzer
+            );
+        });
+    }
+
 
     pub fn spawn_incremental_index(&self, paths: Vec<PathBuf>) {
         let db = Arc::clone(&self.db);

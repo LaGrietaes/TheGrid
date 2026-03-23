@@ -190,6 +190,10 @@ pub struct TheGridApp {
 
     /// New in Node Enhancement: tracks the provider URL being typed in the UI
     remote_url_edit: String,
+
+    // --- Phase 4: Idle & Persistence ---
+    last_input_at: std::time::Instant,
+    idle_notified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -320,6 +324,8 @@ impl TheGridApp {
             remote_model_edit: String::new(),
             remote_url_edit: String::new(),
             terminal_sessions: HashMap::new(),
+            last_input_at: std::time::Instant::now(),
+            idle_notified: false,
         }
     }
 
@@ -568,8 +574,8 @@ impl TheGridApp {
     // ── Phase 3: Index spawners ───────────────────────────────────────────────
 
     /// Kick off a full directory walk for a newly added watch path.
-    /// Sends IndexProgress events during the walk, then IndexComplete.
-    fn spawn_index_directory(&self, path: PathBuf, device_id: String, device_name: String) {
+    fn spawn_index_directory(&mut self, path: PathBuf, device_id: String, device_name: String) {
+        self.index_stats.reset_scan();
         self.runtime.spawn_index_directory(path, device_id, device_name);
     }
 
@@ -874,7 +880,7 @@ impl TheGridApp {
                     self.transfer_log.push(TransferLogEntry::err(
                         format!("✗ {}: {}", name, error)
                     ));
-                    self.push_toast(Toast::err(format!("Download failed: {}", name)));
+                self.push_toast(Toast::err(format!("Download failed: {}", name)));
                 }
 
                 // ── Remote Terminal ───────────────────────────────────────────
@@ -938,9 +944,11 @@ impl TheGridApp {
                 AppEvent::SyncComplete { device_id, files_added } => {
                     log::info!("Sync complete for {}: {} items", device_id, files_added);
                     self.refresh_index_stats();
+                    self.index_stats.scanning = false;
                 }
                 AppEvent::SyncFailed { device_id, error } => {
                     log::debug!("Sync failed for {}: {}", device_id, error);
+                    self.index_stats.scanning = false;
                 }
 
                 // ── Phase 4: Semantic ─────────────────────────────────────────
@@ -964,12 +972,36 @@ impl TheGridApp {
                 }
 
                 // ── Phase 3: Index ────────────────────────────────────────────
-                AppEvent::IndexProgress { scanned, total, current } => {
+                AppEvent::IndexProgress { scanned, total, current, ext } => {
                     self.index_stats.scanning = true;
                     self.index_stats.scan_progress = scanned;
                     self.index_stats.scan_total    = total;
-                    self.set_status(format!("Indexing… {} files  ({})", scanned, current));
+
+                    if let Some(e) = ext {
+                        let count = self.index_stats.type_counts.entry(e).or_insert(0);
+                        *count += 1;
+                    }
+
+                    // Calculate ETA
+                    if let Some(start_ts) = self.index_stats.scan_start_ts {
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+                        let elapsed = (now - start_ts).max(1) as u64;
+                        if scanned > 0 {
+                            let files_per_sec = scanned as f64 / elapsed as f64;
+                            if files_per_sec > 0.0 {
+                                let remaining = total.saturating_sub(scanned);
+                                self.index_stats.scan_eta_secs = Some((remaining as f64 / files_per_sec) as u64);
+                            }
+                        }
+                    }
+
+                    if total > 0 {
+                        self.set_status(format!("Indexing: {}/{} ({})", scanned, total, current));
+                    } else {
+                        self.set_status(format!("Indexing (Resuming...): {} ({})", scanned, current));
+                    }
                 }
+
                 AppEvent::IndexComplete { device_id: _, files_added, duration_ms } => {
                     self.index_stats.scanning    = false;
                     self.index_stats.total_files += files_added;
@@ -979,6 +1011,7 @@ impl TheGridApp {
                             .unwrap_or_default()
                             .as_secs() as i64
                     );
+                    self.index_stats.scan_eta_secs = None;
                     self.set_status(format!(
                         "Index complete: {} files in {:.1}s",
                         files_added, duration_ms as f64 / 1000.0
@@ -995,6 +1028,14 @@ impl TheGridApp {
 
                     // Phase 2: Trigger background hashing
                     self.spawn_hashing_worker();
+                }
+
+                AppEvent::RequestIdleWork => {
+                    self.runtime.spawn_idle_work();
+                }
+                
+                AppEvent::UserIdle(_) => {
+                    // Could pause indexing here if needed
                 }
                 AppEvent::IndexUpdated { paths_updated } => {
                     if paths_updated > 0 {
@@ -1288,6 +1329,71 @@ impl TheGridApp {
     // UI helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    fn render_footer_progress(&self, ctx: &egui::Context) {
+        if !self.index_stats.scanning && self.embedding_progress.0 == self.embedding_progress.1 && self.hashing_progress.0 == self.hashing_progress.1 {
+            return;
+        }
+
+        egui::TopBottomPanel::bottom("hud_footer_progress")
+            .frame(egui::Frame::none().fill(Colors::BG_PANEL).inner_margin(egui::Margin::symmetric(10.0, 2.0)))
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                
+                let progress = if self.index_stats.scanning {
+                    if self.index_stats.scan_total > 0 {
+                        self.index_stats.scan_progress as f32 / self.index_stats.scan_total as f32
+                    } else {
+                        0.0
+                    }
+                } else if self.embedding_progress.1 > 0 {
+                    self.embedding_progress.0 as f32 / self.embedding_progress.1 as f32
+                } else if self.hashing_progress.1 > 0 {
+                    self.hashing_progress.0 as f32 / self.hashing_progress.1 as f32
+                } else {
+                    0.0
+                };
+
+                // Brutalist Progress Bar
+                let rect = ui.available_rect_before_wrap();
+                let bar_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 4.0));
+                ui.painter().rect_filled(bar_rect, 0.0, Color32::from_black_alpha(100));
+                
+                let fill_rect = egui::Rect::from_min_max(bar_rect.min, egui::pos2(bar_rect.min.x + bar_rect.width() * progress, bar_rect.max.y));
+                ui.painter().rect_filled(fill_rect, 0.0, Colors::GREEN);
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let label = if self.index_stats.scanning {
+                        format!("⬡ SCANNING: {:.1}%", progress * 100.0)
+                    } else if self.embedding_progress.1 > 0 && self.embedding_progress.0 < self.embedding_progress.1 {
+                        format!("⬡ EMBEDDING: {:.1}%", progress * 100.0)
+                    } else {
+                        format!("⬡ HASHING: {:.1}%", progress * 100.0)
+                    };
+
+                    ui.label(RichText::new(label).color(Colors::TEXT).size(10.0).monospace());
+                    
+                    if let Some(eta) = self.index_stats.scan_eta_secs {
+                        ui.label(RichText::new(format!(" ETA: {}s", eta)).color(Colors::GREEN).size(10.0).monospace());
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Quick Type Stats
+                        let mut sorted_types: Vec<_> = self.index_stats.type_counts.iter().collect();
+                        sorted_types.sort_by(|a, b| b.1.cmp(a.1));
+                        
+                        let display = sorted_types.iter().take(4)
+                            .map(|(ext, count)| format!("{}: {}", ext.to_uppercase(), count))
+                            .collect::<Vec<_>>()
+                            .join(" | ");
+                        
+                        ui.label(RichText::new(display).color(Colors::TEXT_DIM).size(9.0).monospace());
+                    });
+                });
+                ui.add_space(4.0);
+            });
+    }
+
     fn push_toast(&mut self, t: Toast) { self.toasts.push(t); }
     fn set_status(&mut self, msg: impl Into<String>) { self.status_msg = msg.into(); }
     fn selected_ip(&self) -> Option<String> {
@@ -1561,10 +1667,11 @@ impl TheGridApp {
         if actions.scan_remote {
             let is_local = device_id == self.config.device_name;
             if is_local {
-                if let Some(telem) = self.telemetry_cache.get(device_id) {
-                    for drive in &telem.capabilities.drives {
-                         self.spawn_index_directory(std::path::PathBuf::from(&drive.name), device_id.to_string(), device_id.to_string());
-                    }
+                let drives = self.telemetry_cache.get(device_id)
+                    .map(|t| t.capabilities.drives.clone())
+                    .unwrap_or_default();
+                for drive in drives {
+                    self.spawn_index_directory(std::path::PathBuf::from(&drive.name), device_id.to_string(), device_id.to_string());
                 }
             } else {
                 self.push_toast(Toast::info("Remote scan request sent (stub)"));
@@ -1926,6 +2033,7 @@ impl eframe::App for TheGridApp {
             Screen::Dashboard => {
                 self.render_titlebar(ctx);
                 self.render_statusbar(ctx);
+                self.render_footer_progress(ctx);
 
                 // ── Left: device panel ────────────────────────────────────────
                 let mut device_clicked: Option<usize> = None;
@@ -2156,8 +2264,20 @@ impl eframe::App for TheGridApp {
                     }
                     self.push_toast(Toast::info(format!("Navigated to: {}", result.name)));
                 }
-                if let Some(result) = search_action.preview_result {
-                    let _ = self.event_tx.send(AppEvent::RequestFilePreview(result));
+                // Idle Detection
+                let now = std::time::Instant::now();
+                if ctx.input(|i| i.pointer.any_click() || i.pointer.any_down() || !i.events.is_empty()) {
+                    self.last_input_at = now;
+                    if self.idle_notified {
+                        self.idle_notified = false;
+                        log::info!("User returned from idle, pausing background tasks");
+                    }
+                }
+
+                if !self.idle_notified && now.duration_since(self.last_input_at).as_secs() > 600 {
+                    self.idle_notified = true;
+                    log::info!("System idled for 10m, requesting background tasks resume");
+                    let _ = self.event_tx.send(AppEvent::RequestIdleWork);
                 }
 
                 self.render_viewport_panel(ctx);

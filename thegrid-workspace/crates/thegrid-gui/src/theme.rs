@@ -236,6 +236,9 @@ pub enum IconType {
     Disk,
     Gpu,
     Ai,
+    Globe,
+    Power,
+    Database,
     Camera,
     Microphone,
     Speakers,
@@ -400,6 +403,20 @@ pub fn draw_vector_icon(ui: &mut Ui, rect: egui::Rect, icon: IconType, color: Co
             ui.painter().line_segment([c + egui::vec2(-s, s*0.5), c + egui::vec2(-s*1.1, s*0.7)], stroke);
             ui.painter().line_segment([c + egui::vec2(s, s*0.5), c + egui::vec2(s*1.1, s*0.7)], stroke);
             ui.painter().line_segment([c + egui::vec2(-s*1.1, s*0.7), c + egui::vec2(s*1.1, s*0.7)], stroke);
+        }
+        IconType::Globe => {
+            ui.painter().circle_stroke(c, s * 0.8, stroke);
+            ui.painter().line_segment([c - egui::vec2(s*0.8, 0.0), c + egui::vec2(s*0.8, 0.0)], stroke);
+            ui.painter().line_segment([c - egui::vec2(0.0, s*0.8), c + egui::vec2(0.0, s*0.8)], stroke);
+        }
+        IconType::Power => {
+            ui.painter().circle_stroke(c, s * 0.6, stroke);
+            ui.painter().line_segment([c - egui::vec2(0.0, s*0.3), c - egui::vec2(0.0, s*0.9)], stroke);
+        }
+        IconType::Database => {
+             ui.painter().rect_stroke(egui::Rect::from_center_size(c, egui::vec2(s*1.2, s*1.6)), egui::Rounding::ZERO, stroke);
+             ui.painter().line_segment([c - egui::vec2(s*0.6, s*0.2), c + egui::vec2(s*0.6, -s*0.2)], stroke);
+             ui.painter().line_segment([c - egui::vec2(s*0.6, -s*0.2), c + egui::vec2(s*0.6, s*0.2)], stroke);
         }
 
         IconType::FileUnknown => {

@@ -17,6 +17,8 @@ log        = { workspace = true }
 chrono     = { workspace = true }
 tokio      = { workspace = true }
 reqwest    = { workspace = true }
+jwalk      = { workspace = true }
 hostname   = "0.3"
 dirs       = "5"
 uuid       = { version = "1.7", features = ["v4"] }
+rusqlite   = "0.31"

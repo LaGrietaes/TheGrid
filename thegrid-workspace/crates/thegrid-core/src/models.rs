@@ -208,6 +208,20 @@ pub struct IndexStats {
     pub scanning: bool,
     pub scan_progress: u64,
     pub scan_total: u64,
+    pub scan_start_ts: Option<i64>,
+    pub scan_eta_secs: Option<u64>,
+    pub type_counts: std::collections::HashMap<String, u64>,
+}
+
+impl IndexStats {
+    pub fn reset_scan(&mut self) {
+        self.scanning = true;
+        self.scan_progress = 0;
+        self.scan_total = 0;
+        self.scan_start_ts = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64);
+        self.scan_eta_secs = None;
+        self.type_counts.clear();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
