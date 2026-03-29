@@ -271,8 +271,10 @@ fn main() -> Result<()> {
         || std::env::var("THEGRID_FORCE_TUI").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
     let expect_tui = !pre_plain && (pre_force || (io::stdin().is_terminal() && io::stdout().is_terminal()));
 
-    // In TUI mode suppress INFO/DEBUG to keep the terminal clean; errors still surface briefly.
-    let log_default = if expect_tui { "error" } else { "info" };
+    // In TUI mode silence ALL log output — env_logger writes to stderr which cannot be
+    // cleared by the TUI's ANSI escape and would corrupt the layout. All meaningful events
+    // are captured through emit() into the rolling log panel instead.
+    let log_default = if expect_tui { "off" } else { "info" };
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(log_default)
     ).init();
@@ -655,7 +657,9 @@ fn main() -> Result<()> {
                     emit(&ui_state, tui_mode, "✓", "INDEX", format!("Complete: {} files in {} ms", files_added, duration_ms));
                 }
                 AppEvent::Status(msg) => {
-                    if msg.starts_with("config_update:") {
+                    if msg.starts_with("db_error:") {
+                        emit(&ui_state, tui_mode, "⚠", "DB", &msg["db_error:".len()..]);
+                    } else if msg.starts_with("config_update:") {
                         let parts = &msg["config_update:".len()..];
                         let mut model = None;
                         let mut url = None;

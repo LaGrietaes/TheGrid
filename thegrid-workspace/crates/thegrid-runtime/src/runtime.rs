@@ -41,7 +41,9 @@ impl AppRuntime {
         let db = match Database::open(&db_path) {
             Ok(d) => Arc::new(Mutex::new(d)),
             Err(e) => {
-                log::error!("Failed to open database: {} — using in-memory fallback", e);
+                let msg = format!("DB open failed ({}), using in-memory fallback", e);
+                log::error!("{}", msg);
+                let _ = event_tx.send(AppEvent::Status(format!("db_error:{}", msg)));
                 Arc::new(Mutex::new(Database::open(":memory:")?))
             }
         };
