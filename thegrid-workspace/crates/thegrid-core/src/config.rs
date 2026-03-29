@@ -49,6 +49,18 @@ pub struct Config {
     #[serde(default = "Config::default_true")]
     pub enable_file_access: bool,
 
+    /// Enable remote terminal endpoints over the mesh
+    #[serde(default = "Config::default_true")]
+    pub enable_terminal_access: bool,
+
+    /// Enable remote AI inference endpoints over the mesh
+    #[serde(default = "Config::default_true")]
+    pub enable_ai_access: bool,
+
+    /// Enable remote control operations (config mutation, adb, privileged controls)
+    #[serde(default = "Config::default_true")]
+    pub enable_remote_control: bool,
+
     /// Phase 3: User-defined Custom Smart Rules for filtering files
     #[serde(default)]
     pub smart_rules: Vec<crate::models::SmartRule>,
@@ -76,6 +88,9 @@ impl Default for Config {
             ai_provider_url: None,
             enable_rdp: true,
             enable_file_access: true,
+            enable_terminal_access: true,
+            enable_ai_access: true,
+            enable_remote_control: true,
             smart_rules: Vec::new(),
             projects: vec![
                 crate::models::Project { id: "p1".into(), name: "THE GRID".into(), description: "Core System".into(), tags: vec!["#core".into(), "#system".into()] },

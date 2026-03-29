@@ -84,6 +84,32 @@ impl AgentServer {
         );
     }
 
+    fn capability_enabled(&self, capability: &str) -> bool {
+        let cfg = self.config.lock().unwrap();
+        match capability {
+            "file_access" => cfg.enable_file_access,
+            "terminal_access" => cfg.enable_terminal_access,
+            "ai_access" => cfg.enable_ai_access,
+            "remote_control" => cfg.enable_remote_control,
+            _ => true,
+        }
+    }
+
+    fn respond_capability_forbidden(req: Request, capability: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "error": "forbidden",
+            "reason": "capability_disabled",
+            "capability": capability,
+        })
+        .to_string();
+        req.respond(
+            Response::from_string(body)
+                .with_status_code(403)
+                .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()),
+        )?;
+        Ok(())
+    }
+
     fn run(&self) -> Result<()> {
         std::fs::create_dir_all(&self.transfers_dir)?;
         let addr = format!("0.0.0.0:{}", self.port);
@@ -247,6 +273,10 @@ impl AgentServer {
         }
 
         if method == "POST" && url == "/v1/config" {
+            if !self.capability_enabled("remote_control") {
+                Self::respond_capability_forbidden(req, "remote_control")?;
+                return Ok(());
+            }
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body)?;
 
@@ -308,6 +338,10 @@ impl AgentServer {
         }
 
         if method == "POST" && url == "/adb/enable" {
+            if !self.capability_enabled("remote_control") {
+                Self::respond_capability_forbidden(req, "remote_control")?;
+                return Ok(());
+            }
             #[cfg(target_os = "linux")]
             {
                 log::info!("Agent: attempting to enable ADB over TCP/IP 5555 (Termux)");                match std::process::Command::new("adb")
@@ -352,6 +386,10 @@ impl AgentServer {
         }
 
         if method == "GET" && url.starts_with("/v1/sync") {
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
+                return Ok(());
+            }
             let after: i64 = url.split("after=")
                 .nth(1)
                 .and_then(|t| t.parse().ok())
@@ -369,6 +407,10 @@ impl AgentServer {
         }
 
         if method == "GET" && url == "/filelist" {
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
+                return Ok(());
+            }
             let files = self.list_transfer_files();
             let json = serde_json::to_string(&files)?;
             req.respond(Response::from_string(json)
@@ -378,6 +420,10 @@ impl AgentServer {
         }
 
         if method == "GET" && url.starts_with("/files/") {
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
+                return Ok(());
+            }
             let filename = url.trim_start_matches("/files/");
             let filename = urlencoding_decode(filename);
             let path = self.transfers_dir.join(&filename);
@@ -392,6 +438,10 @@ impl AgentServer {
         }
 
         if method == "POST" && url == "/clipboard" {
+            if !self.capability_enabled("remote_control") {
+                Self::respond_capability_forbidden(req, "remote_control")?;
+                return Ok(());
+            }
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body)?;
 
@@ -414,6 +464,10 @@ impl AgentServer {
         }
 
         if method == "POST" && url == "/upload" {
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
+                return Ok(());
+            }
             let filename = req.headers().iter()
                 .find(|h| h.field.as_str().eq_ignore_ascii_case(AsciiStr::from_ascii("X-Filename").unwrap()))
                 .map(|h| h.value.as_str().to_string())
@@ -436,12 +490,8 @@ impl AgentServer {
 
         // ── NEW: Remote File Browsing ──
         if method == "GET" && url.starts_with("/v1/browse") {
-            let enabled = {
-                let cfg = self.config.lock().unwrap();
-                cfg.enable_file_access
-            };
-            if !enabled {
-                req.respond(Response::from_string(r#"{"error":"file access disabled"}"#).with_status_code(403))?;
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
                 return Ok(());
             }
             let path_str = url.split("path=").nth(1).unwrap_or("");
@@ -463,12 +513,8 @@ impl AgentServer {
         }
 
         if method == "GET" && url.starts_with("/v1/read") {
-            let enabled = {
-                let cfg = self.config.lock().unwrap();
-                cfg.enable_file_access
-            };
-            if !enabled {
-                req.respond(Response::from_string(r#"{"error":"file access disabled"}"#).with_status_code(403))?;
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
                 return Ok(());
             }
             let path_str = url.split("path=").nth(1).unwrap_or("");
@@ -485,12 +531,8 @@ impl AgentServer {
         }
 
         if method == "GET" && url.starts_with("/v1/preview") {
-            let enabled = {
-                let cfg = self.config.lock().unwrap();
-                cfg.enable_file_access
-            };
-            if !enabled {
-                req.respond(Response::from_string(r#"{"error":"file access disabled"}"#).with_status_code(403))?;
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
                 return Ok(());
             }
             let path_str = url.split("path=").nth(1).unwrap_or("");
@@ -517,12 +559,8 @@ impl AgentServer {
         }
 
         if method == "DELETE" && url.starts_with("/v1/files") {
-            let enabled = {
-                let cfg = self.config.lock().unwrap();
-                cfg.enable_file_access
-            };
-            if !enabled {
-                req.respond(Response::from_string(r#"{"error":"forbidden"}"#).with_status_code(403))?;
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
                 return Ok(());
             }
             let path_str = url.split("path=").nth(1).unwrap_or("");
@@ -546,6 +584,10 @@ impl AgentServer {
         }
 
         if method == "POST" && url == "/v1/files/rename" {
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
+                return Ok(());
+            }
             #[derive(serde::Deserialize)]
             struct RenameReq { path: String, new_name: String }
             let mut body = String::new();
@@ -570,6 +612,10 @@ impl AgentServer {
         }
 
         if method == "POST" && url == "/v1/files/move" {
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
+                return Ok(());
+            }
             #[derive(serde::Deserialize)]
             struct MoveReq { paths: Vec<String>, dest_dir: String }
             let mut body = String::new();
@@ -599,6 +645,10 @@ impl AgentServer {
 
         // ── Terminal Endpoints ──
         if method == "POST" && url == "/v1/terminal/session" {
+            if !self.capability_enabled("terminal_access") {
+                Self::respond_capability_forbidden(req, "terminal_access")?;
+                return Ok(());
+            }
             let (writer, mut reader): (Box<dyn Write + Send>, Box<dyn Read + Send>) = {
                 #[cfg(windows)]
                 {
@@ -684,6 +734,10 @@ impl AgentServer {
         }
 
         if method == "POST" && url.starts_with("/v1/terminal/input") {
+            if !self.capability_enabled("terminal_access") {
+                Self::respond_capability_forbidden(req, "terminal_access")?;
+                return Ok(());
+            }
             let id = url.split("id=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
             let mut body = Vec::new();
             req.as_reader().read_to_end(&mut body)?;
@@ -700,6 +754,10 @@ impl AgentServer {
         }
 
         if method == "GET" && url.starts_with("/v1/terminal/output") {
+            if !self.capability_enabled("terminal_access") {
+                Self::respond_capability_forbidden(req, "terminal_access")?;
+                return Ok(());
+            }
             let id = url.split("id=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
             let sessions = self.terminal_sessions.lock().unwrap();
             if let Some(session) = sessions.get(id) {
@@ -714,6 +772,10 @@ impl AgentServer {
 
         // ── NEW: Remote AI Inference ──
         if method == "POST" && url == "/v1/ai/embed" {
+            if !self.capability_enabled("ai_access") {
+                Self::respond_capability_forbidden(req, "ai_access")?;
+                return Ok(());
+            }
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body)?;
             
@@ -739,6 +801,10 @@ impl AgentServer {
         }
 
         if method == "POST" && url == "/v1/ai/search" {
+            if !self.capability_enabled("ai_access") {
+                Self::respond_capability_forbidden(req, "ai_access")?;
+                return Ok(());
+            }
             let mut body = String::new();
             req.as_reader().read_to_string(&mut body)?;
             
@@ -766,6 +832,10 @@ impl AgentServer {
 
         // ── Remote RDP Enablement ──
         if method == "POST" && url == "/v1/rdp/enable" {
+            if !self.capability_enabled("remote_control") {
+                Self::respond_capability_forbidden(req, "remote_control")?;
+                return Ok(());
+            }
             #[cfg(windows)]
             {
                 log::info!("Agent: attempting to enable Windows Remote Desktop (RDP)");
