@@ -154,6 +154,7 @@ pub struct TheGridApp {
     // ── Phase 3: Project & Category State (Now in config) ─────────────────────
 
     mesh_sync_last_at: std::time::Instant,
+    sync_last_poll: HashMap<String, std::time::Instant>,
 
     // --- Phase 4: Semantic AI UI State ---
     semantic_enabled:   bool,
@@ -250,6 +251,26 @@ pub struct ViewportState {
 }
 
 impl TheGridApp {
+    fn command_exists(cmd: &str) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("where")
+                .arg(cmd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::process::Command::new("which")
+                .arg(cmd)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+    }
+
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = mpsc::channel::<AppEvent>();
         let config   = Config::load().unwrap_or_default();
@@ -309,6 +330,7 @@ impl TheGridApp {
             toasts: Vec::new(),
             status_msg: "READY".into(),
             mesh_sync_last_at: std::time::Instant::now(),
+            sync_last_poll: HashMap::new(),
             
 
             
@@ -591,14 +613,33 @@ impl TheGridApp {
         self.runtime.spawn_sync_node(device_id, ip, hostname);
     }
 
-    /// Pull index deltas from ALL reachable Tailscale nodes. (Phase 3)
-    fn sync_all_nodes(&self) {
-        log::debug!("Initiating mesh index synchronization...");
-        for device in &self.devices {
-            if device.name == self.config.device_name { continue; }
-            if let Some(ip) = device.primary_ip() {
-                self.spawn_sync_node(device.id.clone(), ip.to_string(), device.hostname.clone());
+    fn spawn_sync_node_if_due(&mut self, device_id: String, ip: String, hostname: String, min_interval_secs: u64) {
+        let now = std::time::Instant::now();
+        if min_interval_secs > 0 {
+            if let Some(last) = self.sync_last_poll.get(&device_id) {
+                if last.elapsed().as_secs() < min_interval_secs {
+                    return;
+                }
             }
+        }
+        self.sync_last_poll.insert(device_id.clone(), now);
+        self.spawn_sync_node(device_id, ip, hostname);
+    }
+
+    /// Pull index deltas from ALL reachable Tailscale nodes. (Phase 3)
+    fn sync_all_nodes(&mut self) {
+        log::debug!("Initiating mesh index synchronization...");
+        let local_name = self.config.device_name.clone();
+        let devices_snapshot = self.devices.clone();
+        let mut targets = Vec::new();
+        for device in &devices_snapshot {
+            if device.name == local_name { continue; }
+            if let Some(ip) = device.primary_ip() {
+                targets.push((device.id.clone(), ip.to_string(), device.hostname.clone()));
+            }
+        }
+        for (device_id, ip, hostname) in targets {
+            self.spawn_sync_node_if_due(device_id, ip, hostname, 45);
         }
     }
 
@@ -809,7 +850,7 @@ impl TheGridApp {
                             .map(|d| d.id.clone())
                             .unwrap_or_else(|| response.device.clone());
                             
-                        self.runtime.spawn_get_telemetry(ip, device_id);
+                        self.spawn_get_telemetry(ip, device_id);
                     } else {
                         if manual {
                             self.push_toast(Toast::info(format!("⬡ Agent online: {} (v{}) - Limited Access (Key Mismatch)", response.device, response.version)));
@@ -1069,6 +1110,8 @@ impl TheGridApp {
 
                 // ── Phase 3: Telemetry ────────────────────────────────────────
                 AppEvent::TelemetryUpdate { device_id, ip, telemetry } => {
+                    let remote_device_id = device_id.clone();
+                    let telemetry_ip = ip.clone();
                     // Mark local telemetry as no longer pending
                     if device_id == self.config.device_name {
                         self.local_telemetry_pending = false;
@@ -1084,7 +1127,22 @@ impl TheGridApp {
                         }
                     }
 
-                    self.telemetry_cache.insert(device_id, telemetry);
+                    self.telemetry_cache.insert(device_id.clone(), telemetry);
+
+                    // Keep remote indexes synced as telemetry confirms a responsive node.
+                    if let Some(remote_device) = self.devices.iter().find(|d| d.id == remote_device_id) {
+                        if remote_device.name != self.config.device_name {
+                            let best_ip = telemetry_ip
+                                .or_else(|| remote_device.primary_ip().map(|s| s.to_string()))
+                                .unwrap_or_else(|| self.find_best_ip(&remote_device_id));
+                            self.spawn_sync_node_if_due(
+                                remote_device_id,
+                                best_ip,
+                                remote_device.hostname.clone(),
+                                30,
+                            );
+                        }
+                    }
                 }
 
                 // ── Phase 3: WoL ──────────────────────────────────────────────
@@ -1183,6 +1241,17 @@ impl TheGridApp {
                     }
                 }
                 AppEvent::EnableAdb { ip, api_key } => {
+                    if !Self::command_exists("adb") {
+                        self.push_toast(Toast::err("ADB not found. Install Android Platform Tools and add adb to PATH."));
+                        self.set_status("ADB missing on this machine");
+                        continue;
+                    }
+                    if !Self::command_exists("scrcpy") {
+                        self.push_toast(Toast::err("scrcpy not found. Install scrcpy and add it to PATH."));
+                        self.set_status("scrcpy missing on this machine");
+                        continue;
+                    }
+
                     let tx = self.event_tx.clone();
                     let port = self.config.agent_port;
                     std::thread::spawn(move || {
@@ -1205,46 +1274,48 @@ impl TheGridApp {
                                     let _ = std::process::Command::new("adb").arg("disconnect").output();
                                     std::thread::sleep(std::time::Duration::from_millis(1000));
                                     
-                                    // Connect
                                     let addr = format!("{}:5555", ip);
-                                    let output = std::process::Command::new("adb")
-                                        .arg("connect")
-                                        .arg(&addr)
-                                        .output();
-                                    
-                                    match output {
-                                        Ok(out) => {
-                                            let stdout = String::from_utf8_lossy(&out.stdout);
-                                            let stderr = String::from_utf8_lossy(&out.stderr);
-                                            let combined = format!("{}{}", stdout, stderr);
 
-                                            if combined.contains("connected to") {
-                                                log::info!("ADB connected: {}", stdout.trim());
-                                                let _ = tx.send(AppEvent::Status(format!("Connected to {}", ip)));
-                                                
-                                                std::thread::sleep(std::time::Duration::from_millis(1000));
-                                                
-                                                log::info!("Launching scrcpy...");
-                                                let _ = std::process::Command::new("scrcpy")
-                                                    .arg(format!("--tcpip={}", ip))
-                                                    .spawn();
-                                            } else {
-                                                log::error!("ADB connect failed: {}", combined.trim());
-                                                let _ = tx.send(AppEvent::Status(format!("Conn Fail: {}", combined.trim())));
-                                                
-                                                // If we fail to connect, maybe scrcpy can auto-handle it if we just pass the IP?
-                                                // Actually, scrcpy --tcpip=... will try to connect itself.
-                                                // Let's try that as a fallback.
-                                                log::info!("Attempting scrcpy auto-connect...");
-                                                let _ = std::process::Command::new("scrcpy")
-                                                    .arg(format!("--tcpip={}", ip))
-                                                    .spawn();
+                                    // Connect with retries. adb can report either
+                                    // "connected to" or "already connected to".
+                                    let mut connected = false;
+                                    let mut last_error = String::new();
+                                    for _attempt in 0..3 {
+                                        let output = std::process::Command::new("adb")
+                                            .arg("connect")
+                                            .arg(&addr)
+                                            .output();
+
+                                        match output {
+                                            Ok(out) => {
+                                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                                let combined = format!("{}{}", stdout, stderr).to_lowercase();
+                                                if combined.contains("connected to") || combined.contains("already connected to") {
+                                                    connected = true;
+                                                    break;
+                                                }
+                                                last_error = combined.trim().to_string();
+                                            }
+                                            Err(e) => {
+                                                last_error = format!("Could not execute adb: {}", e);
                                             }
                                         }
-                                        Err(e) => {
-                                            let _ = tx.send(AppEvent::Status(format!("Could not execute adb: {}", e)));
-                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(700));
                                     }
+
+                                    if connected {
+                                        let _ = tx.send(AppEvent::Status(format!("Connected to {}", ip)));
+                                    } else {
+                                        log::warn!("ADB connect fallback for {}: {}", ip, last_error);
+                                        let _ = tx.send(AppEvent::Status(format!("ADB connect retry fallback for {}", ip)));
+                                    }
+
+                                    // scrcpy --tcpip can establish/repair the session itself.
+                                    log::info!("Launching scrcpy...");
+                                    let _ = std::process::Command::new("scrcpy")
+                                        .arg(format!("--tcpip={}", ip))
+                                        .spawn();
                                 } else {
                                     let _ = tx.send(AppEvent::Status(format!("Enable failed: {}", resp.status())));
                                 }
@@ -1831,6 +1902,17 @@ impl TheGridApp {
 
 
     fn spawn_launch_scrcpy(&mut self, ip: String) {
+        if !Self::command_exists("adb") {
+            self.push_toast(Toast::err("ADB not found. Install Android Platform Tools and add adb to PATH."));
+            self.set_status("ADB missing on this machine");
+            return;
+        }
+        if !Self::command_exists("scrcpy") {
+            self.push_toast(Toast::err("scrcpy not found. Install scrcpy and add it to PATH."));
+            self.set_status("scrcpy missing on this machine");
+            return;
+        }
+
         log::info!("Checking for USB-connected devices for high-performance mirroring (BPW)...");
         
         // 1. Try to find a USB device first
@@ -1957,7 +2039,8 @@ impl eframe::App for TheGridApp {
         }
 
         // 5. Periodic telemetry and ping refresh (every 30s)
-        let mut ping_targets = Vec::new(); // (ip, name)
+        let mut ping_targets = Vec::new(); // (ip, device_id)
+        let mut sync_targets = Vec::new(); // (device_id, ip, hostname)
         let mut local_telemetry_needed = false;
 
         for d in &self.devices {
@@ -1987,6 +2070,17 @@ impl eframe::App for TheGridApp {
                         ping_targets.push((ip.to_string(), d.id.clone()));
                     }
                 }
+
+                if !is_local {
+                    let sync_interval = if is_selected { 20 } else if self.get_node_status(&d.id) == NodeStatus::GridActive { 75 } else { 180 };
+                    let sync_due = self.sync_last_poll
+                        .get(&d.id)
+                        .map(|t| t.elapsed().as_secs() > sync_interval)
+                        .unwrap_or(true);
+                    if sync_due {
+                        sync_targets.push((d.id.clone(), ip.to_string(), d.hostname.clone()));
+                    }
+                }
             }
         }
 
@@ -1995,6 +2089,9 @@ impl eframe::App for TheGridApp {
         }
         for (ip, id) in ping_targets {
             self.spawn_ping(ip, id, false);
+        }
+        for (device_id, ip, hostname) in sync_targets {
+            self.spawn_sync_node_if_due(device_id, ip, hostname, 0);
         }
 
         // 6. Screen dispatch
@@ -2285,7 +2382,7 @@ impl eframe::App for TheGridApp {
                 self.render_toasts(ctx);
 
                 // --- Phase 3: Periodic Sync ---
-                if self.mesh_sync_last_at.elapsed().as_secs() > 300 {
+                if self.mesh_sync_last_at.elapsed().as_secs() > 120 {
                     self.mesh_sync_last_at = std::time::Instant::now();
                     self.sync_all_nodes();
                 }

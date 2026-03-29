@@ -459,24 +459,36 @@ impl AppRuntime {
                 Err(_)    => 0,
             };
 
-            if let Ok(client) = AgentClient::new(&ip, port, api_key) {
-                if let Ok(results) = client.sync_index(last_ts) {
-                    let mut count = 0;
-                    let mut max_ts = last_ts;
-                    if let Ok(guard) = db.lock() {
-                        for r in results {
-                            let mod_ts = r.modified.unwrap_or(0);
-                            if mod_ts > max_ts { max_ts = mod_ts; }
-                            if guard.upsert_remote_file(r).is_ok() {
-                                count += 1;
-                            }
-                        }
-                        let _ = guard.update_node_sync_ts(&device_id, &hostname, max_ts);
-                    }
-                    if count > 0 {
-                        let _ = event_tx.send(AppEvent::SyncComplete { device_id, files_added: count });
+            let client = match AgentClient::new(&ip, port, api_key) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::SyncFailed { device_id, error: e.to_string() });
+                    return;
+                }
+            };
+
+            let results = match client.sync_index(last_ts) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::SyncFailed { device_id, error: e.to_string() });
+                    return;
+                }
+            };
+
+            let mut count = 0;
+            let mut max_ts = last_ts;
+            if let Ok(guard) = db.lock() {
+                for r in results {
+                    let mod_ts = r.modified.unwrap_or(0);
+                    if mod_ts > max_ts { max_ts = mod_ts; }
+                    if guard.upsert_remote_file(r).is_ok() {
+                        count += 1;
                     }
                 }
+                let _ = guard.update_node_sync_ts(&device_id, &hostname, max_ts);
+            }
+            if count > 0 {
+                let _ = event_tx.send(AppEvent::SyncComplete { device_id, files_added: count });
             }
         });
     }

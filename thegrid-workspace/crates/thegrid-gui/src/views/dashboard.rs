@@ -372,8 +372,14 @@ pub fn render_device_panel(
 // cannot hand out &mut to its inner &'a mut String fields.
 // All three tab functions now take `s: &mut DetailState`.
 fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    let is_android = s.device.os.to_lowercase().contains("android");
+
     ui.columns(3, |cols| {
-        if action_card(&mut cols[0], theme::IconType::RDP, "REMOTE DESKTOP", "Launch RDP session") {
+        if is_android {
+            if action_card(&mut cols[0], theme::IconType::Tablet, "SCREEN MIRROR", "Launch scrcpy") {
+                actions.launch_scrcpy = true;
+            }
+        } else if action_card(&mut cols[0], theme::IconType::RDP, "REMOTE DESKTOP", "Launch RDP session") {
             actions.launch_rdp = true;
         }
         if action_card(&mut cols[1], theme::IconType::Folder, "BROWSE FILES", "Open network share") {
@@ -454,53 +460,45 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
             });
     }
 
-    if s.is_tg_agent && s.device.os.to_lowercase().contains("android") {
+    if !is_android {
+        ui.add_space(20.0);
+        ui.add(egui::Separator::default().spacing(0.0));
+        ui.add_space(16.0);
+
+        // ── RDP Options ───────────────────────────────────────────────────────
+        theme::section_title(ui, "// RDP OPTIONS");
         ui.add_space(8.0);
-        ui.columns(3, |cols| {
-            if action_card(&mut cols[0], theme::IconType::Tablet, "SCREEN MIRROR", "Launch Scrcpy (ADB over IP)") {
-                actions.launch_scrcpy = true;
-            }
-            // Future slots
+
+        ui.columns(2, |cols| {
+            cols[0].label(
+                RichText::new("USERNAME").color(Colors::TEXT_DIM).size(8.0).strong()
+            );
+            cols[0].add_space(4.0);
+            cols[0].add(
+                egui::TextEdit::singleline(s.rdp_username)
+                    .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                    .hint_text("Administrator")
+                    .desired_width(f32::INFINITY)
+            );
+
+            cols[1].label(
+                RichText::new("RESOLUTION").color(Colors::TEXT_DIM).size(8.0).strong()
+            );
+            cols[1].add_space(4.0);
+            // FIX: from_id_source replaces deprecated from_id_source (egui 0.27)
+            egui::ComboBox::from_id_source("rdp_resolution_combo")
+                .width(cols[1].available_width())
+                .selected_text(
+                    RichText::new(s.rdp_resolution.as_str())
+                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                )
+                .show_ui(&mut cols[1], |ui| {
+                    for opt in ["FULLSCREEN", "1920×1080", "2560×1440", "1280×800"] {
+                        ui.selectable_value(s.rdp_resolution, opt.to_string(), opt);
+                    }
+                });
         });
     }
-
-    ui.add_space(20.0);
-    ui.add(egui::Separator::default().spacing(0.0));
-    ui.add_space(16.0);
-
-    // ── RDP Options ───────────────────────────────────────────────────────────
-    theme::section_title(ui, "// RDP OPTIONS");
-    ui.add_space(8.0);
-
-    ui.columns(2, |cols| {
-        cols[0].label(
-            RichText::new("USERNAME").color(Colors::TEXT_DIM).size(8.0).strong()
-        );
-        cols[0].add_space(4.0);
-        cols[0].add(
-            egui::TextEdit::singleline(s.rdp_username)
-                .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
-                .hint_text("Administrator")
-                .desired_width(f32::INFINITY)
-        );
-
-        cols[1].label(
-            RichText::new("RESOLUTION").color(Colors::TEXT_DIM).size(8.0).strong()
-        );
-        cols[1].add_space(4.0);
-        // FIX: from_id_source replaces deprecated from_id_source (egui 0.27)
-        egui::ComboBox::from_id_source("rdp_resolution_combo")
-            .width(cols[1].available_width())
-            .selected_text(
-                RichText::new(s.rdp_resolution.as_str())
-                    .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
-            )
-            .show_ui(&mut cols[1], |ui| {
-                for opt in ["FULLSCREEN", "1920×1080", "2560×1440", "1280×800"] {
-                    ui.selectable_value(s.rdp_resolution, opt.to_string(), opt);
-                }
-            });
-    });
 
     ui.add_space(20.0);
     ui.add(egui::Separator::default().spacing(0.0));
@@ -1269,7 +1267,7 @@ pub fn render_detail_panel_with_timeline(
             if let Some(telem) = s.telemetry {
                 ui.add_space(8.0);
                 ui.horizontal_wrapped(|ui| {
-                    if telem.capabilities.has_rdp {
+                    if telem.capabilities.has_rdp && !s.device.os.to_lowercase().contains("android") {
                         theme::status_badge(ui, "RDP", Some(theme::IconType::RDP), true);
                         ui.add_space(4.0);
                     }
