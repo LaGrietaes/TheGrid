@@ -171,7 +171,7 @@ fn try_rebuild_node() -> Result<String> {
     Ok("Build completed for thegrid-node".to_string())
 }
 
-fn restart_current_node_process() -> Result<()> {
+fn restart_current_node_process() -> Result<String> {
     let exe = std::env::current_exe()?;
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -180,14 +180,45 @@ fn restart_current_node_process() -> Result<()> {
         args.push("--skip-update-check".to_string());
     }
 
-    Command::new(exe)
+    let direct = Command::new(&exe)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .spawn()?;
+        .spawn();
 
-    Ok(())
+    match direct {
+        Ok(_) => {
+            return Ok(format!("Launched updated binary: {}", exe.display()));
+        }
+        Err(direct_err) => {
+            // Fallback: if direct binary path is unavailable (common in some cargo-run layouts),
+            // relaunch through cargo from current workspace.
+            let fallback = Command::new("cargo")
+                .arg("run")
+                .arg("-p")
+                .arg("thegrid-node")
+                .arg("--")
+                .arg("--skip-update-check")
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn();
+
+            match fallback {
+                Ok(_) => {
+                    return Ok("Direct restart path missing; launched via cargo run fallback".to_string());
+                }
+                Err(fallback_err) => {
+                    anyhow::bail!(
+                        "Direct restart failed ({}) and cargo fallback failed ({})",
+                        direct_err,
+                        fallback_err
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn ts() -> String {
@@ -799,8 +830,9 @@ fn main() -> Result<()> {
                                     emit(&ui_state, tui_mode, "✓", "BUILD", build_msg);
                                     emit(&ui_state, tui_mode, "↻", "RESTART", "Launching updated node process...");
                                     match restart_current_node_process() {
-                                        Ok(_) => {
-                                            emit(&ui_state, tui_mode, "✓", "RESTART", "Updated node launched. Closing old process...");
+                                        Ok(msg) => {
+                                            emit(&ui_state, tui_mode, "✓", "RESTART", msg);
+                                            emit(&ui_state, tui_mode, "✓", "RESTART", "Closing old process...");
                                             running.store(false, Ordering::Relaxed);
                                         }
                                         Err(e) => {
