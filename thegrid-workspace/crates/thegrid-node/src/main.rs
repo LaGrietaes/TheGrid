@@ -15,6 +15,7 @@ use thegrid_core::{AppEvent, Config};
 use thegrid_runtime::AppRuntime;
 
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
+const SIGNATURE_LINE: &str = "> Powered and Designed by: sinergias.lagrieta.es";
 
 const ANSI_RESET: &str = "\x1B[0m";
 const ANSI_BOLD: &str = "\x1B[1m";
@@ -196,6 +197,7 @@ fn ts() -> String {
 fn print_banner(device_name: &str, port: u16) {
     println!("╔═══════════════════════════════════════════════════════════════╗");
     println!("║ THE GRID HEADLESS NODE v{:<35} ║", env!("CARGO_PKG_VERSION"));
+    println!("║ {:<61} ║", SIGNATURE_LINE);
     println!("╠═══════════════════════════════════════════════════════════════╣");
     println!("║ Device: {:<55}║", device_name);
     println!("║ Agent Port: {:<51}║", port);
@@ -333,6 +335,7 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         "      ██║   ██║  ██║███████╗╚██████╔╝██║  ██║██║██████╔╝".to_string(),
         "      ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝╚═════╝".to_string(),
         format!("NODE v{}", env!("CARGO_PKG_VERSION")),
+        SIGNATURE_LINE.to_string(),
         format!("Device: {device_name}"),
         format!("Agent Port: {port}"),
         format!("Uptime: {}s", uptime),
@@ -346,6 +349,7 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         logo_rows = 1;
         left = vec![
             format!("{} TG NODE v{}", pulse, env!("CARGO_PKG_VERSION")),
+            "Powered and Designed by: sinergias.lagrieta.es".to_string(),
             format!("Device: {device_name}"),
             format!("Agent Port: {port}"),
             format!("Uptime: {}s", uptime),
