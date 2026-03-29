@@ -5,7 +5,10 @@ use std::sync::mpsc;
 use anyhow::Result;
 use rusqlite::params;
 
-use thegrid_core::{AppEvent, Config, Database, FileWatcher, hash_file, match_rules};
+use thegrid_core::{
+    fingerprint_file, match_rules, should_skip_dir, AppEvent, Config, Database,
+    FileChange, FileWatcher,
+};
 use thegrid_net::{AgentClient, AgentServer, TailscaleClient, WolSentry};
 use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
 
@@ -25,6 +28,7 @@ pub struct AppRuntime {
     pub is_ai_node: bool,
     pub media_analyzer: Arc<Mutex<Option<Arc<dyn thegrid_ai::MediaAnalyzer>>>>,
     pub agent_shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    pub hash_worker_running: Arc<AtomicBool>,
 }
 
 impl AppRuntime {
@@ -70,6 +74,7 @@ impl AppRuntime {
             is_ai_node,
             media_analyzer: Arc::new(Mutex::new(None)),
             agent_shutdown: Arc::new(Mutex::new(None)),
+            hash_worker_running: Arc::new(AtomicBool::new(false)),
         };
 
         Ok(runtime)
@@ -238,13 +243,7 @@ impl AppRuntime {
 
     pub fn spawn_index_directory(&self, path: PathBuf, device_id: String, device_name: String) {
         let db = Arc::clone(&self.db);
-        let config = Arc::clone(&self.config);
         let tx = self.event_tx.clone();
-        
-        // Services/State clones for the worker
-        let semantic = Arc::clone(&self.semantic_search);
-        let remote_ai = Arc::clone(&self.remote_ai_nodes);
-        let analyzer = Arc::clone(&self.media_analyzer);
         
         let path_for_thread = path.clone();
 
@@ -290,14 +289,10 @@ impl AppRuntime {
             // We pass the total_count as a hint for the progress bar
             Self::do_process_index_queue(
                 db, 
-                config, 
                 tx, 
                 device_id, 
                 device_name, 
-                total_count,
-                semantic,
-                remote_ai,
-                analyzer
+                total_count
             );
         });
     }
@@ -306,14 +301,10 @@ impl AppRuntime {
     /// This is a static-like method to avoid lifetime issues when calling from a thread.
     fn do_process_index_queue(
         db:           Arc<Mutex<Database>>,
-        config:       Arc<Mutex<Config>>,
         tx:           mpsc::Sender<AppEvent>,
         device_id:    String,
         device_name:  String,
         total_hint:   u64,
-        semantic:     Arc<Mutex<Option<SemanticSearch>>>,
-        remote_ai:    Arc<Mutex<std::collections::HashMap<String, String>>>,
-        analyzer:     Arc<Mutex<Option<Arc<dyn thegrid_ai::MediaAnalyzer>>>>,
     ) {
         let start = std::time::Instant::now();
         let mut scanned_count = 0u64;
@@ -330,7 +321,7 @@ impl AppRuntime {
 
                 let mut dir_count = 0;
                 match db.lock() {
-                    Ok(mut guard) => {
+                    Ok(guard) => {
                         // Scan dir and get subdirs
                         let entries = match std::fs::read_dir(&dir_path) {
                             Ok(e) => e,
@@ -347,15 +338,28 @@ impl AppRuntime {
                             let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
                             
                             if meta.is_dir() {
-                                // Skip common temp dirs etc if needed (the core skip logic is in Database usually)
+                                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                                if should_skip_dir(&name) {
+                                    continue;
+                                }
                                 subdirs.push(path);
                             } else if meta.is_file() {
                                 let size = meta.len();
                                 let modified = meta.modified().ok()
                                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                     .map(|d| d.as_secs() as i64);
-
-                                let _ = guard.index_file(&device_id, &device_name, &path, size, modified, None);
+                                let fingerprint = fingerprint_file(&path).ok();
+                                let _ = guard.index_file_with_source(
+                                    &device_id,
+                                    &device_name,
+                                    &path,
+                                    size,
+                                    modified,
+                                    fingerprint.as_ref().and_then(|f| f.quick_hash.as_deref()),
+                                    None,
+                                    thegrid_core::DetectionSource::FullScan,
+                                    chrono::Utc::now().timestamp(),
+                                );
                                 dir_count += 1;
                             }
                         }
@@ -399,33 +403,24 @@ impl AppRuntime {
     pub fn spawn_idle_work(&self) {
         log::info!("Idle worker triggered — looking for unfinished tasks");
         let db = Arc::clone(&self.db);
-        let config = Arc::clone(&self.config);
         let tx = self.event_tx.clone();
-        
-        let semantic = Arc::clone(&self.semantic_search);
-        let remote_ai = Arc::clone(&self.remote_ai_nodes);
-        let analyzer = Arc::clone(&self.media_analyzer);
 
-        let device_id   = { config.lock().unwrap().device_name.clone() };
+        let device_id   = { self.config.lock().unwrap().device_name.clone() };
         let device_name = device_id.clone();
         
         std::thread::spawn(move || {
             Self::do_process_index_queue(
                 db, 
-                config, 
                 tx, 
                 device_id, 
                 device_name, 
-                0, // Reset scan total is unknown
-                semantic,
-                remote_ai,
-                analyzer
+                0
             );
         });
     }
 
 
-    pub fn spawn_incremental_index(&self, paths: Vec<PathBuf>) {
+    pub fn spawn_incremental_index(&self, changes: Vec<FileChange>) {
         let db = Arc::clone(&self.db);
         let (device_id, device_name) = {
             let cfg = self.config.lock().unwrap();
@@ -434,11 +429,11 @@ impl AppRuntime {
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let result = db.lock().map(|guard| {
-                guard.index_changed_paths(&device_id, &device_name, &paths)
+                guard.index_changed_paths(&device_id, &device_name, &changes)
             });
             match result {
-                Ok(Ok((updated, _deleted))) => {
-                    let _ = tx.send(AppEvent::IndexUpdated { paths_updated: updated });
+                Ok(Ok((updated, deleted, renamed))) => {
+                    let _ = tx.send(AppEvent::IndexUpdated { paths_updated: updated + deleted + renamed });
                 }
                 _ => {}
             }
@@ -467,7 +462,7 @@ impl AppRuntime {
                 }
             };
 
-            let results = match client.sync_index(last_ts) {
+            let delta = match client.sync_index(last_ts) {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = event_tx.send(AppEvent::SyncFailed { device_id, error: e.to_string() });
@@ -478,12 +473,19 @@ impl AppRuntime {
             let mut count = 0;
             let mut max_ts = last_ts;
             if let Ok(guard) = db.lock() {
-                for r in results {
+                for r in delta.files {
                     let mod_ts = r.modified.unwrap_or(0);
+                    if r.indexed_at > max_ts { max_ts = r.indexed_at; }
                     if mod_ts > max_ts { max_ts = mod_ts; }
                     if guard.upsert_remote_file(r).is_ok() {
                         count += 1;
                     }
+                }
+                for tombstone in delta.tombstones {
+                    if tombstone.deleted_at > max_ts {
+                        max_ts = tombstone.deleted_at;
+                    }
+                    let _ = guard.apply_remote_tombstone(&tombstone);
                 }
                 let _ = guard.update_node_sync_ts(&device_id, &hostname, max_ts);
             }
@@ -616,8 +618,13 @@ impl AppRuntime {
     }
 
     pub fn spawn_hashing_worker(&self) {
+        if self.hash_worker_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         let db = Arc::clone(&self.db);
         let event_tx = self.event_tx.clone();
+        let running = Arc::clone(&self.hash_worker_running);
 
         std::thread::spawn(move || {
             log::info!("[Runtime] Starting background hashing worker...");
@@ -649,6 +656,19 @@ impl AppRuntime {
                             Ok(h) => {
                                 if let Ok(guard) = db.lock() {
                                     let _ = guard.update_file_hash(fid, &h);
+
+                                    if let Ok(rules) = guard.get_rules() {
+                                        let user_rules: Vec<_> = rules.into_iter().map(|r| {
+                                            thegrid_core::models::UserRule {
+                                                id: r.0, name: r.1, pattern: r.2, project: r.3, tag: r.4, is_active: r.5
+                                            }
+                                        }).collect();
+
+                                        let matches = match_rules(&path, &user_rules, fid);
+                                        for m in matches {
+                                            let _ = guard.add_file_tag(fid, m.tag.as_deref(), m.project.as_deref(), false);
+                                        }
+                                    }
                                     hashed_count += 1;
                                 }
                             }
@@ -675,6 +695,8 @@ impl AppRuntime {
                 // Yield to other threads
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+
+            running.store(false, Ordering::SeqCst);
         });
     }
 
@@ -844,70 +866,6 @@ impl AppRuntime {
                 Ok(Ok(entries)) => { let _ = tx.send(AppEvent::TemporalLoaded(entries)); }
                 _ => {}
             }
-        });
-    }
-
-    pub fn spawn_background_hasher(&self) {
-        let db       = self.db.clone();
-        let event_tx = self.event_tx.clone();
-        
-        std::thread::spawn(move || {
-            log::info!("[Runtime] Starting background hashing worker...");
-            let mut hashed = 0;
-
-            loop {
-                // Fetch a batch of files needing a hash
-                let batch = match db.lock() {
-                    Ok(guard) => guard.get_files_needing_hash(50).unwrap_or_default(),
-                    Err(_) => break,
-                };
-                
-                if batch.is_empty() { break; }
-                
-                for (fid, path) in batch {
-                    if path.exists() && path.is_file() {
-                        let hash_res = hash_file(&path);
-                        if let Ok(db_lock) = db.lock() {
-                            match hash_res {
-                                Ok(h) => {
-                                    let _ = db_lock.update_file_hash(fid, &h);
-                                    
-                                    // NEW: Apply Smart Filter Rules
-                                    if let Ok(rules) = db_lock.get_rules() {
-                                        let user_rules: Vec<_> = rules.into_iter().map(|r| {
-                                            thegrid_core::models::UserRule {
-                                                id: r.0, name: r.1, pattern: r.2, project: r.3, tag: r.4, is_active: r.5
-                                            }
-                                        }).collect();
-                                        
-                                        let matches = match_rules(&path, &user_rules, fid);
-                                        for m in matches {
-                                            let _ = db_lock.add_file_tag(fid, m.tag.as_deref(), m.project.as_deref(), false);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    log::warn!("[Runtime] Failed to hash {:?}: {}", path, e);
-                                    let _ = db_lock.update_file_hash(fid, "ERR_HASH_FAILED");
-                                }
-                            }
-                        }
-                    } else {
-                        if let Ok(db_lock) = db.lock() {
-                            let _ = db_lock.update_file_hash(fid, "ERR_NOT_FOUND");
-                        }
-                    }
-                    hashed += 1;
-                    if hashed % 25 == 0 {
-                        // Total is hard to estimate exactly, we just send current count
-                        let _ = event_tx.send(AppEvent::HashingProgress { hashed, total: hashed + 50 });
-                    }
-                }
-                
-                // Throttle to keep CPU usage reasonable
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            log::info!("[Runtime] Background hashing worker finished.");
         });
     }
 

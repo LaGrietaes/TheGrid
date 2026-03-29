@@ -359,9 +359,9 @@ impl AgentServer {
 
             let (tx, rx) = mpsc::channel();
             let _ = self.event_tx.send(AppEvent::SyncRequest { after, response_tx: tx });
-            let files = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default();
+            let delta = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default();
 
-            let json = serde_json::to_string(&files)?;
+            let json = serde_json::to_string(&delta)?;
             req.respond(Response::from_string(json)
                 .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
             )?;
@@ -1064,7 +1064,7 @@ impl AgentClient {
         Ok(r)
     }
 
-    pub fn sync_index(&self, last_sync_ts: i64) -> Result<Vec<FileSearchResult>> {
+    pub fn sync_index(&self, last_sync_ts: i64) -> Result<SyncDelta> {
         let url = format!("{}/v1/sync?after={}", self.base_url, last_sync_ts);
         log::debug!("Client: syncing index from {} (after={})", url, last_sync_ts);
         let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).send().context("Requesting index sync")?;
@@ -1073,8 +1073,13 @@ impl AgentClient {
             log::warn!("Client: sync from {} failed with status {}", url, status);
             return Err(Self::handle_error(resp));
         }
-        let r: Vec<FileSearchResult> = resp.json().context("Parsing sync JSON")?;
-        log::debug!("Client: sync from {} succeeded ({} results)", url, r.len());
+        let r: SyncDelta = resp.json().context("Parsing sync JSON")?;
+        log::debug!(
+            "Client: sync from {} succeeded ({} files, {} tombstones)",
+            url,
+            r.files.len(),
+            r.tombstones.len()
+        );
         Ok(r)
     }
 

@@ -2,6 +2,79 @@ use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionSource {
+    #[default]
+    FullScan,
+    Watcher,
+    Sync,
+}
+
+impl DetectionSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FullScan => "full_scan",
+            Self::Watcher => "watcher",
+            Self::Sync => "sync",
+        }
+    }
+
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "watcher" => Self::Watcher,
+            "sync" => Self::Sync,
+            _ => Self::FullScan,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeKind {
+    Created,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileFingerprint {
+    pub size: u64,
+    pub modified: Option<i64>,
+    pub quick_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub kind: FileChangeKind,
+    pub path: PathBuf,
+    pub old_path: Option<PathBuf>,
+    pub new_path: Option<PathBuf>,
+    pub fingerprint: Option<FileFingerprint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTombstone {
+    pub device_id: String,
+    pub path: PathBuf,
+    pub size: u64,
+    pub modified: Option<i64>,
+    pub hash: Option<String>,
+    pub quick_hash: Option<String>,
+    pub deleted_at: i64,
+    #[serde(default)]
+    pub detected_by: DetectionSource,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncDelta {
+    #[serde(default)]
+    pub files: Vec<FileSearchResult>,
+    #[serde(default)]
+    pub tombstones: Vec<FileTombstone>,
+}
+
 /// A device on the user's Tailscale mesh network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TailscaleDevice {
@@ -127,6 +200,10 @@ pub struct FileSearchResult {
     pub size: u64,
     pub modified: Option<i64>,
     pub hash: Option<String>,
+    pub quick_hash: Option<String>,
+    pub indexed_at: i64,
+    #[serde(default)]
+    pub detected_by: DetectionSource,
     pub rank: Option<f64>,
 }
 

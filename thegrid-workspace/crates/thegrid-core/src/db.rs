@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::models::{FileSearchResult, TemporalEntry, TemporalEventKind};
+use crate::models::{
+    DetectionSource, FileChange, FileChangeKind, FileFingerprint, FileSearchResult, FileTombstone,
+    SyncDelta, TemporalEntry, TemporalEventKind,
+};
 
 pub struct Database {
     pub conn: Connection,
@@ -41,13 +44,16 @@ impl Database {
                 size        INTEGER NOT NULL DEFAULT 0,
                 modified    INTEGER,
                 hash        TEXT,
+                quick_hash  TEXT,
                 ai_metadata TEXT,
+                detected_by TEXT    NOT NULL DEFAULT 'full_scan',
                 indexed_at  INTEGER NOT NULL,
                 UNIQUE(device_id, path)
             );
 
             CREATE INDEX IF NOT EXISTS idx_files_device  ON files(device_id);
             CREATE INDEX IF NOT EXISTS idx_files_ext     ON files(ext);
+            CREATE INDEX IF NOT EXISTS idx_files_quick_hash ON files(quick_hash);
             CREATE INDEX IF NOT EXISTS idx_files_modified ON files(modified DESC);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
@@ -119,6 +125,21 @@ impl Database {
                 UNIQUE(root_path, dir_path)
             );
 
+            CREATE TABLE IF NOT EXISTS file_tombstones (
+                device_id   TEXT    NOT NULL,
+                path        TEXT    NOT NULL,
+                size        INTEGER NOT NULL DEFAULT 0,
+                modified    INTEGER,
+                hash        TEXT,
+                quick_hash  TEXT,
+                deleted_at  INTEGER NOT NULL,
+                detected_by TEXT    NOT NULL DEFAULT 'watcher',
+                PRIMARY KEY(device_id, path)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tombstones_deleted_at ON file_tombstones(deleted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tombstones_quick_hash ON file_tombstones(device_id, quick_hash, size);
+
             -- ── Phase 2: Rules & Smart Filters ──────────────────────────
             CREATE TABLE IF NOT EXISTS user_rules (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,7 +168,18 @@ impl Database {
                 last_seen   INTEGER NOT NULL
             );
         "#).context("Initializing database schema")?;
+        self.add_column_if_missing("ALTER TABLE files ADD COLUMN quick_hash TEXT")?;
+        self.add_column_if_missing("ALTER TABLE files ADD COLUMN detected_by TEXT NOT NULL DEFAULT 'full_scan'")?;
         log::info!("[DB] Schema ready");
+        Ok(())
+    }
+
+    fn add_column_if_missing(&self, sql: &str) -> Result<()> {
+        if let Err(err) = self.conn.execute(sql, []) {
+            if !err.to_string().contains("duplicate column name") {
+                return Err(err.into());
+            }
+        }
         Ok(())
     }
 
@@ -177,23 +209,61 @@ impl Database {
         modified:    Option<i64>,
         hash:        Option<&str>,
     ) -> Result<i64> {
+        self.index_file_with_source(
+            device_id,
+            device_name,
+            path,
+            size,
+            modified,
+            None,
+            hash,
+            DetectionSource::FullScan,
+            unix_now(),
+        )
+    }
+
+    pub fn index_file_with_source(
+        &self,
+        device_id:   &str,
+        device_name: &str,
+        path:        &Path,
+        size:        u64,
+        modified:    Option<i64>,
+        quick_hash:  Option<&str>,
+        hash:        Option<&str>,
+        detected_by: DetectionSource,
+        indexed_at:  i64,
+    ) -> Result<i64> {
         let name = path.file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let ext = path.extension()
             .map(|e| e.to_string_lossy().to_lowercase());
         let path_str = path.to_string_lossy();
-        let now = unix_now();
+
+        self.clear_tombstone_if_older(device_id, path, indexed_at)?;
 
         self.conn.execute(
-            "INSERT INTO files (device_id, device_name, path, name, ext, size, modified, hash, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO files (device_id, device_name, path, name, ext, size, modified, hash, quick_hash, detected_by, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(device_id, path) DO UPDATE
                SET name        = excluded.name,
                    ext         = excluded.ext,
                    size        = excluded.size,
                    modified    = excluded.modified,
-                   hash        = COALESCE(excluded.hash, files.hash),
+                   hash        = CASE
+                                   WHEN excluded.hash IS NOT NULL THEN excluded.hash
+                                   WHEN files.size != excluded.size OR COALESCE(files.modified, -1) != COALESCE(excluded.modified, -1)
+                                     THEN NULL
+                                   ELSE files.hash
+                                 END,
+                   quick_hash  = COALESCE(excluded.quick_hash, files.quick_hash),
+                   ai_metadata = CASE
+                                   WHEN files.size != excluded.size OR COALESCE(files.modified, -1) != COALESCE(excluded.modified, -1)
+                                     THEN NULL
+                                   ELSE files.ai_metadata
+                                 END,
+                   detected_by = excluded.detected_by,
                    indexed_at  = excluded.indexed_at",
             params![
                 device_id,
@@ -204,10 +274,18 @@ impl Database {
                 size as i64,
                 modified,
                 hash,
-                now,
+                quick_hash,
+                detected_by.as_str(),
+                indexed_at,
             ],
         )?;
-        Ok(self.conn.last_insert_rowid())
+
+        let id = self.conn.query_row(
+            "SELECT id FROM files WHERE device_id = ?1 AND path = ?2",
+            params![device_id, path_str.as_ref()],
+            |row| row.get(0),
+        )?;
+        Ok(id)
     }
 
     pub fn update_file_hash(&self, id: i64, hash: &str) -> Result<()> {
@@ -244,7 +322,7 @@ impl Database {
         for g in groups {
             let (hash, size) = g?;
             let mut file_stmt = self.conn.prepare(
-                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, 0.0 as rank 
+                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank 
                  FROM files WHERE hash = ?1 AND size = ?2"
             )?;
             let files = file_stmt.query_map(params![hash, size as i64], |r| self.map_search_result(r))?;
@@ -331,15 +409,39 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_files_after(&self, after: i64) -> Result<Vec<FileSearchResult>> {
+    pub fn get_sync_delta_after(&self, after: i64) -> Result<SyncDelta> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, 0.0 as rank \
+            "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank \
              FROM files WHERE indexed_at > ?1 OR modified > ?1"
         )?;
         let rows = stmt.query_map(params![after], |row| self.map_search_result(row))?;
-        let mut results = Vec::new();
-        for r in rows { results.push(r?); }
-        Ok(results)
+        let mut files = Vec::new();
+        for r in rows { files.push(r?); }
+
+        let mut tomb_stmt = self.conn.prepare(
+            "SELECT device_id, path, size, modified, hash, quick_hash, deleted_at, detected_by
+             FROM file_tombstones
+             WHERE deleted_at > ?1"
+        )?;
+        let tomb_rows = tomb_stmt.query_map(params![after], |row| {
+            Ok(FileTombstone {
+                device_id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+                size: row.get::<_, i64>(2)? as u64,
+                modified: row.get(3)?,
+                hash: row.get(4)?,
+                quick_hash: row.get(5)?,
+                deleted_at: row.get(6)?,
+                detected_by: row.get::<_, Option<String>>(7)?
+                    .as_deref()
+                    .map(DetectionSource::from_db)
+                    .unwrap_or(DetectionSource::Watcher),
+            })
+        })?;
+        let mut tombstones = Vec::new();
+        for row in tomb_rows { tombstones.push(row?); }
+
+        Ok(SyncDelta { files, tombstones })
     }
 
     fn map_search_result(&self, row: &rusqlite::Row) -> rusqlite::Result<FileSearchResult> {
@@ -353,7 +455,13 @@ impl Database {
             size:        row.get::<_, i64>(6)? as u64,
             modified:    row.get(7)?,
             hash:        row.get(8)?,
-            rank:        row.get(9)?,
+            quick_hash:  row.get(9)?,
+            indexed_at:  row.get(10)?,
+            detected_by: row.get::<_, Option<String>>(11)?
+                .as_deref()
+                .map(DetectionSource::from_db)
+                .unwrap_or_default(),
+            rank:        row.get(12)?,
         })
     }
 
@@ -380,13 +488,32 @@ impl Database {
         Ok(())
     }
 
-    pub fn remove_path(&self, device_id: &str, path: &Path) -> Result<usize> {
-        let path_str = path.to_string_lossy();
-        let n = self.conn.execute(
-            "DELETE FROM files WHERE device_id = ?1 AND path = ?2",
-            params![device_id, path_str.as_ref()],
+    pub fn remove_path(&self, device_id: &str, path: &Path, detected_by: DetectionSource) -> Result<usize> {
+        let path_str = path.to_string_lossy().to_string();
+        let rows = self.collect_file_rows_for_path(device_id, &path_str)?;
+        let deleted_at = unix_now();
+
+        for row in &rows {
+            self.insert_tombstone(&FileTombstone {
+                device_id: device_id.to_string(),
+                path: PathBuf::from(&row.path),
+                size: row.size,
+                modified: row.modified,
+                hash: row.hash.clone(),
+                quick_hash: row.quick_hash.clone(),
+                deleted_at,
+                detected_by,
+            })?;
+        }
+
+        let (exact, win_like, unix_like) = path_match_patterns(&path_str);
+        let deleted = self.conn.execute(
+            "DELETE FROM files
+             WHERE device_id = ?1
+               AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
+            params![device_id, exact, win_like, unix_like],
         )?;
-        Ok(n)
+        Ok(deleted)
     }
 
     // ── Phase 4: Semantic AI ──────────────────────────────────────────────
@@ -487,7 +614,7 @@ impl Database {
         
         let id_params: Vec<String> = (0..ids.len()).map(|_| "?".to_string()).collect();
         let sql = format!(
-            "SELECT id, device_id, device_name, path, name, ext, size, modified, 0.0 as rank
+            "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
              FROM files WHERE id IN ({})",
             id_params.join(",")
         );
@@ -585,7 +712,18 @@ impl Database {
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as i64);
 
-                    if let Err(e) = self.index_file(device_id, device_name, &path, size, modified, None) {
+                    let quick_hash = crate::utils::quick_hash_file(&path).ok();
+                    if let Err(e) = self.index_file_with_source(
+                        device_id,
+                        device_name,
+                        &path,
+                        size,
+                        modified,
+                        quick_hash.as_deref(),
+                        None,
+                        DetectionSource::FullScan,
+                        unix_now(),
+                    ) {
                         log::warn!("[DB] Failed to index {:?}: {}", path, e);
                     }
 
@@ -619,32 +757,88 @@ impl Database {
         &self,
         device_id:   &str,
         device_name: &str,
-        paths:       &[PathBuf],
-    ) -> Result<(usize, usize)> {
+        changes:     &[FileChange],
+    ) -> Result<(usize, usize, usize)> {
         let mut updated = 0;
         let mut deleted = 0;
+        let mut renamed = 0;
 
-        for path in paths {
-            if path.exists() {
-                if path.is_file() {
-                    if let Ok(meta) = std::fs::metadata(path) {
-                        let size = meta.len();
-                        let modified = meta.modified().ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64);
-                        if self.index_file(device_id, device_name, path, size, modified, None).is_ok() {
-                            updated += 1;
+        for change in changes {
+            match change.kind {
+                FileChangeKind::Deleted => {
+                    deleted += self.remove_path(device_id, &change.path, DetectionSource::Watcher)?;
+                }
+                FileChangeKind::Renamed => {
+                    if let Some(old_path) = change.old_path.as_ref() {
+                        let new_path = change.new_path.as_ref().unwrap_or(&change.path);
+                        renamed += self.rename_path_tree(device_id, old_path, new_path, DetectionSource::Watcher)?;
+                        if new_path.exists() && new_path.is_file() {
+                            let fingerprint = change.fingerprint.clone().or_else(|| crate::utils::fingerprint_file(new_path).ok());
+                            if let Some(identity) = fingerprint {
+                                if self.index_file_with_source(
+                                    device_id,
+                                    device_name,
+                                    new_path,
+                                    identity.size,
+                                    identity.modified,
+                                    identity.quick_hash.as_deref(),
+                                    None,
+                                    DetectionSource::Watcher,
+                                    unix_now(),
+                                ).is_ok() {
+                                    updated += 1;
+                                }
+                            }
                         }
                     }
                 }
-            } else {
-                if self.remove_path(device_id, path)? > 0 {
-                    deleted += 1;
+                FileChangeKind::Created | FileChangeKind::Modified => {
+                    let path = &change.path;
+                    if !path.exists() {
+                        deleted += self.remove_path(device_id, path, DetectionSource::Watcher)?;
+                        continue;
+                    }
+
+                    if !path.is_file() {
+                        continue;
+                    }
+
+                    let fingerprint = change.fingerprint.clone().or_else(|| crate::utils::fingerprint_file(path).ok());
+                    let Some(identity) = fingerprint else {
+                        continue;
+                    };
+
+                    let correlated_tombstone = if change.kind == FileChangeKind::Created {
+                        self.find_recent_tombstone(device_id, &identity, 8)?
+                    } else {
+                        None
+                    };
+
+                    if let Some(ref tombstone) = correlated_tombstone {
+                        if tombstone.path != *path {
+                            renamed += 1;
+                        }
+                        self.remove_tombstone(device_id, &tombstone.path)?;
+                    }
+
+                    if self.index_file_with_source(
+                        device_id,
+                        device_name,
+                        path,
+                        identity.size,
+                        identity.modified,
+                        identity.quick_hash.as_deref(),
+                        correlated_tombstone.as_ref().and_then(|t| t.hash.as_deref()),
+                        DetectionSource::Watcher,
+                        unix_now(),
+                    ).is_ok() {
+                        updated += 1;
+                    }
                 }
             }
         }
 
-        Ok((updated, deleted))
+        Ok((updated, deleted, renamed))
     }
 
     // ── Search ────────────────────────────────────────────────────────────
@@ -661,7 +855,7 @@ impl Database {
 
         let sql = if device_filter.is_some() {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
-                    f.ext, f.size, f.modified, f.hash, fts.rank
+                                        f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
@@ -670,7 +864,7 @@ impl Database {
              LIMIT ?3"
         } else {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
-                    f.ext, f.size, f.modified, f.hash, fts.rank
+                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
@@ -692,7 +886,13 @@ impl Database {
                 size:        row.get::<_, i64>(6)? as u64,
                 modified:    row.get(7)?,
                 hash:        row.get(8)?,
-                rank:        row.get(9)?,
+                quick_hash:  row.get(9)?,
+                indexed_at:  row.get(10)?,
+                detected_by: row.get::<_, Option<String>>(11)?
+                    .as_deref()
+                    .map(DetectionSource::from_db)
+                    .unwrap_or_default(),
+                rank:        row.get(12)?,
             })
         };
 
@@ -763,10 +963,24 @@ impl Database {
     }
 
     pub fn upsert_remote_file(&self, file: FileSearchResult) -> Result<()> {
+        if let Some(tombstone_ts) = self.get_tombstone_timestamp(&file.device_id, &file.path)? {
+            let incoming_ts = file.modified.unwrap_or(file.indexed_at);
+            if tombstone_ts >= incoming_ts {
+                return Ok(());
+            }
+        }
+
+        if let Some(existing_ts) = self.get_existing_index_timestamp(&file.device_id, &file.path)? {
+            if existing_ts > file.indexed_at {
+                return Ok(());
+            }
+        }
+
         let path_str = file.path.to_string_lossy();
+        self.clear_tombstone_if_older(&file.device_id, &file.path, file.indexed_at)?;
         self.conn.execute(
-            "INSERT INTO files (device_id, device_name, path, name, ext, size, modified, hash, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO files (device_id, device_name, path, name, ext, size, modified, hash, quick_hash, detected_by, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(device_id, path) DO UPDATE SET
                 device_name = excluded.device_name,
                 name       = excluded.name,
@@ -774,6 +988,8 @@ impl Database {
                 size       = excluded.size,
                 modified   = excluded.modified,
                 hash       = excluded.hash,
+                quick_hash = excluded.quick_hash,
+                detected_by = excluded.detected_by,
                 indexed_at = excluded.indexed_at",
             params![
                 file.device_id,
@@ -782,12 +998,29 @@ impl Database {
                 file.name,
                 file.ext,
                 file.size as i64,
-                file.modified.unwrap_or(0),
-                "", // hash
-                unix_now(),
+                file.modified,
+                file.hash,
+                file.quick_hash,
+                file.detected_by.as_str(),
+                file.indexed_at,
             ],
         )?;
         Ok(())
+    }
+
+    pub fn apply_remote_tombstone(&self, tombstone: &FileTombstone) -> Result<bool> {
+        if let Some(existing_ts) = self.get_existing_index_timestamp(&tombstone.device_id, &tombstone.path)? {
+            if existing_ts > tombstone.deleted_at {
+                return Ok(false);
+            }
+        }
+
+        self.insert_tombstone(tombstone)?;
+        let deleted = self.conn.execute(
+            "DELETE FROM files WHERE device_id = ?1 AND path = ?2",
+            params![tombstone.device_id, tombstone.path.to_string_lossy().to_string()],
+        )?;
+        Ok(deleted > 0)
     }
 
     pub fn file_count(&self, device_id: Option<&str>) -> Result<u64> {
@@ -814,12 +1047,192 @@ impl Database {
         status:    &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO transfers (direction, peer_ip, filename, size, status, timestamp)
+            "INSERT INTO transfers (direction, peer_ip, filename, size, status, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![direction, peer_ip, filename, size as i64, status, unix_now()],
         )?;
         Ok(())
     }
+
+    fn collect_file_rows_for_path(&self, device_id: &str, path: &str) -> Result<Vec<StoredFileRow>> {
+        let (exact, win_like, unix_like) = path_match_patterns(path);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, modified, hash, quick_hash, indexed_at
+             FROM files
+             WHERE device_id = ?1
+               AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)"
+        )?;
+        let rows = stmt.query_map(params![device_id, exact, win_like, unix_like], |row| {
+            Ok(StoredFileRow {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get::<_, i64>(2)? as u64,
+                modified: row.get(3)?,
+                hash: row.get(4)?,
+                quick_hash: row.get(5)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    fn insert_tombstone(&self, tombstone: &FileTombstone) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO file_tombstones (device_id, path, size, modified, hash, quick_hash, deleted_at, detected_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(device_id, path) DO UPDATE SET
+                size = excluded.size,
+                modified = excluded.modified,
+                hash = excluded.hash,
+                quick_hash = excluded.quick_hash,
+                deleted_at = excluded.deleted_at,
+                detected_by = excluded.detected_by",
+            params![
+                tombstone.device_id,
+                tombstone.path.to_string_lossy().to_string(),
+                tombstone.size as i64,
+                tombstone.modified,
+                tombstone.hash,
+                tombstone.quick_hash,
+                tombstone.deleted_at,
+                tombstone.detected_by.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn find_recent_tombstone(
+        &self,
+        device_id: &str,
+        fingerprint: &FileFingerprint,
+        window_secs: i64,
+    ) -> Result<Option<FileTombstone>> {
+        let Some(quick_hash) = fingerprint.quick_hash.as_deref() else {
+            return Ok(None);
+        };
+
+        self.conn.query_row(
+            "SELECT device_id, path, size, modified, hash, quick_hash, deleted_at, detected_by
+             FROM file_tombstones
+             WHERE device_id = ?1
+               AND quick_hash = ?2
+               AND size = ?3
+               AND deleted_at >= ?4
+             ORDER BY deleted_at DESC
+             LIMIT 1",
+            params![device_id, quick_hash, fingerprint.size as i64, unix_now() - window_secs],
+            |row| {
+                Ok(FileTombstone {
+                    device_id: row.get(0)?,
+                    path: PathBuf::from(row.get::<_, String>(1)?),
+                    size: row.get::<_, i64>(2)? as u64,
+                    modified: row.get(3)?,
+                    hash: row.get(4)?,
+                    quick_hash: row.get(5)?,
+                    deleted_at: row.get(6)?,
+                    detected_by: row.get::<_, Option<String>>(7)?
+                        .as_deref()
+                        .map(DetectionSource::from_db)
+                        .unwrap_or(DetectionSource::Watcher),
+                })
+            },
+        ).optional().map_err(Into::into)
+    }
+
+    fn remove_tombstone(&self, device_id: &str, path: &Path) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_tombstones WHERE device_id = ?1 AND path = ?2",
+            params![device_id, path.to_string_lossy().to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn clear_tombstone_if_older(&self, device_id: &str, path: &Path, indexed_at: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM file_tombstones WHERE device_id = ?1 AND path = ?2 AND deleted_at <= ?3",
+            params![device_id, path.to_string_lossy().to_string(), indexed_at],
+        )?;
+        Ok(())
+    }
+
+    fn get_tombstone_timestamp(&self, device_id: &str, path: &Path) -> Result<Option<i64>> {
+        self.conn.query_row(
+            "SELECT deleted_at FROM file_tombstones WHERE device_id = ?1 AND path = ?2",
+            params![device_id, path.to_string_lossy().to_string()],
+            |row| row.get(0),
+        ).optional().map_err(Into::into)
+    }
+
+    fn get_existing_index_timestamp(&self, device_id: &str, path: &Path) -> Result<Option<i64>> {
+        self.conn.query_row(
+            "SELECT MAX(indexed_at, COALESCE(modified, indexed_at))
+             FROM files
+             WHERE device_id = ?1 AND path = ?2",
+            params![device_id, path.to_string_lossy().to_string()],
+            |row| row.get(0),
+        ).optional().map_err(Into::into)
+    }
+
+    fn rename_path_tree(
+        &self,
+        device_id: &str,
+        old_path: &Path,
+        new_path: &Path,
+        detected_by: DetectionSource,
+    ) -> Result<usize> {
+        let rows = self.collect_file_rows_for_path(device_id, &old_path.to_string_lossy())?;
+        let mut renamed = 0;
+        let indexed_at = unix_now();
+
+        for row in rows {
+            let current_path = PathBuf::from(&row.path);
+            let target_path = match current_path.strip_prefix(old_path) {
+                Ok(suffix) if !suffix.as_os_str().is_empty() => new_path.join(suffix),
+                _ => new_path.to_path_buf(),
+            };
+
+            let name = target_path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let ext = target_path.extension()
+                .map(|e| e.to_string_lossy().to_lowercase());
+
+            self.conn.execute(
+                "UPDATE files
+                 SET path = ?1,
+                     name = ?2,
+                     ext = ?3,
+                     detected_by = ?4,
+                     indexed_at = ?5
+                 WHERE id = ?6",
+                params![
+                    target_path.to_string_lossy().to_string(),
+                    name,
+                    ext,
+                    detected_by.as_str(),
+                    indexed_at,
+                    row.id,
+                ],
+            )?;
+            renamed += 1;
+        }
+
+        Ok(renamed)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StoredFileRow {
+    id: i64,
+    path: String,
+    size: u64,
+    modified: Option<i64>,
+    hash: Option<String>,
+    quick_hash: Option<String>,
 }
 
 fn unix_now() -> i64 {
@@ -829,7 +1242,7 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-fn should_skip_dir(name: &str) -> bool {
+pub fn should_skip_dir(name: &str) -> bool {
     matches!(
         name,
         ".git" | ".svn" | ".hg"
@@ -841,6 +1254,14 @@ fn should_skip_dir(name: &str) -> bool {
         | "$RECYCLE.BIN" | "System Volume Information"
         | "WindowsApps" | "Windows" | "ProgramData"
     ) || name.starts_with('.')
+}
+
+fn path_match_patterns(path: &str) -> (String, String, String) {
+    (
+        path.to_string(),
+        format!("{}\\%", path),
+        format!("{}/%", path),
+    )
 }
 
 fn sanitize_fts_query(q: &str) -> String {

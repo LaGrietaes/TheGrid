@@ -1,16 +1,16 @@
 use anyhow::Result;
-use notify_debouncer_mini::{
-    new_debouncer, DebounceEventResult, Debouncer,
-};
-use notify::RecommendedWatcher;
-use std::path::PathBuf;
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
+
 use crate::events::AppEvent;
+use crate::models::{FileChange, FileChangeKind};
+use crate::utils::fingerprint_file;
 
 /// Watches filesystem paths and emits `AppEvent::FileSystemChanged`
 pub struct FileWatcher {
-    _debouncer: Debouncer<RecommendedWatcher>,
+    watcher: RecommendedWatcher,
     tx: mpsc::Sender<AppEvent>,
 }
 
@@ -18,51 +18,32 @@ impl FileWatcher {
     pub fn new(event_tx: mpsc::Sender<AppEvent>) -> Result<Self> {
         let tx_clone = event_tx.clone();
 
-        let debouncer = new_debouncer(
-            Duration::from_millis(500),
-            move |result: DebounceEventResult| {
-                match result {
-                    Ok(events) => {
-                        let mut paths: Vec<PathBuf> = events
-                            .into_iter()
-                            .map(|e| e.path)
-                            .collect();
-                        paths.sort();
-                        paths.dedup();
-
-                        if paths.is_empty() { return; }
-
-                        let summary = if paths.len() == 1 {
-                            format!(
-                                "Changed: {}",
-                                paths[0]
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                            )
-                        } else {
-                            format!("{} files changed", paths.len())
-                        };
-
-                        log::debug!("FileWatcher: {}", summary);
-                        let _ = tx_clone.send(AppEvent::FileSystemChanged { paths, summary });
+        let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+            match result {
+                Ok(event) => {
+                    let changes = normalize_event(event);
+                    if changes.is_empty() {
+                        return;
                     }
-                    Err(err) => {
-                        let msg = err.to_string();
-                        log::error!("FileWatcher error: {}", msg);
-                        let _ = tx_clone.send(AppEvent::FileWatcherError(msg));
-                    }
+
+                    let summary = summarize_changes(&changes);
+                    log::debug!("FileWatcher: {}", summary);
+                    let _ = tx_clone.send(AppEvent::FileSystemChanged { changes, summary });
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    log::error!("FileWatcher error: {}", msg);
+                    let _ = tx_clone.send(AppEvent::FileWatcherError(msg));
                 }
             }
-        ).map_err(|e| anyhow::anyhow!("Creating file watcher: {}", e))?;
+        }).map_err(|e| anyhow::anyhow!("Creating file watcher: {}", e))?;
 
-        Ok(Self { _debouncer: debouncer, tx: event_tx })
+        Ok(Self { watcher, tx: event_tx })
     }
 
     pub fn watch(&mut self, path: PathBuf) -> Result<()> {
-        self._debouncer
-            .watcher()
-            .watch(&path, notify::RecursiveMode::Recursive)
+        self.watcher
+            .watch(&path, RecursiveMode::Recursive)
             .map_err(|e| anyhow::anyhow!("Watching {:?}: {}", path, e))?;
 
         log::info!("FileWatcher: now watching {:?}", path);
@@ -73,11 +54,109 @@ impl FileWatcher {
     }
 
     pub fn unwatch(&mut self, path: &PathBuf) -> Result<()> {
-        self._debouncer
-            .watcher()
+        self.watcher
             .unwatch(path)
             .map_err(|e| anyhow::anyhow!("Unwatching {:?}: {}", path, e))?;
         log::info!("FileWatcher: stopped watching {:?}", path);
         Ok(())
     }
+}
+
+fn normalize_event(event: Event) -> Vec<FileChange> {
+    match event.kind {
+        EventKind::Create(CreateKind::Any | CreateKind::File | CreateKind::Folder)
+        | EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {
+            event.paths.into_iter().map(|path| FileChange {
+                kind: if matches!(event.kind, EventKind::Create(_)) {
+                    FileChangeKind::Created
+                } else {
+                    FileChangeKind::Modified
+                },
+                fingerprint: build_fingerprint(&path),
+                old_path: None,
+                new_path: None,
+                path,
+            }).collect()
+        }
+        EventKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Folder) => {
+            event.paths.into_iter().map(|path| FileChange {
+                kind: FileChangeKind::Deleted,
+                path,
+                old_path: None,
+                new_path: None,
+                fingerprint: None,
+            }).collect()
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() >= 2 => {
+            let old_path = event.paths[0].clone();
+            let new_path = event.paths[1].clone();
+            vec![FileChange {
+                kind: FileChangeKind::Renamed,
+                path: new_path.clone(),
+                old_path: Some(old_path),
+                new_path: Some(new_path.clone()),
+                fingerprint: build_fingerprint(&new_path),
+            }]
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            event.paths.into_iter().map(|path| FileChange {
+                kind: FileChangeKind::Deleted,
+                path,
+                old_path: None,
+                new_path: None,
+                fingerprint: None,
+            }).collect()
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            event.paths.into_iter().map(|path| FileChange {
+                kind: FileChangeKind::Created,
+                fingerprint: build_fingerprint(&path),
+                old_path: None,
+                new_path: None,
+                path,
+            }).collect()
+        }
+        EventKind::Modify(ModifyKind::Name(_)) => {
+            event.paths.into_iter().map(|path| FileChange {
+                kind: FileChangeKind::Modified,
+                fingerprint: build_fingerprint(&path),
+                old_path: None,
+                new_path: None,
+                path,
+            }).collect()
+        }
+        _ => event.paths.into_iter().map(|path| FileChange {
+            kind: FileChangeKind::Modified,
+            fingerprint: build_fingerprint(&path),
+            old_path: None,
+            new_path: None,
+            path,
+        }).collect(),
+    }
+}
+
+fn build_fingerprint(path: &Path) -> Option<crate::models::FileFingerprint> {
+    if !path.exists() || !path.is_file() {
+        return None;
+    }
+    fingerprint_file(path).ok()
+}
+
+fn summarize_changes(changes: &[FileChange]) -> String {
+    if changes.len() == 1 {
+        let change = &changes[0];
+        let label = match change.kind {
+            FileChangeKind::Created => "Created",
+            FileChangeKind::Modified => "Modified",
+            FileChangeKind::Deleted => "Deleted",
+            FileChangeKind::Renamed => "Renamed",
+        };
+        return format!(
+            "{}: {}",
+            label,
+            change.path.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+
+    format!("{} file changes detected", changes.len())
 }

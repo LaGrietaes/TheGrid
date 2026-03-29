@@ -107,7 +107,7 @@ pub enum AppEvent {
     // ── Filesystem Watcher ─────────────────────────────────────────────────
     /// One or more files changed in a watched directory.
     FileSystemChanged {
-        paths:  Vec<PathBuf>,
+        changes: Vec<FileChange>,
         summary: String,
     },
 
@@ -125,7 +125,7 @@ pub enum AppEvent {
     /// Incoming request from a remote node for an index sync.
     SyncRequest {
         after: i64,
-        response_tx: mpsc::Sender<Vec<FileSearchResult>>,
+        response_tx: mpsc::Sender<SyncDelta>,
     },
 
     /// Index synchronization completed.

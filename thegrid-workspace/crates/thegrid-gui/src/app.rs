@@ -602,8 +602,8 @@ impl TheGridApp {
     }
 
     /// Incrementally re-index a set of changed paths (from FileSystemChanged).
-    fn spawn_incremental_index(&self, paths: Vec<PathBuf>) {
-        self.runtime.spawn_incremental_index(paths);
+    fn spawn_incremental_index(&self, changes: Vec<thegrid_core::FileChange>) {
+        self.runtime.spawn_incremental_index(changes);
     }
 
     /// Run an FTS5 search. Generation counter prevents stale results overwriting
@@ -650,7 +650,7 @@ impl TheGridApp {
     }
 
     fn spawn_hashing_worker(&self) {
-        self.runtime.spawn_background_hasher();
+        self.runtime.spawn_hashing_worker();
     }
 
     fn spawn_search(&mut self) {
@@ -957,10 +957,10 @@ impl TheGridApp {
                 }
 
                 // ── Filesystem watcher (Phase 2) ──────────────────────────────
-                AppEvent::FileSystemChanged { paths, summary } => {
+                AppEvent::FileSystemChanged { changes, summary } => {
                     self.set_status(format!("⬡ {}", summary));
                     // Phase 3: trigger incremental index update
-                    self.spawn_incremental_index(paths);
+                    self.spawn_incremental_index(changes);
                     // Refresh timeline if it's visible
                     if self.active_tab == DashTab::Timeline {
                         self.spawn_load_timeline();
@@ -976,8 +976,8 @@ impl TheGridApp {
                     let db = self.runtime.db.clone();
                     std::thread::spawn(move || {
                         if let Ok(guard) = db.lock() {
-                            let results = guard.get_files_after(after).unwrap_or_default();
-                            let _ = response_tx.send(results);
+                            let delta = guard.get_sync_delta_after(after).unwrap_or_default();
+                            let _ = response_tx.send(delta);
                         }
                     });
                 }
