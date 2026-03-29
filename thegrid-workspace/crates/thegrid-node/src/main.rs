@@ -16,6 +16,7 @@ use thegrid_runtime::AppRuntime;
 
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
 const SIGNATURE_LINE: &str = "> Powered and Designed by: sinergias.lagrieta.es";
+const LAST_UPDATE_ENV: &str = "THEGRID_LAST_UPDATE";
 
 const ANSI_RESET: &str = "\x1B[0m";
 const ANSI_BOLD: &str = "\x1B[1m";
@@ -27,6 +28,11 @@ const ANSI_WHITE: &str = "\x1B[37m";
 struct ReleaseInfo {
     tag_name: String,
     html_url: String,
+}
+
+enum GitUpdateOutcome {
+    UpToDate { head: String },
+    Updated { from: String, to: String },
 }
 
 fn parse_version_tag(tag: &str) -> Option<Version> {
@@ -74,7 +80,7 @@ fn prompt_yes_no(prompt: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-fn try_git_update() -> Result<String> {
+fn try_git_update() -> Result<GitUpdateOutcome> {
     let probe = Command::new("git")
         .arg("rev-parse")
         .arg("--is-inside-work-tree")
@@ -124,9 +130,12 @@ fn try_git_update() -> Result<String> {
     let after_head = String::from_utf8_lossy(&after.stdout).trim().to_string();
 
     if before_head == after_head {
-        Ok(format!("Already up to date ({})", after_head))
+        Ok(GitUpdateOutcome::UpToDate { head: after_head })
     } else {
-        Ok(format!("Updated {} -> {}", before_head, after_head))
+        Ok(GitUpdateOutcome::Updated {
+            from: before_head,
+            to: after_head,
+        })
     }
 }
 
@@ -171,7 +180,7 @@ fn try_rebuild_node() -> Result<String> {
     Ok("Build completed for thegrid-node".to_string())
 }
 
-fn restart_current_node_process() -> Result<String> {
+fn restart_current_node_process(updated_from_to: Option<(&str, &str)>) -> Result<String> {
     let exe = std::env::current_exe()?;
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -180,12 +189,16 @@ fn restart_current_node_process() -> Result<String> {
         args.push("--skip-update-check".to_string());
     }
 
-    let direct = Command::new(&exe)
+    let mut direct_cmd = Command::new(&exe);
+    direct_cmd
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn();
+        .stderr(Stdio::inherit());
+    if let Some((from, to)) = updated_from_to {
+        direct_cmd.env(LAST_UPDATE_ENV, format!("{}:{}", from, to));
+    }
+    let direct = direct_cmd.spawn();
 
     match direct {
         Ok(_) => {
@@ -194,7 +207,8 @@ fn restart_current_node_process() -> Result<String> {
         Err(direct_err) => {
             // Fallback: if direct binary path is unavailable (common in some cargo-run layouts),
             // relaunch through cargo from current workspace.
-            let fallback = Command::new("cargo")
+            let mut fallback_cmd = Command::new("cargo");
+            fallback_cmd
                 .arg("run")
                 .arg("-p")
                 .arg("thegrid-node")
@@ -202,8 +216,11 @@ fn restart_current_node_process() -> Result<String> {
                 .arg("--skip-update-check")
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .spawn();
+                .stderr(Stdio::inherit());
+            if let Some((from, to)) = updated_from_to {
+                fallback_cmd.env(LAST_UPDATE_ENV, format!("{}:{}", from, to));
+            }
+            let fallback = fallback_cmd.spawn();
 
             match fallback {
                 Ok(_) => {
@@ -626,6 +643,17 @@ fn main() -> Result<()> {
 
     let ui_state = Arc::new(Mutex::new(TuiState::new()));
     emit(&ui_state, tui_mode, "✓", "BOOT", "Configuration loaded");
+    if let Ok(v) = std::env::var(LAST_UPDATE_ENV) {
+        if let Some((from, to)) = v.split_once(':') {
+            emit(
+                &ui_state,
+                tui_mode,
+                "✓",
+                "UPDATE",
+                format!("> Version updated {} to {} successfully", from, to),
+            );
+        }
+    }
 
     if !skip_update_check {
         match check_latest_release() {
@@ -653,8 +681,11 @@ fn main() -> Result<()> {
 
                 if should_update {
                     match try_git_update() {
-                        Ok(msg) => {
-                            emit(&ui_state, tui_mode, "✓", "UPDATE", msg);
+                        Ok(GitUpdateOutcome::UpToDate { head }) => {
+                            emit(&ui_state, tui_mode, "✓", "UPDATE", format!("Version at latest version : {}", head));
+                        }
+                        Ok(GitUpdateOutcome::Updated { from, to }) => {
+                            emit(&ui_state, tui_mode, "✓", "UPDATE", format!("Updated {} -> {}", from, to));
                             emit(&ui_state, tui_mode, "ℹ", "UPDATE", "Restart node to run latest release.");
                             return Ok(());
                         }
@@ -822,30 +853,33 @@ fn main() -> Result<()> {
                 "gitupdate" => {
                     emit(&ui_state, tui_mode, "↻", "GIT", "Fetching + fast-forward pull...");
                     match try_git_update() {
-                        Ok(msg) => {
-                            emit(&ui_state, tui_mode, "✓", "GIT", msg);
+                        Ok(GitUpdateOutcome::UpToDate { head }) => {
+                            emit(&ui_state, tui_mode, "✓", "GIT", format!("Version at latest version : {}", head));
+                        }
+                        Ok(GitUpdateOutcome::Updated { from, to }) => {
+                            emit(&ui_state, tui_mode, "✓", "GIT", format!("Updated {} -> {}", from, to));
                             emit(&ui_state, tui_mode, "↻", "BUILD", "Rebuilding thegrid-node...");
                             match try_rebuild_node() {
                                 Ok(build_msg) => {
                                     emit(&ui_state, tui_mode, "✓", "BUILD", build_msg);
                                     emit(&ui_state, tui_mode, "↻", "RESTART", "Launching updated node process...");
-                                    match restart_current_node_process() {
+                                    match restart_current_node_process(Some((&from, &to))) {
                                         Ok(msg) => {
                                             emit(&ui_state, tui_mode, "✓", "RESTART", msg);
                                             emit(&ui_state, tui_mode, "✓", "RESTART", "Closing old process...");
                                             running.store(false, Ordering::Relaxed);
                                         }
                                         Err(e) => {
-                                            emit(&ui_state, tui_mode, "⚠", "RESTART", format!("Restart failed: {}", e));
+                                            emit(&ui_state, tui_mode, "⚠", "RESTART", format!("> Update Failed Check logs: {}", e));
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    emit(&ui_state, tui_mode, "⚠", "BUILD", format!("Rebuild failed: {}", e));
+                                    emit(&ui_state, tui_mode, "⚠", "BUILD", format!("> Update Failed Check logs: {}", e));
                                 }
                             }
                         }
-                        Err(e) => emit(&ui_state, tui_mode, "⚠", "GIT", format!("Update failed: {}", e)),
+                        Err(e) => emit(&ui_state, tui_mode, "⚠", "GIT", format!("> Update Failed Check logs: {}", e)),
                     }
                 }
                 "quit" | "exit" => {
