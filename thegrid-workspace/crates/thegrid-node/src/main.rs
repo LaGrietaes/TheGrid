@@ -24,6 +24,34 @@ const ANSI_DIM: &str = "\x1B[2m";
 const ANSI_GREEN: &str = "\x1B[32m";
 const ANSI_WHITE: &str = "\x1B[37m";
 
+// S2-C1: command registry metadata used by help output and TUI hints.
+const COMMAND_REGISTRY: &[(&str, &str)] = &[
+    ("help", "Show command list"),
+    ("devices", "Refresh connected device list"),
+    ("ping <ip|#>", "Ping device + agent"),
+    ("pingdev <ip|#>", "Ping device endpoint"),
+    ("pingagent <ip|#>", "Ping agent endpoint"),
+    ("history | !! | !N", "Command history and replay"),
+    ("update", "Check latest release"),
+    ("gitupdate", "Fetch, pull, build, restart"),
+    ("quit", "Stop node"),
+];
+
+fn command_hint_lines(max_lines: usize) -> Vec<String> {
+    COMMAND_REGISTRY
+        .iter()
+        .take(max_lines)
+        .map(|(usage, _)| format!("  {}", usage))
+        .collect()
+}
+
+fn command_help_lines() -> Vec<String> {
+    COMMAND_REGISTRY
+        .iter()
+        .map(|(usage, desc)| format!("{} - {}", usage, desc))
+        .collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
     tag_name: String,
@@ -406,18 +434,9 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         ];
     }
 
-    let mut commands = vec![
-        "COMMANDS".to_string(),
-        "  help".to_string(),
-        "  devices".to_string(),
-        "  ping <ip|#> (device+agent)".to_string(),
-        "  pingdev <ip|#>".to_string(),
-        "  pingagent <ip|#>".to_string(),
-        "  history | !! | !N".to_string(),
-        "  update (release check)".to_string(),
-        "  quit".to_string(),
-        "CONNECTED".to_string(),
-    ];
+    let mut commands = vec!["COMMANDS".to_string()];
+    commands.extend(command_hint_lines(8));
+    commands.push("CONNECTED".to_string());
 
     let mut dev_commands = vec![
         "DEV COMMANDS".to_string(),
@@ -781,7 +800,9 @@ fn main() -> Result<()> {
 
             match parts[0].to_ascii_lowercase().as_str() {
                 "help" => {
-                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | gitupdate | history | !! | !N | update | quit");
+                    for line in command_help_lines() {
+                        emit(&ui_state, tui_mode, "ℹ", "CMD", line);
+                    }
                 }
                 "devices" => {
                     runtime.spawn_load_devices();
