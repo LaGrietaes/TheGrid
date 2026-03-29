@@ -163,6 +163,49 @@ Implementation guidance:
 
 ---
 
+## 1.5 CRUNCH TIME SESSION PROTOCOL (FAST + SAFE)
+
+Objective:
+- Move fast without regressions by sequencing high-risk work first and requiring lightweight proof at each step.
+
+Execution order (mandatory):
+1. Security gating and endpoint capability checks
+2. Operator observability (sync health, tombstones, detection source)
+3. Reliability/performance hardening on large trees and rename storms
+4. Incremental CLI expansion (one command group per PR)
+
+PR slicing rules:
+- One risk domain per PR.
+- Max 1 command group per CLI PR.
+- Every PR must include rollback note and smoke checklist.
+- No bulk parser rewrites in node TUI.
+
+Minimum acceptance gates per PR:
+- Build: `cargo check --workspace`
+- Node: `cargo check -p thegrid-node`
+- Manual smoke (node TUI): `help`, `devices`, `ping`, `history`, `update`, `quit`
+- Sync safety: no stale resurrection after delete/tombstone scenarios
+
+Test matrix for reliability sprint:
+- Rename storm in watched directory (rapid rename loops)
+- Recursive directory move across watched roots
+- Offline/online reconnect with delayed sync replay
+- High file-count indexing run with queue backlog pressure
+
+Low-token / high-speed execution policy:
+- Prefer short progress updates with only deltas.
+- Reuse existing helper APIs before introducing new abstractions.
+- Run focused checks first (`-p` crate), full workspace checks at integration points.
+- Keep code edits minimal; avoid formatting churn in unrelated files.
+
+Definition of done for crunch block:
+- Security toggles enforced server-side
+- GUI exposes sync and tombstone health
+- Reliability matrix passes without data-loss regressions
+- First safe CLI increment shipped with rollback checkpoint
+
+---
+
 ## 2. PHASE 4 IMPLEMENTATION PLAN
 
 ### 4A. Visual Identity — TheGrid FUI (PRIORITY: HIGH)
