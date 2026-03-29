@@ -263,9 +263,17 @@ fn pulse_frame(elapsed: Duration) -> &'static str {
     }
 }
 
-fn render_labeled_line(left: &str, right: &str, left_w: usize, right_w: usize, right_color: &str) {
+fn render_labeled_line(
+    left: &str,
+    right: &str,
+    left_w: usize,
+    right_w: usize,
+    left_color: &str,
+    right_color: &str,
+) {
     println!(
-        "{ANSI_GREEN}║{ANSI_RESET} {ANSI_WHITE}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
+        "{ANSI_GREEN}║{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
+        left_color,
         trim_fit(left, left_w),
         right_color,
         trim_fit(right, right_w),
@@ -298,11 +306,12 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
     let uptime = state.started_at.elapsed().as_secs();
     let pulse = pulse_frame(state.started_at.elapsed());
     let mut left = vec![
-        format!("{} _____ _   _ _____ ____ ___ ____", pulse),
-        "|_   _| | | | ____/ ___|_ _|  _ \\".to_string(),
-        "  | | | |_| |  _|| |  _ | || | | |".to_string(),
-        "  | | |  _  | |__| |_| || || |_| |".to_string(),
-        "  |_| |_| |_|_____\\____|___|____/".to_string(),
+        format!("{} ████████╗██╗  ██╗███████╗ ██████╗ ██████╗ ██╗██████╗", pulse),
+        "   ╚══██╔══╝██║  ██║██╔════╝██╔════╝ ██╔══██╗██║██╔══██╗".to_string(),
+        "      ██║   ███████║█████╗  ██║  ███╗██████╔╝██║██║  ██║".to_string(),
+        "      ██║   ██╔══██║██╔══╝  ██║   ██║██╔══██╗██║██║  ██║".to_string(),
+        "      ██║   ██║  ██║███████╗╚██████╔╝██║  ██║██║██████╔╝".to_string(),
+        "      ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝╚═════╝".to_string(),
         format!("NODE v{}", env!("CARGO_PKG_VERSION")),
         format!("Device: {device_name}"),
         format!("Agent Port: {port}"),
@@ -311,8 +320,10 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         format!("Last: {}", state.last_status),
     ];
 
+    let mut logo_rows = 7usize;
     // Keep key runtime fields near the bottom when width is tight.
     if left_w < 52 {
+        logo_rows = 1;
         left = vec![
             format!("{} TG NODE v{}", pulse, env!("CARGO_PKG_VERSION")),
             format!("Device: {device_name}"),
@@ -371,7 +382,9 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         let d = dev_commands.get(i).map_or("", |s| s.as_str());
         let r = format!("{} │ {}", trim_fit(c, cmd_w), trim_fit(d, dev_w));
         let right_color = if i == 0 { ANSI_BOLD } else { ANSI_WHITE };
-        if i == 5 {
+        let left_color = if i < logo_rows { ANSI_GREEN } else { ANSI_WHITE };
+        let status_idx = left.len().saturating_sub(1);
+        if i == status_idx {
             println!(
                 "{ANSI_GREEN}║{ANSI_RESET} {status_c}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
                 trim_fit(l, left_w),
@@ -380,7 +393,7 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
                 status_c = status_color(&state.last_status),
             );
         } else {
-            render_labeled_line(l, &r, left_w, right_w, right_color);
+            render_labeled_line(l, &r, left_w, right_w, left_color, right_color);
         }
     }
     println!("{ANSI_GREEN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
