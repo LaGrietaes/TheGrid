@@ -1016,9 +1016,13 @@ impl Database {
         }
 
         self.insert_tombstone(tombstone)?;
+        let path = tombstone.path.to_string_lossy().to_string();
+        let (exact, win_like, unix_like) = path_match_patterns(&path);
         let deleted = self.conn.execute(
-            "DELETE FROM files WHERE device_id = ?1 AND path = ?2",
-            params![tombstone.device_id, tombstone.path.to_string_lossy().to_string()],
+            "DELETE FROM files
+             WHERE device_id = ?1
+               AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
+            params![tombstone.device_id, exact, win_like, unix_like],
         )?;
         Ok(deleted > 0)
     }
@@ -1160,19 +1164,27 @@ impl Database {
     }
 
     fn get_tombstone_timestamp(&self, device_id: &str, path: &Path) -> Result<Option<i64>> {
+        let path = path.to_string_lossy().to_string();
+        let (exact, win_like, unix_like) = path_match_patterns(&path);
         self.conn.query_row(
-            "SELECT deleted_at FROM file_tombstones WHERE device_id = ?1 AND path = ?2",
-            params![device_id, path.to_string_lossy().to_string()],
+            "SELECT MAX(deleted_at)
+             FROM file_tombstones
+             WHERE device_id = ?1
+               AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
+            params![device_id, exact, win_like, unix_like],
             |row| row.get(0),
         ).optional().map_err(Into::into)
     }
 
     fn get_existing_index_timestamp(&self, device_id: &str, path: &Path) -> Result<Option<i64>> {
+        let path = path.to_string_lossy().to_string();
+        let (exact, win_like, unix_like) = path_match_patterns(&path);
         self.conn.query_row(
             "SELECT MAX(indexed_at, COALESCE(modified, indexed_at))
              FROM files
-             WHERE device_id = ?1 AND path = ?2",
-            params![device_id, path.to_string_lossy().to_string()],
+             WHERE device_id = ?1
+               AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
+            params![device_id, exact, win_like, unix_like],
             |row| row.get(0),
         ).optional().map_err(Into::into)
     }
