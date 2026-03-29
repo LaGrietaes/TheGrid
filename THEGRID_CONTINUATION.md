@@ -72,6 +72,76 @@ mv wormhole-workspace thegrid-workspace
 
 ### ⬜ Phase 4 — AI + Security + FUI Polish (YOU ARE HERE)
 
+### ✅ Node UX Addendum — Headless Control Surface (NEW)
+
+The headless binary now includes a split terminal control surface to improve
+tablet operations without GUI:
+
+- Upper row, 2 columns:
+    - Runtime summary (version, device, port, uptime, ping stats, last status)
+    - Live command hints + connected device list
+- Lower row, 1 column:
+    - Rolling event log feed (watcher, sync, transfer, AI, config)
+- Integrated command prompt for node operations
+
+Implemented commands (current):
+- `help`
+- `devices` (refreshes tailnet device list)
+- `ping <ip|index>` (index maps to connected list)
+- `update` (checks latest release)
+- `history`, `!!`, `!N` (command history / replay)
+- `quit`
+
+Current constraints:
+- Keeps terminal rendering simple and stable on Termux
+- Uses Unicode box drawing and symbols (no heavy TUI dependency)
+- Supports `--plain` mode for fallback logging
+
+---
+
+### Recommended Next Functions (After Main Project Features Land)
+
+These are high-value node-side commands to add once backend endpoints and runtime hooks are complete:
+
+1. Mesh + Node Management
+- `mesh status` -> summary of reachable nodes, last ping, sync age
+- `mesh sync <all|node>` -> force index sync now
+- `node select <index>` -> set active target for subsequent commands
+
+2. File Ops
+- `files list <node> [path]`
+- `files pull <node> <remote_path> [dest]`
+- `files push <node> <local_path>`
+
+3. Clipboard + Transfer
+- `clip send <node> <text>`
+- `clip get <node>`
+- `transfer queue` and `transfer cancel <id>`
+
+4. AI / Semantic (when phase wiring is complete)
+- `ai status`
+- `ai search <query> [k]`
+- `ai embed <text>`
+
+5. Remote Command/Terminal (when secure endpoint is finalized)
+- `exec <node> <command>`
+- `shell <node>`
+
+6. Device Lifecycle + Recovery
+- `wol <node>`
+- `adb enable <node>`
+- `rdp enable <node>` (where supported)
+
+7. Operations / Observability
+- `logs tail [component]`
+- `health` (service, DB, network, API key diagnostics)
+- `config show|set <key> <value>`
+
+Implementation guidance:
+- Reuse `AppEvent` and `AppRuntime` spawners first; avoid direct network logic in the CLI parser.
+- Keep commands idempotent and script-friendly for Termux automation.
+- Add a command registry table so future subcommands do not bloat `main.rs`.
+
 ---
 
 ## 2. PHASE 4 IMPLEMENTATION PLAN

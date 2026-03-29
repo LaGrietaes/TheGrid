@@ -3,9 +3,12 @@ use chrono::Local;
 use semver::Version;
 use serde::Deserialize;
 
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 use thegrid_core::{AppEvent, Config};
 use thegrid_runtime::AppRuntime;
 
@@ -97,6 +100,167 @@ fn event_line(icon: &str, label: &str, message: impl AsRef<str>) {
     println!("{} {} {:<12} {}", ts(), icon, label, message.as_ref());
 }
 
+#[derive(Debug)]
+struct TuiState {
+    started_at: Instant,
+    last_status: String,
+    recent_logs: VecDeque<String>,
+    devices: Vec<(String, String)>, // (display_name, ip)
+    ping_ok: u64,
+    ping_fail: u64,
+    command_history: VecDeque<String>,
+}
+
+impl TuiState {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_status: "READY".to_string(),
+            recent_logs: VecDeque::with_capacity(256),
+            devices: Vec::new(),
+            ping_ok: 0,
+            ping_fail: 0,
+            command_history: VecDeque::with_capacity(128),
+        }
+    }
+
+    fn push_log(&mut self, line: String) {
+        self.recent_logs.push_back(line);
+        while self.recent_logs.len() > 200 {
+            let _ = self.recent_logs.pop_front();
+        }
+    }
+
+    fn push_cmd_history(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            return;
+        }
+        if self.command_history.back().map(|c| c == cmd).unwrap_or(false) {
+            return;
+        }
+        self.command_history.push_back(cmd.to_string());
+        while self.command_history.len() > 100 {
+            let _ = self.command_history.pop_front();
+        }
+    }
+}
+
+fn term_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.max(80))
+        .unwrap_or(110)
+}
+
+fn trim_fit(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return format!("{s:<width$}");
+    }
+    if width <= 1 {
+        return "".to_string();
+    }
+    let mut out = String::new();
+    for c in s.chars().take(width - 1) {
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+fn render_tui(state: &TuiState, device_name: &str, port: u16) {
+    let width = term_width();
+    let left_w = (width.saturating_sub(7)) / 2;
+    let right_w = width.saturating_sub(7).saturating_sub(left_w);
+    let lower_w = width.saturating_sub(4);
+
+    print!("\x1B[2J\x1B[H");
+
+    let uptime = state.started_at.elapsed().as_secs();
+    let left = vec![
+        format!("THE GRID NODE v{}", env!("CARGO_PKG_VERSION")),
+        format!("Device: {device_name}"),
+        format!("Agent Port: {port}"),
+        format!("Uptime: {}s", uptime),
+        format!("Ping OK/Fail: {}/{}", state.ping_ok, state.ping_fail),
+        format!("Last: {}", state.last_status),
+    ];
+
+    let mut right = vec![
+        "Commands".to_string(),
+        "  help".to_string(),
+        "  devices".to_string(),
+        "  ping <ip|#>".to_string(),
+        "  history | !! | !N".to_string(),
+        "  update".to_string(),
+        "  quit".to_string(),
+        "Connected".to_string(),
+    ];
+
+    for (idx, (name, ip)) in state.devices.iter().take(5).enumerate() {
+        right.push(format!("  {}. {} ({})", idx + 1, name, ip));
+    }
+    if state.devices.is_empty() {
+        right.push("  none yet (run: devices)".to_string());
+    }
+
+    let upper_lines = left.len().max(right.len());
+    println!("╔{}╦{}╗", "═".repeat(left_w + 2), "═".repeat(right_w + 2));
+    for i in 0..upper_lines {
+        let l = left.get(i).map_or("", |s| s.as_str());
+        let r = right.get(i).map_or("", |s| s.as_str());
+        println!("║ {} │ {} ║", trim_fit(l, left_w), trim_fit(r, right_w));
+    }
+    println!("╠{}╣", "═".repeat(width.saturating_sub(2)));
+
+    let max_logs = 12usize;
+    let start = state.recent_logs.len().saturating_sub(max_logs);
+    for line in state.recent_logs.iter().skip(start) {
+        println!("║ {} ║", trim_fit(line, lower_w));
+    }
+    for _ in state.recent_logs.iter().skip(start).count()..max_logs {
+        println!("║ {} ║", " ".repeat(lower_w));
+    }
+
+    println!("╠{}╣", "═".repeat(width.saturating_sub(2)));
+    println!("║ {} ║", trim_fit("Type command then Enter (help for list, history for recall)", lower_w));
+    println!("╚{}╝", "═".repeat(width.saturating_sub(2)));
+    print!("> ");
+    let _ = io::stdout().flush();
+}
+
+fn emit(state: &Arc<Mutex<TuiState>>, tui_mode: bool, icon: &str, label: &str, message: impl AsRef<str>) {
+    let message = message.as_ref().to_string();
+    if !tui_mode {
+        event_line(icon, label, &message);
+    }
+
+    if let Ok(mut s) = state.lock() {
+        s.last_status = format!("{} {}", label, message);
+        s.push_log(format!("{} {} {:<10} {}", ts(), icon, label, message));
+    }
+}
+
+fn spawn_command_reader(cmd_tx: mpsc::Sender<String>, running: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let stdin = io::stdin();
+        while running.load(Ordering::Relaxed) {
+            let mut line = String::new();
+            if stdin.read_line(&mut line).is_err() {
+                continue;
+            }
+            let cmd = line.trim().to_string();
+            if cmd.is_empty() {
+                continue;
+            }
+            if cmd_tx.send(cmd).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn main() -> Result<()> {
     // Initialize logging
     env_logger::Builder::from_env(
@@ -125,6 +289,9 @@ fn main() -> Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let mut auto_update = std::env::var("THEGRID_AUTO_UPDATE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut plain_mode = std::env::var("THEGRID_PLAIN")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let mut i = 1;
@@ -156,6 +323,9 @@ fn main() -> Result<()> {
             "--yes-update" => {
                 auto_update = true;
             }
+            "--plain" => {
+                plain_mode = true;
+            }
             _ => {
                 log::warn!("Unknown argument: {}", args[i]);
             }
@@ -175,10 +345,16 @@ fn main() -> Result<()> {
     print_banner(&config.device_name, config.agent_port);
     event_line("✓", "BOOT", "Configuration loaded");
 
+    let tui_mode = !plain_mode && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let ui_state = Arc::new(Mutex::new(TuiState::new()));
+    emit(&ui_state, tui_mode, "✓", "BOOT", "Configuration loaded");
+
     if !skip_update_check {
         match check_latest_release() {
             Ok(Some(release)) => {
-                event_line(
+                emit(
+                    &ui_state,
+                    tui_mode,
                     "⬆",
                     "UPDATE",
                     format!(
@@ -187,7 +363,7 @@ fn main() -> Result<()> {
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
-                event_line("ℹ", "UPDATE", format!("Release: {}", release.html_url));
+                emit(&ui_state, tui_mode, "ℹ", "UPDATE", format!("Release: {}", release.html_url));
 
                 let should_update = if auto_update {
                     true
@@ -200,16 +376,16 @@ fn main() -> Result<()> {
                 if should_update {
                     match try_git_update() {
                         Ok(_) => {
-                            event_line("✓", "UPDATE", "Repository updated. Restart node to run latest release.");
+                            emit(&ui_state, tui_mode, "✓", "UPDATE", "Repository updated. Restart node to run latest release.");
                             return Ok(());
                         }
                         Err(e) => {
-                            event_line("⚠", "UPDATE", format!("Auto-update failed: {}", e));
-                            event_line("ℹ", "UPDATE", "You can continue now and update later.");
+                            emit(&ui_state, tui_mode, "⚠", "UPDATE", format!("Auto-update failed: {}", e));
+                            emit(&ui_state, tui_mode, "ℹ", "UPDATE", "You can continue now and update later.");
                         }
                     }
                 } else {
-                    event_line("⏭", "UPDATE", "Skipped for now");
+                    emit(&ui_state, tui_mode, "⏭", "UPDATE", "Skipped for now");
                 }
             }
             Ok(None) => {
@@ -226,15 +402,136 @@ fn main() -> Result<()> {
     let runtime = AppRuntime::new(config, tx)?;
     runtime.start_services();
 
-    event_line("▶", "RUNTIME", "Services started. Press Ctrl+C to stop.");
+    emit(&ui_state, tui_mode, "▶", "RUNTIME", "Services started. Press Ctrl+C to stop.");
+
+    let running = Arc::new(AtomicBool::new(true));
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+    if tui_mode {
+        spawn_command_reader(cmd_tx, Arc::clone(&running));
+    }
+    let mut last_render = Instant::now();
+
+    if tui_mode {
+        if let Ok(s) = ui_state.lock() {
+            render_tui(&s, &runtime.config.lock().unwrap().device_name, runtime.config.lock().unwrap().agent_port);
+        }
+    }
 
     // Simple loop to handle events
-    loop {
+    while running.load(Ordering::Relaxed) {
+        while let Ok(cmd_line) = cmd_rx.try_recv() {
+            let mut effective_cmd = cmd_line.trim().to_string();
+            if effective_cmd == "!!" {
+                if let Ok(s) = ui_state.lock() {
+                    if let Some(last) = s.command_history.back() {
+                        effective_cmd = last.clone();
+                    } else {
+                        emit(&ui_state, tui_mode, "⚠", "CMD", "No command history yet");
+                        continue;
+                    }
+                }
+            } else if let Some(n_str) = effective_cmd.strip_prefix('!') {
+                if let Ok(n) = n_str.parse::<usize>() {
+                    if let Ok(s) = ui_state.lock() {
+                        if n == 0 || n > s.command_history.len() {
+                            emit(&ui_state, tui_mode, "⚠", "CMD", format!("History index out of range: {}", n));
+                            continue;
+                        }
+                        effective_cmd = s.command_history[n - 1].clone();
+                    }
+                }
+            }
+
+            if let Ok(mut s) = ui_state.lock() {
+                s.push_cmd_history(&effective_cmd);
+            }
+
+            let parts: Vec<&str> = effective_cmd.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+
+            match parts[0].to_ascii_lowercase().as_str() {
+                "help" => {
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | history | !! | !N | update | quit");
+                }
+                "devices" => {
+                    runtime.spawn_load_devices();
+                    emit(&ui_state, tui_mode, "↻", "CMD", "Refreshing connected device list...");
+                }
+                "ping" => {
+                    if let Some(target) = parts.get(1) {
+                        if let Ok(idx) = target.parse::<usize>() {
+                            if let Ok(s) = ui_state.lock() {
+                                if idx == 0 || idx > s.devices.len() {
+                                    emit(&ui_state, tui_mode, "⚠", "CMD", format!("Device index {} not found", idx));
+                                } else {
+                                    let (name, ip) = s.devices[idx - 1].clone();
+                                    runtime.spawn_ping(ip.clone(), true);
+                                    emit(&ui_state, tui_mode, "◎", "CMD", format!("Pinging #{} {} ({})", idx, name, ip));
+                                }
+                            }
+                        } else {
+                            runtime.spawn_ping((*target).to_string(), true);
+                            emit(&ui_state, tui_mode, "◎", "CMD", format!("Pinging {}", target));
+                        }
+                    } else {
+                        emit(&ui_state, tui_mode, "⚠", "CMD", "Usage: ping <ip|device_index>");
+                    }
+                }
+                "history" => {
+                    if let Ok(s) = ui_state.lock() {
+                        if s.command_history.is_empty() {
+                            emit(&ui_state, tui_mode, "ℹ", "HISTORY", "No commands in history yet");
+                        } else {
+                            for (idx, cmd) in s.command_history.iter().enumerate() {
+                                emit(&ui_state, tui_mode, "·", "HISTORY", format!("{}: {}", idx + 1, cmd));
+                            }
+                        }
+                    }
+                }
+                "update" => {
+                    match check_latest_release() {
+                        Ok(Some(release)) => {
+                            emit(
+                                &ui_state,
+                                tui_mode,
+                                "⬆",
+                                "UPDATE",
+                                format!("New release {} available: {}", release.tag_name, release.html_url),
+                            );
+                        }
+                        Ok(None) => emit(&ui_state, tui_mode, "✓", "UPDATE", "Already up to date"),
+                        Err(e) => emit(&ui_state, tui_mode, "⚠", "UPDATE", format!("Check failed: {}", e)),
+                    }
+                }
+                "quit" | "exit" => {
+                    emit(&ui_state, tui_mode, "■", "CMD", "Stopping node...");
+                    running.store(false, Ordering::Relaxed);
+                }
+                other => {
+                    emit(&ui_state, tui_mode, "⚠", "CMD", format!("Unknown command: {}", other));
+                }
+            }
+        }
+
         // Drain events
         while let Ok(event) = rx.try_recv() {
             match event {
+                AppEvent::DevicesLoaded(devices) => {
+                    if let Ok(mut s) = ui_state.lock() {
+                        s.devices = devices
+                            .iter()
+                            .filter_map(|d| d.primary_ip().map(|ip| (d.display_name().to_string(), ip.to_string())))
+                            .collect();
+                    }
+                    emit(&ui_state, tui_mode, "✓", "DEVICES", format!("Loaded {} devices", devices.len()));
+                }
+                AppEvent::DevicesFailed(err) => {
+                    emit(&ui_state, tui_mode, "⚠", "DEVICES", format!("Load failed: {}", err));
+                }
                 AppEvent::SyncRequest { after, response_tx } => {
-                    event_line("⇄", "SYNC", format!("Incoming sync request (after={})", after));
+                    emit(&ui_state, tui_mode, "⇄", "SYNC", format!("Incoming sync request (after={})", after));
                     if let Ok(guard) = runtime.db.lock() {
                         match guard.get_files_after(after) {
                             Ok(results) => {
@@ -248,12 +545,12 @@ fn main() -> Result<()> {
                     }
                 }
                 AppEvent::FileSystemChanged { paths, summary } => {
-                    event_line("Δ", "WATCHER", format!("{} ({} paths)", summary, paths.len()));
+                    emit(&ui_state, tui_mode, "Δ", "WATCHER", format!("{} ({} paths)", summary, paths.len()));
                     runtime.spawn_incremental_index(paths);
                 }
                 AppEvent::ClipboardReceived(entry) => {
                     let preview: String = entry.content.chars().take(80).collect();
-                    event_line("📋", "CLIPBOARD", format!("from {}: {}", entry.sender, preview));
+                    emit(&ui_state, tui_mode, "⎘", "CLIPBOARD", format!("from {}: {}", entry.sender, preview));
                     
                     // Attempt to set Termux clipboard if running on Android
                     #[cfg(target_os = "linux")]
@@ -267,22 +564,22 @@ fn main() -> Result<()> {
                     }
                 }
                 AppEvent::FileReceived { name, size } => {
-                    event_line("📥", "TRANSFER", format!("{} ({} bytes)", name, size));
+                    emit(&ui_state, tui_mode, "↓", "TRANSFER", format!("{} ({} bytes)", name, size));
                 }
                 AppEvent::RemoteAiEmbedRequest { text, response_tx } => {
-                    event_line("🧠", "AI", format!("Embedding request ({} chars)", text.len()));
+                    emit(&ui_state, tui_mode, "◇", "AI", format!("Embedding request ({} chars)", text.len()));
                     runtime.handle_remote_ai_embed(text, response_tx);
                 }
                 AppEvent::RemoteAiSearchRequest { query, k, response_tx } => {
-                    event_line("🔎", "AI", format!("Search request k={} query='{}'", k, query));
+                    emit(&ui_state, tui_mode, "◈", "AI", format!("Search request k={} query='{}'", k, query));
                     runtime.handle_remote_ai_search(query, k, response_tx);
                 }
                 AppEvent::RefreshAiServices => {
-                    event_line("↻", "AI", "Refreshing AI services");
+                    emit(&ui_state, tui_mode, "↻", "AI", "Refreshing AI services");
                     runtime.refresh_ai_services();
                 }
                 AppEvent::EnableAdb { .. } => {
-                    event_line("📱", "ADB", "Enabling ADB over TCP/IP (port 5555)");
+                    emit(&ui_state, tui_mode, "⇢", "ADB", "Enabling ADB over TCP/IP (port 5555)");
                     match std::process::Command::new("adb")
                         .arg("tcpip")
                         .arg("5555")
@@ -306,21 +603,27 @@ fn main() -> Result<()> {
                 }
                 AppEvent::AgentPingOk { ip, response, manual } => {
                     if manual {
-                        event_line("✓", "PING", format!("{} OK (auth={})", ip, response.authorized));
+                        if let Ok(mut s) = ui_state.lock() {
+                            s.ping_ok += 1;
+                        }
+                        emit(&ui_state, tui_mode, "✓", "PING", format!("{} OK (auth={})", ip, response.authorized));
                     }
                 }
                 AppEvent::AgentPingFailed { ip, error, manual } => {
                     if manual {
-                        event_line("⚠", "PING", format!("{} failed: {}", ip, error));
+                        if let Ok(mut s) = ui_state.lock() {
+                            s.ping_fail += 1;
+                        }
+                        emit(&ui_state, tui_mode, "⚠", "PING", format!("{} failed: {}", ip, error));
                     }
                 }
                 AppEvent::IndexProgress { scanned, total, current, .. } => {
                     if total > 0 {
-                        event_line("◷", "INDEX", format!("{}/{} [{}]", scanned, total, current));
+                        emit(&ui_state, tui_mode, "◷", "INDEX", format!("{}/{} [{}]", scanned, total, current));
                     }
                 }
                 AppEvent::IndexComplete { files_added, duration_ms, .. } => {
-                    event_line("✓", "INDEX", format!("Complete: {} files in {} ms", files_added, duration_ms));
+                    emit(&ui_state, tui_mode, "✓", "INDEX", format!("Complete: {} files in {} ms", files_added, duration_ms));
                 }
                 AppEvent::Status(msg) => {
                     if msg.starts_with("config_update:") {
@@ -343,7 +646,7 @@ fn main() -> Result<()> {
                         if url.is_some() { cfg.ai_provider_url = url; changed = true; }
                         
                         if changed {
-                            event_line("⚙", "CONFIG", "Received remote config update");
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", "Received remote config update");
                             let _ = cfg.save();
                             {
                                 let mut runtime_cfg = runtime.config.lock().unwrap();
@@ -364,6 +667,16 @@ fn main() -> Result<()> {
             }
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if tui_mode && last_render.elapsed() >= Duration::from_millis(700) {
+            if let Ok(s) = ui_state.lock() {
+                let cfg = runtime.config.lock().unwrap();
+                render_tui(&s, &cfg.device_name, cfg.agent_port);
+            }
+            last_render = Instant::now();
+        }
+
+        std::thread::sleep(Duration::from_millis(140));
     }
+
+    Ok(())
 }
