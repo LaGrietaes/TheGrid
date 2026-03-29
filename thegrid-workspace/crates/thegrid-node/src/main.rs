@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Local;
 use semver::Version;
 use serde::Deserialize;
+use terminal_size::{Width, terminal_size};
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -13,6 +14,15 @@ use thegrid_core::{AppEvent, Config};
 use thegrid_runtime::AppRuntime;
 
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
+
+const ANSI_RESET: &str = "\x1B[0m";
+const ANSI_BOLD: &str = "\x1B[1m";
+const ANSI_DIM: &str = "\x1B[2m";
+const ANSI_CYAN: &str = "\x1B[36m";
+const ANSI_GREEN: &str = "\x1B[32m";
+const ANSI_YELLOW: &str = "\x1B[33m";
+const ANSI_RED: &str = "\x1B[31m";
+const ANSI_WHITE: &str = "\x1B[37m";
 
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
@@ -147,11 +157,57 @@ impl TuiState {
 }
 
 fn term_width() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    terminal_size()
+        .map(|(Width(w), _)| w as usize)
+        .or_else(|| {
+            std::env::var("COLUMNS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        })
         .map(|v| v.max(80))
         .unwrap_or(110)
+}
+
+fn status_color(status: &str) -> &'static str {
+    let s = status.to_ascii_lowercase();
+    if s.contains("fail") || s.contains("error") {
+        ANSI_RED
+    } else if s.contains("warn") || s.contains("update") {
+        ANSI_YELLOW
+    } else {
+        ANSI_GREEN
+    }
+}
+
+fn log_color(line: &str) -> &'static str {
+    let s = line.to_ascii_lowercase();
+    if s.contains('⚠') || s.contains(" fail") || s.contains("error") {
+        ANSI_RED
+    } else if s.contains('↻') || s.contains("update") {
+        ANSI_YELLOW
+    } else if s.contains('✓') || s.contains(" ok") {
+        ANSI_GREEN
+    } else {
+        ANSI_WHITE
+    }
+}
+
+fn pulse_frame(elapsed: Duration) -> &'static str {
+    match (elapsed.as_millis() / 260) % 4 {
+        0 => "◴",
+        1 => "◷",
+        2 => "◶",
+        _ => "◵",
+    }
+}
+
+fn render_labeled_line(left: &str, right: &str, left_w: usize, right_w: usize, right_color: &str) {
+    println!(
+        "{ANSI_CYAN}║{ANSI_RESET} {ANSI_WHITE}{}{ANSI_RESET} {ANSI_CYAN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_CYAN}║{ANSI_RESET}",
+        trim_fit(left, left_w),
+        right_color,
+        trim_fit(right, right_w),
+    );
 }
 
 fn trim_fit(s: &str, width: usize) -> String {
@@ -178,8 +234,9 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
     print!("\x1B[2J\x1B[H");
 
     let uptime = state.started_at.elapsed().as_secs();
+    let pulse = pulse_frame(state.started_at.elapsed());
     let left = vec![
-        format!("THE GRID NODE v{}", env!("CARGO_PKG_VERSION")),
+        format!("{} THE GRID NODE v{}", pulse, env!("CARGO_PKG_VERSION")),
         format!("Device: {device_name}"),
         format!("Agent Port: {port}"),
         format!("Uptime: {}s", uptime),
@@ -206,27 +263,49 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
     }
 
     let upper_lines = left.len().max(right.len());
-    println!("╔{}╦{}╗", "═".repeat(left_w + 2), "═".repeat(right_w + 2));
+    println!(
+        "{ANSI_CYAN}╔{}╦{}╗{ANSI_RESET}",
+        "═".repeat(left_w + 2),
+        "═".repeat(right_w + 2)
+    );
     for i in 0..upper_lines {
         let l = left.get(i).map_or("", |s| s.as_str());
         let r = right.get(i).map_or("", |s| s.as_str());
-        println!("║ {} │ {} ║", trim_fit(l, left_w), trim_fit(r, right_w));
+        let right_color = if i == 0 || i == 7 { ANSI_BOLD } else { ANSI_GREEN };
+        if i == 5 {
+            println!(
+                "{ANSI_CYAN}║{ANSI_RESET} {status_c}{}{ANSI_RESET} {ANSI_CYAN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_CYAN}║{ANSI_RESET}",
+                trim_fit(l, left_w),
+                right_color,
+                trim_fit(r, right_w),
+                status_c = status_color(&state.last_status),
+            );
+        } else {
+            render_labeled_line(l, r, left_w, right_w, right_color);
+        }
     }
-    println!("╠{}╣", "═".repeat(width.saturating_sub(2)));
+    println!("{ANSI_CYAN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
 
     let max_logs = 12usize;
     let start = state.recent_logs.len().saturating_sub(max_logs);
     for line in state.recent_logs.iter().skip(start) {
-        println!("║ {} ║", trim_fit(line, lower_w));
+        println!(
+            "{ANSI_CYAN}║{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_CYAN}║{ANSI_RESET}",
+            log_color(line),
+            trim_fit(line, lower_w)
+        );
     }
     for _ in state.recent_logs.iter().skip(start).count()..max_logs {
-        println!("║ {} ║", " ".repeat(lower_w));
+        println!("{ANSI_CYAN}║{ANSI_RESET} {} {ANSI_CYAN}║{ANSI_RESET}", " ".repeat(lower_w));
     }
 
-    println!("╠{}╣", "═".repeat(width.saturating_sub(2)));
-    println!("║ {} ║", trim_fit("Type command then Enter (help for list, history for recall)", lower_w));
-    println!("╚{}╝", "═".repeat(width.saturating_sub(2)));
-    print!("> ");
+    println!("{ANSI_CYAN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
+    println!(
+        "{ANSI_CYAN}║{ANSI_RESET} {ANSI_DIM}{}{ANSI_RESET} {ANSI_CYAN}║{ANSI_RESET}",
+        trim_fit("Type command then Enter (help for list, history for recall)", lower_w)
+    );
+    println!("{ANSI_CYAN}╚{}╝{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
+    print!("{ANSI_BOLD}{ANSI_CYAN}> {ANSI_RESET}");
     let _ = io::stdout().flush();
 }
 
