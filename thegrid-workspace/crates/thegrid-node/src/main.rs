@@ -128,6 +128,47 @@ fn try_git_update() -> Result<String> {
     }
 }
 
+fn git_branch_head() -> Option<String> {
+    let branch_out = Command::new("git")
+        .arg("rev-parse")
+        .arg("--abbrev-ref")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !branch_out.status.success() {
+        return None;
+    }
+
+    let head_out = Command::new("git")
+        .arg("rev-parse")
+        .arg("--short")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !head_out.status.success() {
+        return None;
+    }
+
+    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
+    let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+    Some(format!("{} @ {}", branch, head))
+}
+
+fn try_rebuild_node() -> Result<String> {
+    let build = Command::new("cargo")
+        .arg("build")
+        .arg("-p")
+        .arg("thegrid-node")
+        .output()?;
+
+    if !build.status.success() {
+        let stderr = String::from_utf8_lossy(&build.stderr);
+        anyhow::bail!("cargo build failed: {}", stderr.trim());
+    }
+
+    Ok("Build completed for thegrid-node".to_string())
+}
+
 fn ts() -> String {
     Local::now().format("%H:%M:%S").to_string()
 }
@@ -256,14 +297,31 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
 
     let uptime = state.started_at.elapsed().as_secs();
     let pulse = pulse_frame(state.started_at.elapsed());
-    let left = vec![
-        format!("{} THE GRID NODE v{}", pulse, env!("CARGO_PKG_VERSION")),
+    let mut left = vec![
+        format!("{} _____ _   _ _____ ____ ___ ____", pulse),
+        "|_   _| | | | ____/ ___|_ _|  _ \\".to_string(),
+        "  | | | |_| |  _|| |  _ | || | | |".to_string(),
+        "  | | |  _  | |__| |_| || || |_| |".to_string(),
+        "  |_| |_| |_|_____\\____|___|____/".to_string(),
+        format!("NODE v{}", env!("CARGO_PKG_VERSION")),
         format!("Device: {device_name}"),
         format!("Agent Port: {port}"),
         format!("Uptime: {}s", uptime),
         format!("Ping OK/Fail: {}/{}", state.ping_ok, state.ping_fail),
         format!("Last: {}", state.last_status),
     ];
+
+    // Keep key runtime fields near the bottom when width is tight.
+    if left_w < 52 {
+        left = vec![
+            format!("{} TG NODE v{}", pulse, env!("CARGO_PKG_VERSION")),
+            format!("Device: {device_name}"),
+            format!("Agent Port: {port}"),
+            format!("Uptime: {}s", uptime),
+            format!("Ping OK/Fail: {}/{}", state.ping_ok, state.ping_fail),
+            format!("Last: {}", state.last_status),
+        ];
+    }
 
     let mut commands = vec![
         "COMMANDS".to_string(),
@@ -278,12 +336,17 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         "CONNECTED".to_string(),
     ];
 
-    let dev_commands = [
-        "DEV COMMANDS",
-        "  gitupdate",
-        "  git status (shell)",
-        "  git log -1 (shell)",
+    let mut dev_commands = vec![
+        "DEV COMMANDS".to_string(),
+        "  gitupdate".to_string(),
+        "  gitupdate --rebuild".to_string(),
     ];
+    if let Some(refs) = git_branch_head() {
+        dev_commands.push(format!("  {}", refs));
+    } else {
+        dev_commands.push("  git: unavailable".to_string());
+    }
+    dev_commands.push("  git status (shell)".to_string());
 
     for (idx, (name, ip)) in state.devices.iter().take(5).enumerate() {
         commands.push(format!("  {}. {} ({})", idx + 1, name, ip));
@@ -305,7 +368,7 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
     for i in 0..upper_lines {
         let l = left.get(i).map_or("", |s| s.as_str());
         let c = commands.get(i).map_or("", |s| s.as_str());
-        let d = dev_commands.get(i).copied().unwrap_or("");
+        let d = dev_commands.get(i).map_or("", |s| s.as_str());
         let r = format!("{} │ {}", trim_fit(c, cmd_w), trim_fit(d, dev_w));
         let right_color = if i == 0 { ANSI_BOLD } else { ANSI_WHITE };
         if i == 5 {
@@ -619,7 +682,7 @@ fn main() -> Result<()> {
 
             match parts[0].to_ascii_lowercase().as_str() {
                 "help" => {
-                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | gitupdate | history | !! | !N | update | quit");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | gitupdate [--rebuild] | history | !! | !N | update | quit");
                 }
                 "devices" => {
                     runtime.spawn_load_devices();
@@ -693,7 +756,15 @@ fn main() -> Result<()> {
                     match try_git_update() {
                         Ok(msg) => {
                             emit(&ui_state, tui_mode, "✓", "GIT", msg);
-                            emit(&ui_state, tui_mode, "ℹ", "GIT", "Restart node to run the latest binary after pull.");
+                            let with_rebuild = parts.get(1).map(|v| *v == "--rebuild" || *v == "rebuild").unwrap_or(false);
+                            if with_rebuild {
+                                emit(&ui_state, tui_mode, "↻", "BUILD", "Rebuilding thegrid-node...");
+                                match try_rebuild_node() {
+                                    Ok(build_msg) => emit(&ui_state, tui_mode, "✓", "BUILD", build_msg),
+                                    Err(e) => emit(&ui_state, tui_mode, "⚠", "BUILD", format!("Rebuild failed: {}", e)),
+                                }
+                            }
+                            emit(&ui_state, tui_mode, "ℹ", "GIT", "Restart node to run the latest binary after pull/build.");
                         }
                         Err(e) => emit(&ui_state, tui_mode, "⚠", "GIT", format!("Update failed: {}", e)),
                     }
