@@ -97,6 +97,25 @@ Current constraints:
 - Uses Unicode box drawing and symbols (no heavy TUI dependency)
 - Supports `--plain` mode for fallback logging
 
+### Node CLI Development Log (2026-03-29)
+
+Applied and kept in `main`:
+- `gitupdate` now performs `fetch --prune` + `pull --ff-only` and reports explicit up-to-date state.
+- Auto-update path rebuilds `thegrid-node` and attempts self-restart.
+- Restart path now has a cargo fallback when direct binary relaunch is unavailable.
+- Startup noise in TUI mode was reduced by removing transient startup prints.
+- Post-restart update status is surfaced with `THEGRID_LAST_UPDATE`.
+
+Applied then reverted in `main` (stability rollback):
+- A large command-surface expansion (`mesh`, `node select`, `files`, `clip`, `health`, `config`, `logs`) was attempted in one change.
+- Result: terminal render/input behavior became noisy and unstable in active use.
+- Action taken: full revert to restore known-good behavior.
+
+Blueprint rule going forward:
+- Expand node commands in small slices (1 command group per PR), never as a single bulk parser rewrite.
+- Keep TUI rendering and command parsing decoupled; avoid high-churn state mutations in the render loop.
+- Each CLI expansion must ship with a rollback-safe checkpoint and manual TUI smoke pass (`help`, `devices`, `ping`, `history`, `update`, `quit`).
+
 ---
 
 ### Recommended Next Functions (After Main Project Features Land)
