@@ -7,6 +7,7 @@ use terminal_size::{Width, terminal_size};
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -167,6 +168,25 @@ fn try_rebuild_node() -> Result<String> {
     }
 
     Ok("Build completed for thegrid-node".to_string())
+}
+
+fn restart_current_node_process() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Avoid immediate release-check prompt loop after self-restart.
+    if !args.iter().any(|a| a == "--skip-update-check") {
+        args.push("--skip-update-check".to_string());
+    }
+
+    Command::new(exe)
+        .args(args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    Ok(())
 }
 
 fn ts() -> String {
@@ -350,7 +370,7 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
     let mut dev_commands = vec![
         "DEV COMMANDS".to_string(),
         "  gitupdate".to_string(),
-        "  gitupdate --rebuild".to_string(),
+        "  pull+build+restart".to_string(),
     ];
     if let Some(refs) = git_branch_head() {
         dev_commands.push(format!("  {}", refs));
@@ -695,7 +715,7 @@ fn main() -> Result<()> {
 
             match parts[0].to_ascii_lowercase().as_str() {
                 "help" => {
-                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | gitupdate [--rebuild] | history | !! | !N | update | quit");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | gitupdate | history | !! | !N | update | quit");
                 }
                 "devices" => {
                     runtime.spawn_load_devices();
@@ -769,15 +789,25 @@ fn main() -> Result<()> {
                     match try_git_update() {
                         Ok(msg) => {
                             emit(&ui_state, tui_mode, "✓", "GIT", msg);
-                            let with_rebuild = parts.get(1).map(|v| *v == "--rebuild" || *v == "rebuild").unwrap_or(false);
-                            if with_rebuild {
-                                emit(&ui_state, tui_mode, "↻", "BUILD", "Rebuilding thegrid-node...");
-                                match try_rebuild_node() {
-                                    Ok(build_msg) => emit(&ui_state, tui_mode, "✓", "BUILD", build_msg),
-                                    Err(e) => emit(&ui_state, tui_mode, "⚠", "BUILD", format!("Rebuild failed: {}", e)),
+                            emit(&ui_state, tui_mode, "↻", "BUILD", "Rebuilding thegrid-node...");
+                            match try_rebuild_node() {
+                                Ok(build_msg) => {
+                                    emit(&ui_state, tui_mode, "✓", "BUILD", build_msg);
+                                    emit(&ui_state, tui_mode, "↻", "RESTART", "Launching updated node process...");
+                                    match restart_current_node_process() {
+                                        Ok(_) => {
+                                            emit(&ui_state, tui_mode, "✓", "RESTART", "Updated node launched. Closing old process...");
+                                            running.store(false, Ordering::Relaxed);
+                                        }
+                                        Err(e) => {
+                                            emit(&ui_state, tui_mode, "⚠", "RESTART", format!("Restart failed: {}", e));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    emit(&ui_state, tui_mode, "⚠", "BUILD", format!("Rebuild failed: {}", e));
                                 }
                             }
-                            emit(&ui_state, tui_mode, "ℹ", "GIT", "Restart node to run the latest binary after pull/build.");
                         }
                         Err(e) => emit(&ui_state, tui_mode, "⚠", "GIT", format!("Update failed: {}", e)),
                     }
