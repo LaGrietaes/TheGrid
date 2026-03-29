@@ -18,10 +18,7 @@ const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGr
 const ANSI_RESET: &str = "\x1B[0m";
 const ANSI_BOLD: &str = "\x1B[1m";
 const ANSI_DIM: &str = "\x1B[2m";
-const ANSI_CYAN: &str = "\x1B[36m";
 const ANSI_GREEN: &str = "\x1B[32m";
-const ANSI_YELLOW: &str = "\x1B[33m";
-const ANSI_RED: &str = "\x1B[31m";
 const ANSI_WHITE: &str = "\x1B[37m";
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +116,7 @@ struct TuiState {
     ping_ok: u64,
     ping_fail: u64,
     command_history: VecDeque<String>,
+    dirty: bool,
 }
 
 impl TuiState {
@@ -131,6 +129,7 @@ impl TuiState {
             ping_ok: 0,
             ping_fail: 0,
             command_history: VecDeque::with_capacity(128),
+            dirty: true,
         }
     }
 
@@ -168,28 +167,12 @@ fn term_width() -> usize {
         .unwrap_or(110)
 }
 
-fn status_color(status: &str) -> &'static str {
-    let s = status.to_ascii_lowercase();
-    if s.contains("fail") || s.contains("error") {
-        ANSI_RED
-    } else if s.contains("warn") || s.contains("update") {
-        ANSI_YELLOW
-    } else {
-        ANSI_GREEN
-    }
+fn status_color(_status: &str) -> &'static str {
+    ANSI_GREEN
 }
 
-fn log_color(line: &str) -> &'static str {
-    let s = line.to_ascii_lowercase();
-    if s.contains('⚠') || s.contains(" fail") || s.contains("error") {
-        ANSI_RED
-    } else if s.contains('↻') || s.contains("update") {
-        ANSI_YELLOW
-    } else if s.contains('✓') || s.contains(" ok") {
-        ANSI_GREEN
-    } else {
-        ANSI_WHITE
-    }
+fn log_color(_line: &str) -> &'static str {
+    ANSI_WHITE
 }
 
 fn pulse_frame(elapsed: Duration) -> &'static str {
@@ -203,7 +186,7 @@ fn pulse_frame(elapsed: Duration) -> &'static str {
 
 fn render_labeled_line(left: &str, right: &str, left_w: usize, right_w: usize, right_color: &str) {
     println!(
-        "{ANSI_CYAN}║{ANSI_RESET} {ANSI_WHITE}{}{ANSI_RESET} {ANSI_CYAN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_CYAN}║{ANSI_RESET}",
+        "{ANSI_GREEN}║{ANSI_RESET} {ANSI_WHITE}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
         trim_fit(left, left_w),
         right_color,
         trim_fit(right, right_w),
@@ -264,17 +247,17 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
 
     let upper_lines = left.len().max(right.len());
     println!(
-        "{ANSI_CYAN}╔{}╦{}╗{ANSI_RESET}",
+        "{ANSI_GREEN}╔{}╦{}╗{ANSI_RESET}",
         "═".repeat(left_w + 2),
         "═".repeat(right_w + 2)
     );
     for i in 0..upper_lines {
         let l = left.get(i).map_or("", |s| s.as_str());
         let r = right.get(i).map_or("", |s| s.as_str());
-        let right_color = if i == 0 || i == 7 { ANSI_BOLD } else { ANSI_GREEN };
+        let right_color = if i == 0 || i == 7 { ANSI_BOLD } else { ANSI_WHITE };
         if i == 5 {
             println!(
-                "{ANSI_CYAN}║{ANSI_RESET} {status_c}{}{ANSI_RESET} {ANSI_CYAN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_CYAN}║{ANSI_RESET}",
+                "{ANSI_GREEN}║{ANSI_RESET} {status_c}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
                 trim_fit(l, left_w),
                 right_color,
                 trim_fit(r, right_w),
@@ -284,28 +267,28 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
             render_labeled_line(l, r, left_w, right_w, right_color);
         }
     }
-    println!("{ANSI_CYAN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
+    println!("{ANSI_GREEN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
 
     let max_logs = 12usize;
     let start = state.recent_logs.len().saturating_sub(max_logs);
     for line in state.recent_logs.iter().skip(start) {
         println!(
-            "{ANSI_CYAN}║{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_CYAN}║{ANSI_RESET}",
+            "{ANSI_GREEN}║{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
             log_color(line),
             trim_fit(line, lower_w)
         );
     }
     for _ in state.recent_logs.iter().skip(start).count()..max_logs {
-        println!("{ANSI_CYAN}║{ANSI_RESET} {} {ANSI_CYAN}║{ANSI_RESET}", " ".repeat(lower_w));
+        println!("{ANSI_GREEN}║{ANSI_RESET} {} {ANSI_GREEN}║{ANSI_RESET}", " ".repeat(lower_w));
     }
 
-    println!("{ANSI_CYAN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
+    println!("{ANSI_GREEN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
     println!(
-        "{ANSI_CYAN}║{ANSI_RESET} {ANSI_DIM}{}{ANSI_RESET} {ANSI_CYAN}║{ANSI_RESET}",
+        "{ANSI_GREEN}║{ANSI_RESET} {ANSI_DIM}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
         trim_fit("Type command then Enter (help for list, history for recall)", lower_w)
     );
-    println!("{ANSI_CYAN}╚{}╝{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
-    print!("{ANSI_BOLD}{ANSI_CYAN}> {ANSI_RESET}");
+    println!("{ANSI_GREEN}╚{}╝{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
+    print!("{ANSI_BOLD}{ANSI_GREEN}> {ANSI_RESET}");
     let _ = io::stdout().flush();
 }
 
@@ -318,6 +301,7 @@ fn emit(state: &Arc<Mutex<TuiState>>, tui_mode: bool, icon: &str, label: &str, m
     if let Ok(mut s) = state.lock() {
         s.last_status = format!("{} {}", label, message);
         s.push_log(format!("{} {} {:<10} {}", ts(), icon, label, message));
+        s.dirty = true;
     }
 }
 
@@ -780,12 +764,21 @@ fn main() -> Result<()> {
             }
         }
 
-        if tui_mode && last_render.elapsed() >= Duration::from_millis(700) {
+        if tui_mode {
+            let force_heartbeat = last_render.elapsed() >= Duration::from_secs(20);
+            let mut should_render = force_heartbeat;
             if let Ok(s) = ui_state.lock() {
-                let cfg = runtime.config.lock().unwrap();
-                render_tui(&s, &cfg.device_name, cfg.agent_port);
+                should_render = should_render || s.dirty;
             }
-            last_render = Instant::now();
+
+            if should_render {
+                if let Ok(mut s) = ui_state.lock() {
+                    let cfg = runtime.config.lock().unwrap();
+                    render_tui(&s, &cfg.device_name, cfg.agent_port);
+                    s.dirty = false;
+                }
+                last_render = Instant::now();
+            }
         }
 
         std::thread::sleep(Duration::from_millis(140));
