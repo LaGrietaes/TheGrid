@@ -24,6 +24,9 @@ members = [
     "crates/thegrid-gui",
     "crates/thegrid-runtime",
 ]
+default-members = [
+    "crates/thegrid-node",
+]
 resolver = "2"
 
 # ── Shared dependency versions (keeps crates in sync) ─────────────────────────

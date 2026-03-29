@@ -1,4 +1,14 @@
 {
+  "scripts": {
+    "run:gui": "cargo run -p thegrid-gui",
+    "run:node": "cargo run -p thegrid-node",
+    "build:gui": "cargo build --release -p thegrid-gui",
+    "build:node": "cargo build --release -p thegrid-node",
+    "check:gui": "cargo check -p thegrid-gui",
+    "check:node": "cargo check -p thegrid-node",
+    "check:headless": "cargo check --workspace --exclude thegrid-gui",
+    "build:headless": "cargo build --release --workspace --exclude thegrid-gui"
+  },
   "devDependencies": {
     "@microsoft/winappcli": "^0.2.0"
   }

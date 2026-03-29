@@ -19,6 +19,46 @@ The `main` branch is the comprehensive workspace containing all components, spec
 
 ---
 
+## Organized Dual Targets (Single Branch)
+
+To work on GUI and NODE in sync while keeping headless builds free of GUI extras,
+use package-scoped commands from the root workspace.
+
+### Run Commands
+
+```bash
+# GUI target
+cargo run -p thegrid-gui
+
+# Headless target (only node dependency graph)
+cargo run -p thegrid-node
+
+# Full headless validation build (all non-GUI crates)
+cargo check --workspace --exclude thegrid-gui
+```
+
+### Optional NPM Shortcuts
+
+From `thegrid-workspace/`:
+
+```bash
+npm run run:gui
+npm run run:node
+npm run build:gui
+npm run build:node
+```
+
+---
+
+## Headless Terminal UX
+
+`thegrid-node` now prints structured Unicode status lines for key runtime events
+(boot, sync, watcher, transfer, AI, indexing) to make terminal progress easier to scan.
+
+Routine ping logs were reduced from `info` to `debug` to avoid terminal clutter.
+
+---
+
 ## USB Connectivity & Debugging (Android)
 While Tailscale mesh is the primary communication vector, you can connect directly to Android / Termux nodes seamlessly over a physical USB connection using `scrcpy` (Screen Copy).
 

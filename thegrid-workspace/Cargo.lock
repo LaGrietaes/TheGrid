@@ -4799,6 +4799,8 @@ dependencies = [
  "env_logger",
  "hostname 0.4.2",
  "log",
+ "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "thegrid-core",

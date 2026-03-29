@@ -161,7 +161,7 @@ impl AgentServer {
             }
 
             let masked_key = key.map(|k| if k.len() > 8 { format!("{}...", &k[..8]) } else { "***".into() }).unwrap_or_else(|| "MISSING".into());
-            log::info!("Agent [/ping] from {} - authorized={} ({}) - Key: {}", remote_addr, authorized, auth_mode, masked_key);
+            log::debug!("Agent [/ping] from {} - authorized={} ({}) - Key: {}", remote_addr, authorized, auth_mode, masked_key);
 
             let h = hostname::get().unwrap_or_else(|_| std::ffi::OsString::from("UNKNOWN")).to_string_lossy().to_string();
             let body = serde_json::json!({
@@ -920,7 +920,7 @@ impl AgentClient {
     pub fn ping(&self) -> Result<AgentPingResponse> {
         let url = format!("{}/ping", self.base_url);
         let masked_key = if self.api_key.len() > 8 { format!("{}...", &self.api_key[..8]) } else { "***".into() };
-        log::info!("Client: pinging {} with Key: {}", url, masked_key);
+        log::debug!("Client: pinging {} with Key: {}", url, masked_key);
         let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).timeout(std::time::Duration::from_secs(3)).send().context("Pinging agent")?;
         let status = resp.status();
         if !status.is_success() {
@@ -928,7 +928,7 @@ impl AgentClient {
             return Err(Self::handle_error(resp));
         }
         let r: AgentPingResponse = resp.json().context("Parsing ping response")?;
-        log::info!("Client: ping to {} succeeded (authorized={})", url, r.authorized);
+        log::debug!("Client: ping to {} succeeded (authorized={})", url, r.authorized);
         Ok(r)
     }
 

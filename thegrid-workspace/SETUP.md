@@ -57,6 +57,13 @@ $env:RUST_LOG="info"
 cargo run -p thegrid-gui
 ```
 
+Headless node (without GUI crate):
+
+```powershell
+$env:RUST_LOG="info"
+cargo run -p thegrid-node
+```
+
 ---
 
 ## 5. Build Release Binary
@@ -64,6 +71,12 @@ cargo run -p thegrid-gui
 ```bash
 cargo build --release -p thegrid-gui
 # Output: target/release/thegrid.exe (~15-25 MB)
+
+# Headless binary
+cargo build --release -p thegrid-node
+
+# Headless-only full workspace build (exclude GUI crate)
+cargo build --release --workspace --exclude thegrid-gui
 ```
 
 ---
@@ -107,6 +120,10 @@ thegrid-workspace/
     │   └── src/lib.rs
     ├── thegrid-ai/                ← Semantic layer stubs (Phase 4)
     │   └── src/lib.rs
+    ├── thegrid-runtime/           ← Shared runtime/service orchestration
+    │   └── src/runtime.rs
+    ├── thegrid-node/              ← Headless binary
+    │   └── src/main.rs
     └── thegrid-gui/               ← The app binary (egui)
         └── src/
             ├── main.rs             ← Entry point, eframe setup
