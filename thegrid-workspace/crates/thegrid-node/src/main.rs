@@ -52,6 +52,35 @@ fn command_help_lines() -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedCommand<'a> {
+    Help,
+    Devices,
+    Ping,
+    PingDevice,
+    PingAgent,
+    History,
+    Update,
+    GitUpdate,
+    Quit,
+    Unknown(&'a str),
+}
+
+fn parse_command(token: &str) -> ParsedCommand<'_> {
+    match token.to_ascii_lowercase().as_str() {
+        "help" => ParsedCommand::Help,
+        "devices" => ParsedCommand::Devices,
+        "ping" => ParsedCommand::Ping,
+        "pingdev" => ParsedCommand::PingDevice,
+        "pingagent" => ParsedCommand::PingAgent,
+        "history" => ParsedCommand::History,
+        "update" => ParsedCommand::Update,
+        "gitupdate" => ParsedCommand::GitUpdate,
+        "quit" | "exit" => ParsedCommand::Quit,
+        _ => ParsedCommand::Unknown(token),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
     tag_name: String,
@@ -798,17 +827,17 @@ fn main() -> Result<()> {
                 }
             };
 
-            match parts[0].to_ascii_lowercase().as_str() {
-                "help" => {
+            match parse_command(parts[0]) {
+                ParsedCommand::Help => {
                     for line in command_help_lines() {
                         emit(&ui_state, tui_mode, "ℹ", "CMD", line);
                     }
                 }
-                "devices" => {
+                ParsedCommand::Devices => {
                     runtime.spawn_load_devices();
                     emit(&ui_state, tui_mode, "↻", "CMD", "Refreshing connected device list...");
                 }
-                "ping" => {
+                ParsedCommand::Ping => {
                     if let Some(target) = parts.get(1) {
                         if let Some((label, ip)) = resolve_ping_target(target) {
                             runtime.spawn_ping_device(ip.clone(), true);
@@ -821,7 +850,7 @@ fn main() -> Result<()> {
                         emit(&ui_state, tui_mode, "⚠", "CMD", "Usage: ping <ip|device_index>");
                     }
                 }
-                "pingdev" => {
+                ParsedCommand::PingDevice => {
                     if let Some(target) = parts.get(1) {
                         if let Some((label, ip)) = resolve_ping_target(target) {
                             runtime.spawn_ping_device(ip, true);
@@ -833,7 +862,7 @@ fn main() -> Result<()> {
                         emit(&ui_state, tui_mode, "⚠", "CMD", "Usage: pingdev <ip|device_index>");
                     }
                 }
-                "pingagent" => {
+                ParsedCommand::PingAgent => {
                     if let Some(target) = parts.get(1) {
                         if let Some((label, ip)) = resolve_ping_target(target) {
                             runtime.spawn_ping(ip, true);
@@ -845,7 +874,7 @@ fn main() -> Result<()> {
                         emit(&ui_state, tui_mode, "⚠", "CMD", "Usage: pingagent <ip|device_index>");
                     }
                 }
-                "history" => {
+                ParsedCommand::History => {
                     if let Ok(s) = ui_state.lock() {
                         if s.command_history.is_empty() {
                             emit(&ui_state, tui_mode, "ℹ", "HISTORY", "No commands in history yet");
@@ -856,7 +885,7 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                "update" => {
+                ParsedCommand::Update => {
                     match check_latest_release() {
                         Ok(Some(release)) => {
                             emit(
@@ -871,7 +900,7 @@ fn main() -> Result<()> {
                         Err(e) => emit(&ui_state, tui_mode, "⚠", "UPDATE", format!("Check failed: {}", e)),
                     }
                 }
-                "gitupdate" => {
+                ParsedCommand::GitUpdate => {
                     emit(&ui_state, tui_mode, "↻", "GIT", "Fetching + fast-forward pull...");
                     match try_git_update() {
                         Ok(GitUpdateOutcome::UpToDate { head }) => {
@@ -903,11 +932,11 @@ fn main() -> Result<()> {
                         Err(e) => emit(&ui_state, tui_mode, "⚠", "GIT", format!("> Update Failed Check logs: {}", e)),
                     }
                 }
-                "quit" | "exit" => {
+                ParsedCommand::Quit => {
                     emit(&ui_state, tui_mode, "■", "CMD", "Stopping node...");
                     running.store(false, Ordering::Relaxed);
                 }
-                other => {
+                ParsedCommand::Unknown(other) => {
                     emit(&ui_state, tui_mode, "⚠", "CMD", format!("Unknown command: {}", other));
                 }
             }
