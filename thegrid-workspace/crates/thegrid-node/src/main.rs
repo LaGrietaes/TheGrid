@@ -262,9 +262,19 @@ fn spawn_command_reader(cmd_tx: mpsc::Sender<String>, running: Arc<AtomicBool>) 
 }
 
 fn main() -> Result<()> {
-    // Initialize logging
+    // Quick pre-scan args + env to know if TUI will be active BEFORE logger init.
+    // In TUI mode we silence INFO noise — the rolling log panel captures events via emit().
+    let raw_args: Vec<String> = std::env::args().collect();
+    let pre_plain = raw_args.iter().any(|a| a == "--plain")
+        || std::env::var("THEGRID_PLAIN").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let pre_force = raw_args.iter().any(|a| a == "--force-tui")
+        || std::env::var("THEGRID_FORCE_TUI").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+    let expect_tui = !pre_plain && (pre_force || (io::stdin().is_terminal() && io::stdout().is_terminal()));
+
+    // In TUI mode suppress INFO/DEBUG to keep the terminal clean; errors still surface briefly.
+    let log_default = if expect_tui { "error" } else { "info" };
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info")
+        env_logger::Env::default().default_filter_or(log_default)
     ).init();
 
     log::info!("THE GRID Headless Node v{} starting", env!("CARGO_PKG_VERSION"));
@@ -329,7 +339,7 @@ fn main() -> Result<()> {
             "--plain" => {
                 plain_mode = true;
             }
-            "--force-tui" => {
+            "--force-tui" | "--froce-tui" => {
                 force_tui = true;
             }
             _ => {
