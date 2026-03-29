@@ -628,20 +628,20 @@ fn main() -> Result<()> {
     let stdout_tty = io::stdout().is_terminal();
     let tui_mode = !plain_mode && (force_tui || (stdin_tty && stdout_tty));
 
-    print_banner(&config.device_name, config.agent_port);
-
-    if tui_mode {
-        println!("  TUI mode : ACTIVE");
-    } else {
+    if !tui_mode {
+        print_banner(&config.device_name, config.agent_port);
         println!(
             "  TUI mode : OFF  (stdin_tty={}, stdout_tty={}, plain={}, force={})",
             stdin_tty, stdout_tty, plain_mode, force_tui
         );
         println!("  Tip      : run with --force-tui to enable the interactive interface");
+        println!();
     }
-    println!();
 
     let ui_state = Arc::new(Mutex::new(TuiState::new()));
+    if tui_mode {
+        emit(&ui_state, tui_mode, "ℹ", "BOOT", "TUI mode active");
+    }
     emit(&ui_state, tui_mode, "✓", "BOOT", "Configuration loaded");
     if let Ok(v) = std::env::var(LAST_UPDATE_ENV) {
         if let Some((from, to)) = v.split_once(':') {
