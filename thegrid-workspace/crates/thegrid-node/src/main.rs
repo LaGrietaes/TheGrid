@@ -236,7 +236,9 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         "Commands".to_string(),
         "  help".to_string(),
         "  devices".to_string(),
-        "  ping <ip|#>".to_string(),
+        "  ping <ip|#> (device+agent)".to_string(),
+        "  pingdev <ip|#>".to_string(),
+        "  pingagent <ip|#>".to_string(),
         "  history | !! | !N".to_string(),
         "  update".to_string(),
         "  quit".to_string(),
@@ -259,7 +261,7 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
     for i in 0..upper_lines {
         let l = left.get(i).map_or("", |s| s.as_str());
         let r = right.get(i).map_or("", |s| s.as_str());
-        let right_color = if i == 0 || i == 7 { ANSI_BOLD } else { ANSI_WHITE };
+        let right_color = if i == 0 || i == 9 { ANSI_BOLD } else { ANSI_WHITE };
         if i == 5 {
             println!(
                 "{ANSI_GREEN}║{ANSI_RESET} {status_c}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
@@ -551,9 +553,26 @@ fn main() -> Result<()> {
                 continue;
             }
 
+            let resolve_ping_target = |target: &str| -> Option<(String, String)> {
+                if let Ok(idx) = target.parse::<usize>() {
+                    if let Ok(s) = ui_state.lock() {
+                        if idx == 0 || idx > s.devices.len() {
+                            None
+                        } else {
+                            let (name, ip) = s.devices[idx - 1].clone();
+                            Some((format!("#{} {}", idx, name), ip))
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    Some((target.to_string(), target.to_string()))
+                }
+            };
+
             match parts[0].to_ascii_lowercase().as_str() {
                 "help" => {
-                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | history | !! | !N | update | quit");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | history | !! | !N | update | quit");
                 }
                 "devices" => {
                     runtime.spawn_load_devices();
@@ -561,29 +580,39 @@ fn main() -> Result<()> {
                 }
                 "ping" => {
                     if let Some(target) = parts.get(1) {
-                        if let Ok(idx) = target.parse::<usize>() {
-                            let selected = if let Ok(s) = ui_state.lock() {
-                                if idx == 0 || idx > s.devices.len() {
-                                    None
-                                } else {
-                                    Some(s.devices[idx - 1].clone())
-                                }
-                            } else {
-                                None
-                            };
-
-                            if let Some((name, ip)) = selected {
-                                runtime.spawn_ping(ip.clone(), true);
-                                emit(&ui_state, tui_mode, "◎", "CMD", format!("Pinging #{} {} ({})", idx, name, ip));
-                            } else {
-                                emit(&ui_state, tui_mode, "⚠", "CMD", format!("Device index {} not found", idx));
-                            }
+                        if let Some((label, ip)) = resolve_ping_target(target) {
+                            runtime.spawn_ping_device(ip.clone(), true);
+                            runtime.spawn_ping(ip.clone(), true);
+                            emit(&ui_state, tui_mode, "◎", "CMD", format!("Ping {} -> device + agent", label));
                         } else {
-                            runtime.spawn_ping((*target).to_string(), true);
-                            emit(&ui_state, tui_mode, "◎", "CMD", format!("Pinging {}", target));
+                            emit(&ui_state, tui_mode, "⚠", "CMD", format!("Device index {} not found", target));
                         }
                     } else {
                         emit(&ui_state, tui_mode, "⚠", "CMD", "Usage: ping <ip|device_index>");
+                    }
+                }
+                "pingdev" => {
+                    if let Some(target) = parts.get(1) {
+                        if let Some((label, ip)) = resolve_ping_target(target) {
+                            runtime.spawn_ping_device(ip, true);
+                            emit(&ui_state, tui_mode, "◎", "CMD", format!("Device ping {}", label));
+                        } else {
+                            emit(&ui_state, tui_mode, "⚠", "CMD", format!("Device index {} not found", target));
+                        }
+                    } else {
+                        emit(&ui_state, tui_mode, "⚠", "CMD", "Usage: pingdev <ip|device_index>");
+                    }
+                }
+                "pingagent" => {
+                    if let Some(target) = parts.get(1) {
+                        if let Some((label, ip)) = resolve_ping_target(target) {
+                            runtime.spawn_ping(ip, true);
+                            emit(&ui_state, tui_mode, "◎", "CMD", format!("Agent ping {}", label));
+                        } else {
+                            emit(&ui_state, tui_mode, "⚠", "CMD", format!("Device index {} not found", target));
+                        }
+                    } else {
+                        emit(&ui_state, tui_mode, "⚠", "CMD", "Usage: pingagent <ip|device_index>");
                     }
                 }
                 "history" => {
@@ -735,6 +764,20 @@ fn main() -> Result<()> {
                 AppEvent::Status(msg) => {
                     if msg.starts_with("db_error:") {
                         emit(&ui_state, tui_mode, "⚠", "DB", &msg["db_error:".len()..]);
+                    } else if msg.starts_with("device_ping_ok:") {
+                        let parts: Vec<&str> = msg.splitn(3, ':').collect();
+                        if parts.len() == 3 {
+                            if parts[2] == "true" {
+                                emit(&ui_state, tui_mode, "✓", "DEVICE", format!("{} reachable", parts[1]));
+                            }
+                        }
+                    } else if msg.starts_with("device_ping_fail:") {
+                        let parts: Vec<&str> = msg.splitn(4, ':').collect();
+                        if parts.len() == 4 {
+                            if parts[2] == "true" {
+                                emit(&ui_state, tui_mode, "⚠", "DEVICE", format!("{} unreachable: {}", parts[1], parts[3]));
+                            }
+                        }
                     } else if msg.starts_with("config_update:") {
                         let parts = &msg["config_update:".len()..];
                         let mut model = None;

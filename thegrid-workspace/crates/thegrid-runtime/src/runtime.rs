@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
@@ -182,6 +183,39 @@ impl AppRuntime {
             match AgentClient::new(&ip, port, api_key).and_then(|c| c.ping()) {
                 Ok(response)  => { let _ = tx.send(AppEvent::AgentPingOk { ip: ip_addr, response, manual }); }
                 Err(e) => { let _ = tx.send(AppEvent::AgentPingFailed { ip: ip_addr, error: e.to_string(), manual }); }
+            }
+        });
+    }
+
+    pub fn spawn_ping_device(&self, ip: String, manual: bool) {
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            #[cfg(target_os = "windows")]
+            let output = Command::new("ping")
+                .args(["-n", "1", "-w", "1200", &ip])
+                .output();
+
+            #[cfg(not(target_os = "windows"))]
+            let output = Command::new("ping")
+                .args(["-c", "1", "-W", "1", &ip])
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let _ = tx.send(AppEvent::Status(format!("device_ping_ok:{}:{}", ip, manual)));
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let msg = if stderr.trim().is_empty() {
+                        "host unreachable or timeout".to_string()
+                    } else {
+                        stderr.trim().to_string()
+                    };
+                    let _ = tx.send(AppEvent::Status(format!("device_ping_fail:{}:{}:{}", ip, manual, msg)));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Status(format!("device_ping_fail:{}:{}:{}", ip, manual, e)));
+                }
             }
         });
     }
