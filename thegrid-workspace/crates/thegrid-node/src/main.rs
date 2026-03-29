@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::path::PathBuf;
 use chrono::Local;
 use semver::Version;
 use serde::Deserialize;
@@ -12,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use thegrid_core::{AppEvent, Config};
+use thegrid_net::AgentClient;
 use thegrid_runtime::AppRuntime;
 
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
@@ -256,12 +258,22 @@ fn event_line(icon: &str, label: &str, message: impl AsRef<str>) {
     println!("{} {} {:<12} {}", ts(), icon, label, message.as_ref());
 }
 
+/// A peer node known to this instance (from Tailscale device list).
+#[derive(Debug, Clone)]
+struct NodeDevice {
+    display_name: String,
+    ip: String,
+    device_id: String,
+    hostname: String,
+}
+
 #[derive(Debug)]
 struct TuiState {
     started_at: Instant,
     last_status: String,
     recent_logs: VecDeque<String>,
-    devices: Vec<(String, String)>, // (display_name, ip)
+    devices: Vec<NodeDevice>,
+    selected_device: Option<usize>,
     ping_ok: u64,
     ping_fail: u64,
     command_history: VecDeque<String>,
@@ -275,6 +287,7 @@ impl TuiState {
             last_status: "READY".to_string(),
             recent_logs: VecDeque::with_capacity(256),
             devices: Vec::new(),
+            selected_device: None,
             ping_ok: 0,
             ping_fail: 0,
             command_history: VecDeque::with_capacity(128),
@@ -414,8 +427,12 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         "  pingdev <ip|#>".to_string(),
         "  pingagent <ip|#>".to_string(),
         "  history | !! | !N".to_string(),
-        "  update (release check)".to_string(),
-        "  quit".to_string(),
+        "  mesh status | mesh sync <all|#>".to_string(),
+        "  node select <#>  (@=active)".to_string(),
+        "  files list/pull/push <#|@>".to_string(),
+        "  clip send <#|@> <text>".to_string(),
+        "  health | config show/set".to_string(),
+        "  logs [n] | update | quit".to_string(),
         "CONNECTED".to_string(),
     ];
 
@@ -431,8 +448,9 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
     }
     dev_commands.push("  git status (shell)".to_string());
 
-    for (idx, (name, ip)) in state.devices.iter().take(5).enumerate() {
-        commands.push(format!("  {}. {} ({})", idx + 1, name, ip));
+    for (idx, dev) in state.devices.iter().take(5).enumerate() {
+        let sel = if state.selected_device == Some(idx) { "→" } else { " " };
+        commands.push(format!(" {}{}.{} ({})", sel, idx + 1, dev.display_name, dev.ip));
     }
     if state.devices.is_empty() {
         commands.push("  none yet (run: devices)".to_string());
@@ -762,26 +780,35 @@ fn main() -> Result<()> {
                 continue;
             }
 
-            let resolve_ping_target = |target: &str| -> Option<(String, String)> {
-                if let Ok(idx) = target.parse::<usize>() {
-                    if let Ok(s) = ui_state.lock() {
-                        if idx == 0 || idx > s.devices.len() {
-                            None
-                        } else {
-                            let (name, ip) = s.devices[idx - 1].clone();
-                            Some((format!("#{} {}", idx, name), ip))
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    Some((target.to_string(), target.to_string()))
+            // Resolve a target specifier (@, numeric index, or raw IP) to a NodeDevice.
+            let resolve_device = |target: &str| -> Option<NodeDevice> {
+                if target == "@" {
+                    let idx = ui_state.lock().ok().and_then(|s| s.selected_device)?;
+                    return ui_state.lock().ok().and_then(|s| s.devices.get(idx).cloned());
                 }
+                if let Ok(idx) = target.parse::<usize>() {
+                    return ui_state.lock().ok().and_then(|s| {
+                        if idx == 0 || idx > s.devices.len() { None }
+                        else { s.devices.get(idx - 1).cloned() }
+                    });
+                }
+                // Plain IP/hostname
+                Some(NodeDevice {
+                    display_name: target.to_string(),
+                    ip: target.to_string(),
+                    device_id: target.to_string(),
+                    hostname: target.to_string(),
+                })
             };
 
             match parts[0].to_ascii_lowercase().as_str() {
                 "help" => {
-                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | gitupdate | history | !! | !N | update | quit");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "Navigation: devices | node select <#> | mesh status | mesh sync <all|#>");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "Files:      files list <#|@> [path] | files pull <#|@> <path> | files push <#|@> <path>");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "Clipboard:  clip send <#|@> <text>");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "Network:    ping <ip|#> | pingdev <ip|#> | pingagent <ip|#>");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "Ops:        health | config show | config set <key> <val> | logs [n]");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "Update:     update | gitupdate | history | !! | !N | quit");
                 }
                 "devices" => {
                     runtime.spawn_load_devices();
@@ -789,7 +816,8 @@ fn main() -> Result<()> {
                 }
                 "ping" => {
                     if let Some(target) = parts.get(1) {
-                        if let Some((label, ip)) = resolve_ping_target(target) {
+                        if let Some(dev) = resolve_device(target) {
+                            let (label, ip) = (format!("#{} {}", target, dev.display_name), dev.ip);
                             runtime.spawn_ping_device(ip.clone(), true);
                             runtime.spawn_ping(ip.clone(), true);
                             emit(&ui_state, tui_mode, "◎", "CMD", format!("Ping {} -> device + agent", label));
@@ -802,7 +830,8 @@ fn main() -> Result<()> {
                 }
                 "pingdev" => {
                     if let Some(target) = parts.get(1) {
-                        if let Some((label, ip)) = resolve_ping_target(target) {
+                        if let Some(dev) = resolve_device(target) {
+                            let (label, ip) = (format!("#{} {}", target, dev.display_name), dev.ip);
                             runtime.spawn_ping_device(ip, true);
                             emit(&ui_state, tui_mode, "◎", "CMD", format!("Device ping {}", label));
                         } else {
@@ -814,7 +843,8 @@ fn main() -> Result<()> {
                 }
                 "pingagent" => {
                     if let Some(target) = parts.get(1) {
-                        if let Some((label, ip)) = resolve_ping_target(target) {
+                        if let Some(dev) = resolve_device(target) {
+                            let (label, ip) = (format!("#{} {}", target, dev.display_name), dev.ip);
                             runtime.spawn_ping(ip, true);
                             emit(&ui_state, tui_mode, "◎", "CMD", format!("Agent ping {}", label));
                         } else {
@@ -886,6 +916,275 @@ fn main() -> Result<()> {
                     emit(&ui_state, tui_mode, "■", "CMD", "Stopping node...");
                     running.store(false, Ordering::Relaxed);
                 }
+                // ── Mesh Management ───────────────────────────────────────
+                "mesh" => {
+                    match parts.get(1).copied() {
+                        Some("status") => {
+                            let devs: Vec<NodeDevice> = ui_state.lock()
+                                .ok().map(|s| s.devices.clone()).unwrap_or_default();
+                            if devs.is_empty() {
+                                emit(&ui_state, tui_mode, "⚠", "MESH", "No devices known — run: devices");
+                            } else {
+                                emit(&ui_state, tui_mode, "ℹ", "MESH", format!("{} node(s) in mesh — pinging all", devs.len()));
+                                for (i, d) in devs.iter().enumerate() {
+                                    emit(&ui_state, tui_mode, "·", "MESH", format!("  #{} {} [{}]", i + 1, d.display_name, d.ip));
+                                    runtime.spawn_ping(d.ip.clone(), true);
+                                    runtime.spawn_ping_device(d.ip.clone(), true);
+                                }
+                            }
+                        }
+                        Some("sync") => {
+                            let target = parts.get(2).copied().unwrap_or("all");
+                            let devs: Vec<NodeDevice> = ui_state.lock()
+                                .ok().map(|s| s.devices.clone()).unwrap_or_default();
+                            if devs.is_empty() {
+                                emit(&ui_state, tui_mode, "⚠", "MESH", "No devices known — run: devices first");
+                            } else if target == "all" {
+                                for d in &devs {
+                                    runtime.spawn_sync_node(d.device_id.clone(), d.ip.clone(), d.hostname.clone());
+                                    emit(&ui_state, tui_mode, "⇄", "MESH", format!("Sync → {}", d.display_name));
+                                }
+                            } else if let Some(dev) = resolve_device(target) {
+                                runtime.spawn_sync_node(dev.device_id.clone(), dev.ip.clone(), dev.hostname.clone());
+                                emit(&ui_state, tui_mode, "⇄", "MESH", format!("Sync → {}", dev.display_name));
+                            } else {
+                                emit(&ui_state, tui_mode, "⚠", "MESH", format!("Device '{}' not found", target));
+                            }
+                        }
+                        _ => {
+                            emit(&ui_state, tui_mode, "ℹ", "MESH", "mesh status | mesh sync <all|#>");
+                        }
+                    }
+                }
+                // ── Node Selection ────────────────────────────────────────
+                "node" => {
+                    match parts.get(1).copied() {
+                        Some("select") => {
+                            if let Some(idx_str) = parts.get(2) {
+                                if let Ok(idx) = idx_str.parse::<usize>() {
+                                    let valid = ui_state.lock().ok()
+                                        .map(|s| idx > 0 && idx <= s.devices.len())
+                                        .unwrap_or(false);
+                                    if valid {
+                                        if let Ok(mut s) = ui_state.lock() {
+                                            s.selected_device = Some(idx - 1);
+                                            let name = s.devices[idx - 1].display_name.clone();
+                                            drop(s);
+                                            emit(&ui_state, tui_mode, "✓", "NODE", format!("Active target → #{} {} (use @ in commands)", idx, name));
+                                        }
+                                    } else {
+                                        emit(&ui_state, tui_mode, "⚠", "NODE", format!("No device at index {} — run: devices", idx));
+                                    }
+                                } else {
+                                    emit(&ui_state, tui_mode, "⚠", "NODE", "Usage: node select <index>");
+                                }
+                            } else {
+                                emit(&ui_state, tui_mode, "⚠", "NODE", "Usage: node select <index>");
+                            }
+                        }
+                        _ => {
+                            let cur = ui_state.lock().ok()
+                                .and_then(|s| s.selected_device.and_then(|i| s.devices.get(i).map(|d| d.display_name.clone())));
+                            match cur {
+                                Some(n) => emit(&ui_state, tui_mode, "ℹ", "NODE", format!("Active: {} — node select <#>", n)),
+                                None    => emit(&ui_state, tui_mode, "ℹ", "NODE", "No active node — node select <index>"),
+                            }
+                        }
+                    }
+                }
+                // ── Remote File Operations ────────────────────────────────
+                "files" => {
+                    let sub    = parts.get(1).copied().unwrap_or("");
+                    let target = parts.get(2).copied().unwrap_or("");
+                    match sub {
+                        "list" => {
+                            if target.is_empty() {
+                                emit(&ui_state, tui_mode, "⚠", "FILES", "Usage: files list <#|@> [path]");
+                            } else if let Some(dev) = resolve_device(target) {
+                                let path = parts.get(3).map(PathBuf::from);
+                                emit(&ui_state, tui_mode, "↻", "FILES", format!("Listing {} ...", dev.display_name));
+                                match path {
+                                    None    => runtime.spawn_list_remote_files(dev.ip),
+                                    Some(p) => runtime.spawn_browse_remote_directory(dev.ip, dev.device_id, p),
+                                }
+                            } else {
+                                emit(&ui_state, tui_mode, "⚠", "FILES", format!("Device '{}' not found", target));
+                            }
+                        }
+                        "pull" => {
+                            // files pull <#|@> <remote_path>
+                            let remote = parts.get(3).copied().unwrap_or("");
+                            if target.is_empty() || remote.is_empty() {
+                                emit(&ui_state, tui_mode, "⚠", "FILES", "Usage: files pull <#|@> <remote_path>");
+                            } else if let Some(dev) = resolve_device(target) {
+                                // spawn_download_file uses the bare filename and fetches from /files/<name>
+                                let fname = std::path::Path::new(remote)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| remote.to_string());
+                                runtime.spawn_download_file(dev.ip, fname.clone());
+                                emit(&ui_state, tui_mode, "↓", "FILES", format!("Pulling '{}' from {} ...", fname, dev.display_name));
+                            } else {
+                                emit(&ui_state, tui_mode, "⚠", "FILES", format!("Device '{}' not found", target));
+                            }
+                        }
+                        "push" => {
+                            // files push <#|@> <local_path>
+                            let local = parts.get(3).copied().unwrap_or("");
+                            if target.is_empty() || local.is_empty() {
+                                emit(&ui_state, tui_mode, "⚠", "FILES", "Usage: files push <#|@> <local_path>");
+                            } else if let Some(dev) = resolve_device(target) {
+                                let p = PathBuf::from(local);
+                                if p.exists() {
+                                    emit(&ui_state, tui_mode, "↑", "FILES", format!("Pushing '{}' to {} ...", local, dev.display_name));
+                                    runtime.spawn_send_file(dev.ip, p, 0);
+                                } else {
+                                    emit(&ui_state, tui_mode, "⚠", "FILES", format!("File not found: {}", local));
+                                }
+                            } else {
+                                emit(&ui_state, tui_mode, "⚠", "FILES", format!("Device '{}' not found", target));
+                            }
+                        }
+                        _ => {
+                            emit(&ui_state, tui_mode, "ℹ", "FILES", "files list <#|@> [path] | files pull <#|@> <remote_path> | files push <#|@> <local_path>");
+                        }
+                    }
+                }
+                // ── Clipboard ─────────────────────────────────────────────
+                "clip" => {
+                    let sub    = parts.get(1).copied().unwrap_or("");
+                    let target = parts.get(2).copied().unwrap_or("");
+                    match sub {
+                        "send" => {
+                            if target.is_empty() {
+                                emit(&ui_state, tui_mode, "⚠", "CLIP", "Usage: clip send <#|@> <text>");
+                            } else if let Some(dev) = resolve_device(target) {
+                                // Everything after the target token is the message text
+                                let text: String = effective_cmd
+                                    .splitn(4, char::is_whitespace)
+                                    .nth(3)
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string();
+                                if text.is_empty() {
+                                    emit(&ui_state, tui_mode, "⚠", "CLIP", "Usage: clip send <#|@> <text>");
+                                } else {
+                                    let (api_key, port, sender) = {
+                                        let cfg = runtime.config.lock().unwrap();
+                                        (cfg.api_key.clone(), cfg.agent_port, cfg.device_name.clone())
+                                    };
+                                    let tx   = runtime.event_tx.clone();
+                                    let ip   = dev.ip.clone();
+                                    emit(&ui_state, tui_mode, "⎘", "CLIP", format!("Sending to {} ...", dev.display_name));
+                                    std::thread::spawn(move || {
+                                        match AgentClient::new(&ip, port, api_key) {
+                                            Ok(client) => match client.send_clipboard(&text, &sender) {
+                                                Ok(_)  => { let _ = tx.send(AppEvent::ClipboardSent); }
+                                                Err(e) => { let _ = tx.send(AppEvent::ClipboardSendFailed(e.to_string())); }
+                                            },
+                                            Err(e)     => { let _ = tx.send(AppEvent::ClipboardSendFailed(e.to_string())); }
+                                        }
+                                    });
+                                }
+                            } else {
+                                emit(&ui_state, tui_mode, "⚠", "CLIP", format!("Device '{}' not found", target));
+                            }
+                        }
+                        _ => {
+                            emit(&ui_state, tui_mode, "ℹ", "CLIP", "clip send <#|@> <text>");
+                        }
+                    }
+                }
+                // ── Diagnostics ───────────────────────────────────────────
+                "health" => {
+                    let (has_key, has_name, port, watch_count) = {
+                        let cfg = runtime.config.lock().unwrap();
+                        (!cfg.api_key.trim().is_empty(), !cfg.device_name.is_empty(), cfg.agent_port, cfg.watch_paths.len())
+                    };
+                    let db_ok  = runtime.db.try_lock().is_ok();
+                    let ai_ok  = runtime.is_ai_node;
+                    let sem_ok = runtime.semantic_search.lock().ok().map(|s| s.is_some()).unwrap_or(false);
+                    let dev_count = ui_state.lock().ok().map(|s| s.devices.len()).unwrap_or(0);
+                    emit(&ui_state, tui_mode, "ℹ", "HEALTH", format!(
+                        "Config  key={} name={} port={} watchers={}",
+                        if has_key  { "✓" } else { "✗" },
+                        if has_name { "✓" } else { "✗" },
+                        port, watch_count
+                    ));
+                    emit(&ui_state, tui_mode, "ℹ", "HEALTH", format!(
+                        "Runtime DB={} AI={} Semantic={} Mesh={}",
+                        if db_ok  { "✓" } else { "LOCKED" },
+                        if ai_ok  { "✓" } else { "—" },
+                        if sem_ok { "✓" } else { "—" },
+                        dev_count
+                    ));
+                }
+                // ── Config r/w ────────────────────────────────────────────
+                "config" => {
+                    match parts.get(1).copied() {
+                        Some("show") | None => {
+                            let cfg = runtime.config.lock().unwrap();
+                            let masked = if cfg.api_key.len() > 12 {
+                                format!("{}…", &cfg.api_key[..12])
+                            } else { "***".to_string() };
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", format!("device_name    = {}", cfg.device_name));
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", format!("api_key        = {}", masked));
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", format!("agent_port     = {}", cfg.agent_port));
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", format!("ai_model       = {:?}", cfg.ai_model));
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", format!("ai_provider    = {:?}", cfg.ai_provider_url));
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", format!("rdp            = {}", cfg.enable_rdp));
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", format!("file_access    = {}", cfg.enable_file_access));
+                            emit(&ui_state, tui_mode, "⚙", "CONFIG", format!("watch_paths    = {:?}", cfg.watch_paths));
+                        }
+                        Some("set") => {
+                            let key = parts.get(2).copied().unwrap_or("");
+                            let val = parts.get(3).copied().unwrap_or("");
+                            if key.is_empty() {
+                                emit(&ui_state, tui_mode, "⚠", "CONFIG", "Usage: config set <key> <value>");
+                                emit(&ui_state, tui_mode, "ℹ", "CONFIG", "Keys: device_name | agent_port | ai_model | ai_provider_url");
+                            } else {
+                                let mut cfg = runtime.config.lock().unwrap();
+                                let ok = match key {
+                                    "device_name"    => { cfg.device_name = val.to_string(); true }
+                                    "agent_port"     => val.parse::<u16>().map(|p| { cfg.agent_port = p; }).is_ok(),
+                                    "ai_model"       => { cfg.ai_model = if val.is_empty() { None } else { Some(val.to_string()) }; true }
+                                    "ai_provider_url"=> { cfg.ai_provider_url = if val.is_empty() { None } else { Some(val.to_string()) }; true }
+                                    _                => false,
+                                };
+                                if ok {
+                                    match cfg.save() {
+                                        Ok(_)  => emit(&ui_state, tui_mode, "✓", "CONFIG", format!("{} = {}", key, val)),
+                                        Err(e) => emit(&ui_state, tui_mode, "⚠", "CONFIG", format!("Save failed: {}", e)),
+                                    }
+                                } else {
+                                    emit(&ui_state, tui_mode, "⚠", "CONFIG", format!("Unknown key '{}'. Keys: device_name | agent_port | ai_model | ai_provider_url", key));
+                                }
+                            }
+                        }
+                        _ => {
+                            emit(&ui_state, tui_mode, "ℹ", "CONFIG", "config show | config set <key> <value>");
+                        }
+                    }
+                }
+                // ── Log viewer ────────────────────────────────────────────
+                "logs" => {
+                    let n = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(20);
+                    let lines: Vec<String> = ui_state.lock().ok()
+                        .map(|s| s.recent_logs.iter().rev().take(n).cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    if lines.is_empty() {
+                        emit(&ui_state, tui_mode, "ℹ", "LOGS", "No log entries yet");
+                    } else {
+                        for line in lines.into_iter().rev() {
+                            if !tui_mode { println!("{}", line); }
+                            // In TUI mode the rolling panel already shows them;
+                            // this prints them again for plain-mode users.
+                        }
+                        if !tui_mode {
+                            emit(&ui_state, tui_mode, "ℹ", "LOGS", format!("Showed last {} entries", n));
+                        }
+                    }
+                }
                 other => {
                     emit(&ui_state, tui_mode, "⚠", "CMD", format!("Unknown command: {}", other));
                 }
@@ -896,13 +1195,20 @@ fn main() -> Result<()> {
         while let Ok(event) = rx.try_recv() {
             match event {
                 AppEvent::DevicesLoaded(devices) => {
+                    let count = devices.len();
                     if let Ok(mut s) = ui_state.lock() {
-                        s.devices = devices
-                            .iter()
-                            .filter_map(|d| d.primary_ip().map(|ip| (d.display_name().to_string(), ip.to_string())))
+                        s.devices = devices.iter()
+                            .filter_map(|d| {
+                                d.primary_ip().map(|ip| NodeDevice {
+                                    display_name: d.display_name().to_string(),
+                                    ip: ip.to_string(),
+                                    device_id: d.id.clone(),
+                                    hostname: d.hostname.clone(),
+                                })
+                            })
                             .collect();
                     }
-                    emit(&ui_state, tui_mode, "✓", "DEVICES", format!("Loaded {} devices", devices.len()));
+                    emit(&ui_state, tui_mode, "✓", "DEVICES", format!("Loaded {} devices", count));
                 }
                 AppEvent::DevicesFailed(err) => {
                     emit(&ui_state, tui_mode, "⚠", "DEVICES", format!("Load failed: {}", err));
@@ -1052,6 +1358,59 @@ fn main() -> Result<()> {
                     } else {
                         log::debug!("Status: {}", msg);
                     }
+                }
+                // ── File listings ──────────────────────────────────────
+                AppEvent::RemoteFilesLoaded(files) => {
+                    emit(&ui_state, tui_mode, "📂", "FILES", format!("{} items", files.len()));
+                    for f in files.iter().take(20) {
+                        emit(&ui_state, tui_mode, "·", "FILES", format!("  {} ({} B)", f.name, f.size));
+                    }
+                    if files.len() > 20 {
+                        emit(&ui_state, tui_mode, "·", "FILES", format!("  … and {} more", files.len() - 20));
+                    }
+                }
+                AppEvent::RemoteFilesFailed(err) => {
+                    emit(&ui_state, tui_mode, "⚠", "FILES", format!("Listing failed: {}", err));
+                }
+                AppEvent::RemoteBrowseLoaded { path, files, .. } => {
+                    emit(&ui_state, tui_mode, "📂", "BROWSE", format!("{} — {} items", path.display(), files.len()));
+                    for f in files.iter().take(30) {
+                        let kind = if f.is_dir { "/" } else { "" };
+                        emit(&ui_state, tui_mode, "·", "BROWSE", format!("  {}{} ({} B)", f.name, kind, f.size));
+                    }
+                    if files.len() > 30 {
+                        emit(&ui_state, tui_mode, "·", "BROWSE", format!("  … and {} more", files.len() - 30));
+                    }
+                }
+                AppEvent::RemoteBrowseFailed { error, .. } => {
+                    emit(&ui_state, tui_mode, "⚠", "BROWSE", format!("Browse failed: {}", error));
+                }
+                // ── Transfers ──────────────────────────────────────────
+                AppEvent::FileSent { name, .. } => {
+                    emit(&ui_state, tui_mode, "✓", "PUSH", format!("Sent: {}", name));
+                }
+                AppEvent::FileSendFailed { error, .. } => {
+                    emit(&ui_state, tui_mode, "⚠", "PUSH", format!("Send failed: {}", error));
+                }
+                AppEvent::FileDownloaded { name, path } => {
+                    emit(&ui_state, tui_mode, "✓", "PULL", format!("Saved: {} → {}", name, path.display()));
+                }
+                AppEvent::FileDownloadFailed { name, error } => {
+                    emit(&ui_state, tui_mode, "⚠", "PULL", format!("Download failed {}: {}", name, error));
+                }
+                // ── Mesh sync ─────────────────────────────────────────
+                AppEvent::SyncComplete { device_id, files_added } => {
+                    emit(&ui_state, tui_mode, "✓", "SYNC", format!("{} — {} file(s) merged", device_id, files_added));
+                }
+                AppEvent::SyncFailed { device_id, error } => {
+                    emit(&ui_state, tui_mode, "⚠", "SYNC", format!("{} — {}", device_id, error));
+                }
+                // ── Clipboard ─────────────────────────────────────────
+                AppEvent::ClipboardSent => {
+                    emit(&ui_state, tui_mode, "✓", "CLIP", "Clipboard sent");
+                }
+                AppEvent::ClipboardSendFailed(e) => {
+                    emit(&ui_state, tui_mode, "⚠", "CLIP", format!("Send failed: {}", e));
                 }
                 _ => {
                     // Ignore GUI-only events
