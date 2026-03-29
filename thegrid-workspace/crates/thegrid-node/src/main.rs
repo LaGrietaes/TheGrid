@@ -444,7 +444,8 @@ fn main() -> Result<()> {
 
     if tui_mode {
         if let Ok(s) = ui_state.lock() {
-            render_tui(&s, &runtime.config.lock().unwrap().device_name, runtime.config.lock().unwrap().agent_port);
+            let cfg = runtime.config.lock().unwrap();
+            render_tui(&s, &cfg.device_name, cfg.agent_port);
         }
     }
 
