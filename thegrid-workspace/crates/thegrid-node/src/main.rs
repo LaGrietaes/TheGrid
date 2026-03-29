@@ -294,6 +294,9 @@ fn main() -> Result<()> {
     let mut plain_mode = std::env::var("THEGRID_PLAIN")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    let mut force_tui = std::env::var("THEGRID_FORCE_TUI")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -326,6 +329,9 @@ fn main() -> Result<()> {
             "--plain" => {
                 plain_mode = true;
             }
+            "--force-tui" => {
+                force_tui = true;
+            }
             _ => {
                 log::warn!("Unknown argument: {}", args[i]);
             }
@@ -342,10 +348,23 @@ fn main() -> Result<()> {
     log::info!("Config: device={}, port={}, key_len={}", 
         config.device_name, config.agent_port, config.api_key.len());
 
-    print_banner(&config.device_name, config.agent_port);
-    event_line("✓", "BOOT", "Configuration loaded");
+    let stdin_tty = io::stdin().is_terminal();
+    let stdout_tty = io::stdout().is_terminal();
+    let tui_mode = !plain_mode && (force_tui || (stdin_tty && stdout_tty));
 
-    let tui_mode = !plain_mode && io::stdin().is_terminal() && io::stdout().is_terminal();
+    print_banner(&config.device_name, config.agent_port);
+
+    if tui_mode {
+        println!("  TUI mode : ACTIVE");
+    } else {
+        println!(
+            "  TUI mode : OFF  (stdin_tty={}, stdout_tty={}, plain={}, force={})",
+            stdin_tty, stdout_tty, plain_mode, force_tui
+        );
+        println!("  Tip      : run with --force-tui to enable the interactive interface");
+    }
+    println!();
+
     let ui_state = Arc::new(Mutex::new(TuiState::new()));
     emit(&ui_state, tui_mode, "✓", "BOOT", "Configuration loaded");
 
@@ -533,20 +552,20 @@ fn main() -> Result<()> {
                 AppEvent::SyncRequest { after, response_tx } => {
                     emit(&ui_state, tui_mode, "⇄", "SYNC", format!("Incoming sync request (after={})", after));
                     if let Ok(guard) = runtime.db.lock() {
-                        match guard.get_files_after(after) {
-                            Ok(results) => {
-                                let _ = response_tx.send(results);
+                        match guard.get_sync_delta_after(after) {
+                            Ok(delta) => {
+                                let _ = response_tx.send(delta);
                             }
                             Err(e) => {
                                 log::error!("Failed to query files for sync: {}", e);
-                                let _ = response_tx.send(vec![]);
+                                let _ = response_tx.send(thegrid_core::SyncDelta::default());
                             }
                         }
                     }
                 }
-                AppEvent::FileSystemChanged { paths, summary } => {
-                    emit(&ui_state, tui_mode, "Δ", "WATCHER", format!("{} ({} paths)", summary, paths.len()));
-                    runtime.spawn_incremental_index(paths);
+                AppEvent::FileSystemChanged { changes, summary } => {
+                    emit(&ui_state, tui_mode, "Δ", "WATCHER", format!("{} ({} changes)", summary, changes.len()));
+                    runtime.spawn_incremental_index(changes);
                 }
                 AppEvent::ClipboardReceived(entry) => {
                     let preview: String = entry.content.chars().take(80).collect();
