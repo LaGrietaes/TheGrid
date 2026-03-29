@@ -38,12 +38,17 @@ fn check_latest_release() -> Result<Option<ReleaseInfo>> {
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
 
-    let release = client
+    let response = client
         .get(RELEASES_LATEST_URL)
         .header("User-Agent", format!("thegrid-node/{}", env!("CARGO_PKG_VERSION")))
-        .send()?
-        .error_for_status()?
-        .json::<ReleaseInfo>()?;
+        .send()?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Repository has no published releases yet.
+        return Ok(None);
+    }
+
+    let release = response.error_for_status()?.json::<ReleaseInfo>()?;
 
     let latest = match parse_version_tag(&release.tag_name) {
         Some(v) => v,
@@ -557,14 +562,21 @@ fn main() -> Result<()> {
                 "ping" => {
                     if let Some(target) = parts.get(1) {
                         if let Ok(idx) = target.parse::<usize>() {
-                            if let Ok(s) = ui_state.lock() {
+                            let selected = if let Ok(s) = ui_state.lock() {
                                 if idx == 0 || idx > s.devices.len() {
-                                    emit(&ui_state, tui_mode, "⚠", "CMD", format!("Device index {} not found", idx));
+                                    None
                                 } else {
-                                    let (name, ip) = s.devices[idx - 1].clone();
-                                    runtime.spawn_ping(ip.clone(), true);
-                                    emit(&ui_state, tui_mode, "◎", "CMD", format!("Pinging #{} {} ({})", idx, name, ip));
+                                    Some(s.devices[idx - 1].clone())
                                 }
+                            } else {
+                                None
+                            };
+
+                            if let Some((name, ip)) = selected {
+                                runtime.spawn_ping(ip.clone(), true);
+                                emit(&ui_state, tui_mode, "◎", "CMD", format!("Pinging #{} {} ({})", idx, name, ip));
+                            } else {
+                                emit(&ui_state, tui_mode, "⚠", "CMD", format!("Device index {} not found", idx));
                             }
                         } else {
                             runtime.spawn_ping((*target).to_string(), true);
