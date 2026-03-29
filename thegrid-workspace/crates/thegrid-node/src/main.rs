@@ -72,7 +72,7 @@ fn prompt_yes_no(prompt: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-fn try_git_update() -> Result<()> {
+fn try_git_update() -> Result<String> {
     let probe = Command::new("git")
         .arg("rev-parse")
         .arg("--is-inside-work-tree")
@@ -80,6 +80,25 @@ fn try_git_update() -> Result<()> {
 
     if !probe.status.success() {
         anyhow::bail!("Current directory is not a git repository");
+    }
+
+    let before = Command::new("git")
+        .arg("rev-parse")
+        .arg("--short")
+        .arg("HEAD")
+        .output()?;
+    if !before.status.success() {
+        anyhow::bail!("Failed to read current git HEAD");
+    }
+    let before_head = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+    let fetch = Command::new("git")
+        .arg("fetch")
+        .arg("--prune")
+        .output()?;
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr);
+        anyhow::bail!("git fetch failed: {}", stderr.trim());
     }
 
     let pull = Command::new("git")
@@ -92,7 +111,21 @@ fn try_git_update() -> Result<()> {
         anyhow::bail!("git pull failed: {}", stderr.trim());
     }
 
-    Ok(())
+    let after = Command::new("git")
+        .arg("rev-parse")
+        .arg("--short")
+        .arg("HEAD")
+        .output()?;
+    if !after.status.success() {
+        anyhow::bail!("Failed to read updated git HEAD");
+    }
+    let after_head = String::from_utf8_lossy(&after.stdout).trim().to_string();
+
+    if before_head == after_head {
+        Ok(format!("Already up to date ({})", after_head))
+    } else {
+        Ok(format!("Updated {} -> {}", before_head, after_head))
+    }
 }
 
 fn ts() -> String {
@@ -232,27 +265,38 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         format!("Last: {}", state.last_status),
     ];
 
-    let mut right = vec![
-        "Commands".to_string(),
+    let mut commands = vec![
+        "COMMANDS".to_string(),
         "  help".to_string(),
         "  devices".to_string(),
         "  ping <ip|#> (device+agent)".to_string(),
         "  pingdev <ip|#>".to_string(),
         "  pingagent <ip|#>".to_string(),
         "  history | !! | !N".to_string(),
-        "  update".to_string(),
+        "  update (release check)".to_string(),
         "  quit".to_string(),
-        "Connected".to_string(),
+        "CONNECTED".to_string(),
+    ];
+
+    let dev_commands = [
+        "DEV COMMANDS",
+        "  gitupdate",
+        "  git status (shell)",
+        "  git log -1 (shell)",
     ];
 
     for (idx, (name, ip)) in state.devices.iter().take(5).enumerate() {
-        right.push(format!("  {}. {} ({})", idx + 1, name, ip));
+        commands.push(format!("  {}. {} ({})", idx + 1, name, ip));
     }
     if state.devices.is_empty() {
-        right.push("  none yet (run: devices)".to_string());
+        commands.push("  none yet (run: devices)".to_string());
     }
 
-    let upper_lines = left.len().max(right.len());
+    let cmd_w = (right_w.saturating_sub(3)) / 2;
+    let dev_w = right_w.saturating_sub(3).saturating_sub(cmd_w);
+    let right_lines = commands.len().max(dev_commands.len());
+
+    let upper_lines = left.len().max(right_lines);
     println!(
         "{ANSI_GREEN}╔{}╦{}╗{ANSI_RESET}",
         "═".repeat(left_w + 2),
@@ -260,18 +304,20 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
     );
     for i in 0..upper_lines {
         let l = left.get(i).map_or("", |s| s.as_str());
-        let r = right.get(i).map_or("", |s| s.as_str());
-        let right_color = if i == 0 || i == 9 { ANSI_BOLD } else { ANSI_WHITE };
+        let c = commands.get(i).map_or("", |s| s.as_str());
+        let d = dev_commands.get(i).copied().unwrap_or("");
+        let r = format!("{} │ {}", trim_fit(c, cmd_w), trim_fit(d, dev_w));
+        let right_color = if i == 0 { ANSI_BOLD } else { ANSI_WHITE };
         if i == 5 {
             println!(
                 "{ANSI_GREEN}║{ANSI_RESET} {status_c}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
                 trim_fit(l, left_w),
                 right_color,
-                trim_fit(r, right_w),
+                trim_fit(&r, right_w),
                 status_c = status_color(&state.last_status),
             );
         } else {
-            render_labeled_line(l, r, left_w, right_w, right_color);
+            render_labeled_line(l, &r, left_w, right_w, right_color);
         }
     }
     println!("{ANSI_GREEN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
@@ -476,8 +522,9 @@ fn main() -> Result<()> {
 
                 if should_update {
                     match try_git_update() {
-                        Ok(_) => {
-                            emit(&ui_state, tui_mode, "✓", "UPDATE", "Repository updated. Restart node to run latest release.");
+                        Ok(msg) => {
+                            emit(&ui_state, tui_mode, "✓", "UPDATE", msg);
+                            emit(&ui_state, tui_mode, "ℹ", "UPDATE", "Restart node to run latest release.");
                             return Ok(());
                         }
                         Err(e) => {
@@ -572,7 +619,7 @@ fn main() -> Result<()> {
 
             match parts[0].to_ascii_lowercase().as_str() {
                 "help" => {
-                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | history | !! | !N | update | quit");
+                    emit(&ui_state, tui_mode, "ℹ", "CMD", "help | devices | ping <ip|#> | pingdev <ip|#> | pingagent <ip|#> | gitupdate | history | !! | !N | update | quit");
                 }
                 "devices" => {
                     runtime.spawn_load_devices();
@@ -639,6 +686,16 @@ fn main() -> Result<()> {
                         }
                         Ok(None) => emit(&ui_state, tui_mode, "✓", "UPDATE", "Already up to date"),
                         Err(e) => emit(&ui_state, tui_mode, "⚠", "UPDATE", format!("Check failed: {}", e)),
+                    }
+                }
+                "gitupdate" => {
+                    emit(&ui_state, tui_mode, "↻", "GIT", "Fetching + fast-forward pull...");
+                    match try_git_update() {
+                        Ok(msg) => {
+                            emit(&ui_state, tui_mode, "✓", "GIT", msg);
+                            emit(&ui_state, tui_mode, "ℹ", "GIT", "Restart node to run the latest binary after pull.");
+                        }
+                        Err(e) => emit(&ui_state, tui_mode, "⚠", "GIT", format!("Update failed: {}", e)),
                     }
                 }
                 "quit" | "exit" => {
