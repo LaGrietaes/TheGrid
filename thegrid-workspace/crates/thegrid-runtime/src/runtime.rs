@@ -492,6 +492,7 @@ impl AppRuntime {
         let start = std::time::Instant::now();
         let scanned_total = Arc::new(AtomicU64::new(0));
         let dirs_processed = Arc::new(AtomicU64::new(0));
+        let max_total_seen = Arc::new(AtomicU64::new(total_hint));
         let mut worker_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
         worker_count = worker_count.clamp(2, 8);
         if root_filter.is_some() {
@@ -508,6 +509,7 @@ impl AppRuntime {
             let root_filter = root_filter.clone();
             let scanned_total = Arc::clone(&scanned_total);
             let dirs_processed = Arc::clone(&dirs_processed);
+            let max_total_seen = Arc::clone(&max_total_seen);
 
             workers.push(std::thread::spawn(move || -> u64 {
                 let mut local_scanned = 0u64;
@@ -621,9 +623,23 @@ impl AppRuntime {
                         dynamic_total
                     };
 
+                    let mut observed_max = max_total_seen.load(Ordering::Relaxed);
+                    while progress_total > observed_max {
+                        match max_total_seen.compare_exchange_weak(
+                            observed_max,
+                            progress_total,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => observed_max = actual,
+                        }
+                    }
+                    let stable_total = max_total_seen.load(Ordering::Relaxed).max(progress_scanned);
+
                     let _ = tx.send(AppEvent::IndexProgress {
                         scanned: progress_scanned,
-                        total:   progress_total,
+                        total:   stable_total,
                         current: dir_path.file_name().unwrap_or_default().to_string_lossy().into(),
                         ext:     None,
                         estimated_total: total_hint == 0,

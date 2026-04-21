@@ -1713,6 +1713,10 @@ impl TheGridApp {
 
                     ui.label(RichText::new(label).color(Colors::TEXT).size(10.0).monospace());
                     
+                    if let Some(rate) = self.index_stats.smoothed_files_per_sec {
+                        ui.label(RichText::new(format!(" {:.1} f/s", rate)).color(Colors::TEXT_DIM).size(10.0).monospace());
+                    }
+
                     if let Some(eta) = self.index_stats.scan_eta_secs {
                         ui.label(RichText::new(format!(" ETA: {}s", eta)).color(Colors::GREEN).size(10.0).monospace());
                     }
