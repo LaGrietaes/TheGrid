@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use egui_tiles::Tree;
 use egui::{Color32, Context, RichText};
+use serde::Deserialize;
 
 use thegrid_core::{AppEvent, Config};
 use thegrid_core::models::*;
@@ -59,6 +60,14 @@ use std::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen { Boot, Setup, Dashboard }
+
+const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
+
+#[derive(Debug, Deserialize)]
+struct ReleaseInfo {
+    tag_name: String,
+    html_url: String,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Toast notification
@@ -201,6 +210,7 @@ pub struct TheGridApp {
     last_input_at: std::time::Instant,
     idle_notified: bool,
     initial_scan_dispatched: bool,
+    release_check_dispatched: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -436,7 +446,54 @@ impl TheGridApp {
             last_input_at: std::time::Instant::now(),
             idle_notified: false,
             initial_scan_dispatched: false,
+            release_check_dispatched: false,
         }
+    }
+
+    fn start_release_check(&mut self) {
+        if self.release_check_dispatched {
+            return;
+        }
+        self.release_check_dispatched = true;
+
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let response = match client
+                .get(RELEASES_LATEST_URL)
+                .header("User-Agent", format!("thegrid-gui/{}", env!("CARGO_PKG_VERSION")))
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return;
+            }
+
+            let release = match response.error_for_status().and_then(|r| r.json::<ReleaseInfo>()) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+
+            let current = env!("CARGO_PKG_VERSION").trim_start_matches('v').to_string();
+            let latest = release.tag_name.trim_start_matches('v').to_string();
+            if latest != current {
+                let _ = tx.send(AppEvent::Status(format!(
+                    "update_available:{}|{}",
+                    release.tag_name,
+                    release.html_url
+                )));
+            }
+        });
     }
 
     fn start_initial_watch_scans(&mut self) {
@@ -1372,6 +1429,17 @@ impl TheGridApp {
                     if msg.starts_with("index_count:") {
                         if let Ok(n) = msg["index_count:".len()..].parse::<u64>() {
                             self.index_stats.total_files = n;
+                        }
+                    } else if msg.starts_with("update_available:") {
+                        let payload = &msg["update_available:".len()..];
+                        let mut parts = payload.splitn(2, '|');
+                        let version = parts.next().unwrap_or("unknown");
+                        let url = parts.next().unwrap_or("");
+                        self.push_toast(Toast::info(format!("Update available: {}", version)));
+                        if !url.is_empty() {
+                            self.set_status(format!("New version {} available: {}", version, url));
+                        } else {
+                            self.set_status(format!("New version {} available", version));
                         }
                     } else if msg.starts_with("config_update:") {
                         // Format: config_update:model="...",url="..."
@@ -2314,6 +2382,7 @@ impl eframe::App for TheGridApp {
 
             Screen::Dashboard => {
                 self.start_initial_watch_scans();
+                self.start_release_check();
                 self.render_titlebar(ctx);
                 self.render_statusbar(ctx);
                 self.render_footer_progress(ctx);

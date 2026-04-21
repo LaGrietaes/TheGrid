@@ -4,6 +4,7 @@
 
 set APP_NAME=The Grid
 set EXE_NAME=thegrid.exe
+set NODE_EXE_NAME=thegrid-node.exe
 
 echo [!] Installing %APP_NAME%...
 
@@ -24,6 +25,15 @@ echo oLink.TargetPath = "%~dp0%EXE_NAME%" >> %SCRIPT_PATH%
 echo oLink.WorkingDirectory = "%~dp0" >> %SCRIPT_PATH%
 echo oLink.Description = "Secure Mesh Network and AI Terminal" >> %SCRIPT_PATH%
 echo oLink.Save >> %SCRIPT_PATH%
+
+echo If CreateObject("Scripting.FileSystemObject").FileExists("%~dp0%NODE_EXE_NAME%") Then >> %SCRIPT_PATH%
+echo   sNodeLinkFile = oWS.SpecialFolders("Desktop") ^& "\%APP_NAME% Node.lnk" >> %SCRIPT_PATH%
+echo   Set oNodeLink = oWS.CreateShortcut(sNodeLinkFile) >> %SCRIPT_PATH%
+echo   oNodeLink.TargetPath = "%~dp0%NODE_EXE_NAME%" >> %SCRIPT_PATH%
+echo   oNodeLink.WorkingDirectory = "%~dp0" >> %SCRIPT_PATH%
+echo   oNodeLink.Description = "The Grid headless node" >> %SCRIPT_PATH%
+echo   oNodeLink.Save >> %SCRIPT_PATH%
+echo End If >> %SCRIPT_PATH%
 cscript //nologo %SCRIPT_PATH%
 del %SCRIPT_PATH%
 
