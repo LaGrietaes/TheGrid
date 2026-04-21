@@ -47,24 +47,53 @@ impl RdpLauncher {
 
         #[cfg(target_os = "windows")]
         {
-            let mut cmd = Command::new("mstsc.exe");
-            cmd.arg(format!("/v:{}", ip));
-
-            // Windows mstsc.exe does NOT support a `/u:` parameter natively.
-            // If the user needs to authenticate, mstsc will display the credentials prompt automatically.
-            let _ = username; // Ignored for now. Future: write out a temporary .rdp file.
-
-            if let RdpResolution::Custom(w, h) = resolution {
-                cmd.arg(format!("/w:{}", w));
-                cmd.arg(format!("/h:{}", h));
+            use std::io::Write;
+            
+            // On Windows, mstsc.exe does NOT support a `/u:` parameter for usernames.
+            // To pass a username, we must write out a temporary .rdp file.
+            let temp_dir = std::env::temp_dir();
+            let rdp_path = temp_dir.join(format!("thegrid_{}.rdp", ip.replace(".", "_").replace(":", "_")));
+            
+            let mut file = std::fs::File::create(&rdp_path)
+                .map_err(|e| anyhow::anyhow!("Failed to create temporary .rdp file: {}", e))?;
+            
+            // Build the .rdp content
+            writeln!(file, "full address:s:{}", ip)?;
+            if let Some(user) = username {
+                if !user.trim().is_empty() {
+                    writeln!(file, "username:s:{}", user)?;
+                }
             }
+            
+            match resolution {
+                RdpResolution::FullScreen => {
+                    writeln!(file, "screen mode id:i:2")?; // Fullscreen
+                }
+                RdpResolution::Custom(w, h) => {
+                    writeln!(file, "screen mode id:i:1")?; // Deskop window
+                    writeln!(file, "desktopwidth:i:{}", w)?;
+                    writeln!(file, "desktopheight:i:{}", h)?;
+                }
+            }
+            
+            // Optimization for high-latency/Tailscale connections
+            writeln!(file, "compression:i:1")?;
+            writeln!(file, "keyboardhook:i:2")?;
+            writeln!(file, "audiomode:i:0")?;
+            writeln!(file, "redirectclipboard:i:1")?;
+            writeln!(file, "displayconnectionbar:i:1")?;
+            
+            // Force prompt for credentials to ensure a clean login if NLA fails
+            // writeln!(file, "prompt for credentials:i:1")?; 
 
+            let mut cmd = Command::new("mstsc.exe");
+            cmd.arg(rdp_path.to_string_lossy().to_string());
+            
             // Run the process directly. mstsc is a GUI app, so it won't open a console.
-            // Using DETACHED_PROCESS breaks UI rendering and clipboard in Windows 11.
             cmd.spawn()
-                .map_err(|e| anyhow::anyhow!("Failed to launch mstsc.exe: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to launch mstsc.exe with .rdp file: {}", e))?;
 
-            log::info!("Launched mstsc.exe for {}", ip);
+            log::info!("Launched mstsc.exe for {} with temp .rdp at {:?}", ip, rdp_path);
             Ok(())
         }
     }

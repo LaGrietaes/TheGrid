@@ -128,10 +128,9 @@ pub struct TheGridApp {
     selected_node_ids:   Vec<String>,
     tailscale_connected: bool,
 
-    // ── Per-device UI state ───────────────────────────────────────────────────
-    active_tab:     DashTab,
-    rdp_username:   String,
-    rdp_resolution: String,
+    // ── Per-device RDP preferences ───────────────────────────────────────────
+    rdp_usernames:   HashMap<String, String>,
+    rdp_resolutions: HashMap<String, String>,
     is_tg_agent:    bool,
 
     // ── Clipboard / file transfer ─────────────────────────────────────────────
@@ -380,7 +379,6 @@ impl TheGridApp {
             ..Default::default()
         };
         let settings     = SettingsState::from_config(&config);
-        let rdp_username = config.rdp_username.clone();
 
         // Initialize the shared runtime
         let runtime = Arc::new(AppRuntime::new(config.clone(), tx.clone())
@@ -400,8 +398,8 @@ impl TheGridApp {
             selected_node_ids: Vec::new(),
             tailscale_connected: false,
             active_tab:     DashTab::default(),
-            rdp_username,
-            rdp_resolution: "FULLSCREEN".into(),
+            rdp_usernames:   HashMap::new(),
+            rdp_resolutions: HashMap::new(),
             is_tg_agent: false,
             clip_out:   String::new(),
             clip_inbox: Vec::new(),
@@ -1961,10 +1959,13 @@ impl TheGridApp {
 
     fn handle_detail_actions(&mut self, actions: DetailActions, ip: &str, device_id: &str) {
         if actions.launch_rdp {
-            let user = if self.rdp_username.trim().is_empty() { None }
-                       else { Some(self.rdp_username.trim()) };
-            let res = RdpResolution::from_str(&self.rdp_resolution);
-            match RdpLauncher::launch(ip, user, &res) {
+            let rdp_user = self.rdp_usernames.get(device_id).map(|s| s.as_str())
+                .or_else(|| if self.config.rdp_username.is_empty() { None } else { Some(&self.config.rdp_username) });
+            
+            let rdp_res_str = self.rdp_resolutions.get(device_id).cloned().unwrap_or_else(|| "FULLSCREEN".into());
+            let res = RdpResolution::from_str(&rdp_res_str);
+            
+            match RdpLauncher::launch(ip, rdp_user, &res) {
                 Ok(_)  => self.push_toast(Toast::ok(format!("RDP → {}", ip))),
                 Err(e) => self.push_toast(Toast::err(format!("RDP failed: {}", e))),
             }
@@ -2534,12 +2535,16 @@ impl eframe::App for TheGridApp {
                             let watch_snap   = self.runtime.config.lock().unwrap().watch_paths.clone();
                             let telem_snap   = telemetry_snap.get(&device.id).cloned();
 
-                            let status = self.get_node_status(&device.id);
+                            let rdp_user = self.rdp_usernames.entry(device.id.clone())
+                                .or_insert_with(|| self.config.rdp_username.clone());
+                            let rdp_res  = self.rdp_resolutions.entry(device.id.clone())
+                                .or_insert_with(|| "FULLSCREEN".into());
+
                             let mut detail = DetailState {
                                 device:         &device,
                                 active_tab:     &mut self.active_tab,
-                                rdp_username:   &mut self.rdp_username,
-                                rdp_resolution: &mut self.rdp_resolution,
+                                rdp_username:   rdp_user,
+                                rdp_resolution: rdp_res,
                                 clip_out:       &mut self.clip_out,
                                 clip_inbox:     &clip_snap,
                                 file_queue:     &queue_snap,
