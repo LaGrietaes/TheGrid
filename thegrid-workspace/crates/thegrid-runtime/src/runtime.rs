@@ -855,25 +855,55 @@ impl AppRuntime {
 
         std::thread::spawn(move || {
             const LOCAL_OLLAMA: &str = "http://127.0.0.1:11434";
+            const REMOTE_LOCALAI: &str = "http://100.67.58.127:8080";
 
-            // Resolve provider URL + model — explicit config wins, then auto-detect Ollama.
+            // Resolve provider URL + model — explicit config wins, then auto-detect with fallback.
             let (resolved_url, resolved_model) = {
                 let cfg = config.lock().unwrap();
                 match (cfg.ai_provider_url.clone(), cfg.ai_model.clone()) {
                     (Some(u), m) => (u, m.unwrap_or_else(|| "nomic-embed-text".to_string())),
                     (None, _) => {
-                        // Auto-detect local Ollama
-                        match thegrid_ai::probe_ollama_models(LOCAL_OLLAMA) {
-                            Some(models) if !models.is_empty() => {
-                                let best = thegrid_ai::pick_best_embed_model(&models)
-                                    .unwrap_or_else(|| "nomic-embed-text".to_string());
-                                log::info!("[AI] Auto-detected Ollama ({} model(s)), selecting '{}'", models.len(), best);
-                                (LOCAL_OLLAMA.to_string(), best)
+                        // Auto-detect: try local Ollama first, then remote LocalAI, then fallback
+                        let endpoints = vec![
+                            (LOCAL_OLLAMA, "Local Ollama (GPU-accel)"),
+                            (REMOTE_LOCALAI, "Tablet LocalAI (backup)"),
+                        ];
+
+                        let mut found_endpoint = None;
+                        for (url, label) in endpoints {
+                            match thegrid_ai::probe_ollama_models(url) {
+                                Some(models) if !models.is_empty() => {
+                                    let best = thegrid_ai::pick_best_embed_model(&models)
+                                        .unwrap_or_else(|| "nomic-embed-text".to_string());
+                                    log::info!("[AI] {} → {} model(s), selecting '{}'", label, models.len(), best);
+                                    found_endpoint = Some((url.to_string(), best));
+                                    break;
+                                }
+                                _ => {
+                                    // Try next endpoint
+                                    log::debug!("[AI] {} not reachable, trying next...", label);
+                                    continue;
+                                }
                             }
-                            _ => {
-                                log::warn!("[AI] No Ollama found at {} and no ai_provider_url configured. Semantic search unavailable.", LOCAL_OLLAMA);
+                        }
+
+                        // Also try LocalAI via /v1/models endpoint
+                        if found_endpoint.is_none() {
+                            if let Some(models) = thegrid_ai::probe_localai_models(REMOTE_LOCALAI) {
+                                if !models.is_empty() {
+                                    let best = models.first().cloned().unwrap_or_else(|| "deepseek-coder-16b.gguf".to_string());
+                                    log::info!("[AI] Tablet LocalAI (OpenAI API) → {} model(s), selecting '{}'", models.len(), best);
+                                    found_endpoint = Some((REMOTE_LOCALAI.to_string(), best));
+                                }
+                            }
+                        }
+
+                        match found_endpoint {
+                            Some((url, model)) => (url, model),
+                            None => {
+                                log::warn!("[AI] No AI provider found. Start Ollama locally or ensure tablet LocalAI is reachable.");
                                 let _ = event_tx.send(AppEvent::SemanticFailed(
-                                    "No AI provider: start Ollama or set ai_provider_url in config.".to_string()
+                                    "No AI provider: start Ollama locally (http://127.0.0.1:11434) or check tablet LocalAI at 100.67.58.127:8080".to_string()
                                 ));
                                 return;
                             }

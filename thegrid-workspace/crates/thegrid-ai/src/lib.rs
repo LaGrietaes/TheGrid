@@ -35,51 +35,100 @@ impl EmbeddingProvider for FastEmbedProvider {
     }
 }
 
-/// Provider that talks to an external HTTP AI server (Ollama, llama.cpp, etc.)
+/// Wire format used by the remote embedding server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiFormat {
+    /// Ollama: POST /api/embeddings {model, prompt} → {embedding: [...]}
+    Ollama,
+    /// OpenAI-compatible: POST /v1/embeddings {model, input} → {data:[{embedding:[...]}]}
+    OpenAi,
+}
+
+/// Provider that talks to an external HTTP AI server (Ollama, LocalAI, llama.cpp, etc.)
 pub struct HttpEmbeddingProvider {
     model_name: String,
     base_url: String,
     client: reqwest::blocking::Client,
     dims: usize,
+    format: ApiFormat,
 }
 
 impl HttpEmbeddingProvider {
-    /// Connect to the Ollama endpoint, confirm reachability, and probe actual vector dimensions.
+    /// Connect to an embedding endpoint, auto-detect format, and probe actual vector dimensions.
+    /// Tries OpenAI-compat first, then Ollama format.
     pub fn new(model_name: String, base_url: String) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(20))
             .build()?;
 
-        let probe_url = format!("{}/api/embeddings", base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": model_name,
-            "prompt": "probe",
-        });
+        // Try OpenAI-compat format first (/v1/embeddings)
+        if let Ok((dims, format)) = Self::probe_format(&client, &model_name, &base_url, ApiFormat::OpenAi) {
+            if dims > 0 {
+                log::info!("[AI] LocalAI/OpenAI-compat ready: model={} dims={} url={}", model_name, dims, base_url);
+                return Ok(Self { model_name, base_url, client, dims, format });
+            }
+        }
 
-        let resp = client.post(&probe_url)
-            .json(&body)
-            .send()
-            .map_err(|e| anyhow::anyhow!("Ollama not reachable at {}: {}", base_url, e))?;
+        // Fall back to Ollama format (/api/embeddings)
+        let (dims, format) = Self::probe_format(&client, &model_name, &base_url, ApiFormat::Ollama)
+            .map_err(|e| anyhow::anyhow!("AI server not reachable at {}: {}", base_url, e))?;
 
-        if !resp.status().is_success() {
+        if dims == 0 {
             return Err(anyhow::anyhow!(
-                "Ollama returned {} for model '{}'. Run: ollama pull {}",
-                resp.status(), model_name, model_name
+                "AI server returned empty embedding for '{}'. Check model config.",
+                model_name
             ));
         }
 
-        #[derive(serde::Deserialize)]
-        struct OllamaResp { embedding: Vec<f32> }
-        let data: OllamaResp = resp.json()
-            .map_err(|e| anyhow::anyhow!("Bad Ollama probe response: {}", e))?;
-
-        let dims = data.embedding.len();
-        if dims == 0 {
-            return Err(anyhow::anyhow!("Ollama returned empty embedding for '{}'", model_name));
-        }
-
         log::info!("[AI] Ollama ready: model={} dims={} url={}", model_name, dims, base_url);
-        Ok(Self { model_name, base_url, client, dims })
+        Ok(Self { model_name, base_url, client, dims, format })
+    }
+
+    fn probe_format(client: &reqwest::blocking::Client, model_name: &str, base_url: &str, format: ApiFormat) -> Result<(usize, ApiFormat)> {
+        let vec = Self::do_embed_with(client, model_name, base_url, "probe", format)?;
+        Ok((vec.len(), format))
+    }
+
+    fn do_embed_with(
+        client: &reqwest::blocking::Client,
+        model_name: &str,
+        base_url: &str,
+        text: &str,
+        format: ApiFormat,
+    ) -> Result<Vec<f32>> {
+        let base = base_url.trim_end_matches('/');
+        match format {
+            ApiFormat::OpenAi => {
+                let url = format!("{}/v1/embeddings", base);
+                let body = serde_json::json!({ "model": model_name, "input": text });
+                let resp = client.post(&url).json(&body).send()
+                    .map_err(|e| anyhow::anyhow!("OpenAI embed request failed: {}", e))?;
+                if !resp.status().is_success() {
+                    return Err(anyhow::anyhow!("OpenAI embed HTTP {}", resp.status()));
+                }
+                #[derive(serde::Deserialize)]
+                struct EmbObj { embedding: Vec<f32> }
+                #[derive(serde::Deserialize)]
+                struct OpenAiResp { data: Vec<EmbObj> }
+                let data: OpenAiResp = resp.json()
+                    .map_err(|e| anyhow::anyhow!("Bad OpenAI embed response: {}", e))?;
+                Ok(data.data.into_iter().next().map(|e| e.embedding).unwrap_or_default())
+            }
+            ApiFormat::Ollama => {
+                let url = format!("{}/api/embeddings", base);
+                let body = serde_json::json!({ "model": model_name, "prompt": text });
+                let resp = client.post(&url).json(&body).send()
+                    .map_err(|e| anyhow::anyhow!("Ollama embed request failed: {}", e))?;
+                if !resp.status().is_success() {
+                    return Err(anyhow::anyhow!("Ollama embed HTTP {}", resp.status()));
+                }
+                #[derive(serde::Deserialize)]
+                struct OllamaResp { embedding: Vec<f32> }
+                let data: OllamaResp = resp.json()
+                    .map_err(|e| anyhow::anyhow!("Bad Ollama embed response: {}", e))?;
+                Ok(data.embedding)
+            }
+        }
     }
 }
 
@@ -88,26 +137,7 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
     fn model_id(&self) -> &str { &self.model_name }
 
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let url = format!("{}/api/embeddings", self.base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": self.model_name,
-            "prompt": text,
-        });
-
-        let resp = self.client.post(&url)
-            .json(&body)
-            .send()
-            .map_err(|e| anyhow::anyhow!("HTTP AI request failed: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(anyhow::anyhow!("HTTP AI returned status {}", resp.status()));
-        }
-
-        #[derive(serde::Deserialize)]
-        struct OllamaResp { embedding: Vec<f32> }
-        let data: OllamaResp = resp.json()
-            .map_err(|e| anyhow::anyhow!("Failed to parse AI response: {}", e))?;
-        Ok(data.embedding)
+        Self::do_embed_with(&self.client, &self.model_name, &self.base_url, text, self.format)
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -133,6 +163,27 @@ pub fn probe_ollama_models(base_url: &str) -> Option<Vec<String>> {
 
     let data: TagsResp = resp.json().ok()?;
     Some(data.models.into_iter().map(|m| m.name).collect())
+}
+
+/// Probe a LocalAI / OpenAI-compatible instance and return the list of model ids.
+/// Returns `None` if the server is not running or not reachable.
+pub fn probe_localai_models(base_url: &str) -> Option<Vec<String>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build().ok()?;
+
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let resp = client.get(&url).send().ok()?;
+    if !resp.status().is_success() { return None; }
+
+    #[derive(serde::Deserialize)]
+    struct ModelObj { id: String }
+    #[derive(serde::Deserialize)]
+    struct ModelsResp { data: Vec<ModelObj> }
+
+    let data: ModelsResp = resp.json().ok()?;
+    let ids: Vec<String> = data.data.into_iter().map(|m| m.id).collect();
+    if ids.is_empty() { None } else { Some(ids) }
 }
 
 /// Pick the best embedding-capable model from an available Ollama model list.
