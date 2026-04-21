@@ -768,19 +768,38 @@ fn execute_command(
             runtime.spawn_duplicates_scan();
         }
         ParsedCommand::History => {
-            if let Ok(s) = ui_state.lock() {
+            let history_lines = if let Ok(s) = ui_state.lock() {
                 if s.command_history.is_empty() {
-                    emit(ui_state, tui_mode, "ℹ", "HISTORY", "No commands in history yet");
+                    Vec::new()
                 } else {
-                    for (idx, cmd) in s.command_history.iter().enumerate() {
-                        emit(ui_state, tui_mode, "·", "HISTORY", format!("{}: {}", idx + 1, cmd));
-                    }
+                    s.command_history
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, cmd)| format!("{}: {}", idx + 1, cmd))
+                        .collect::<Vec<_>>()
+                }
+            } else {
+                Vec::new()
+            };
+
+            if history_lines.is_empty() {
+                emit(ui_state, tui_mode, "ℹ", "HISTORY", "No commands in history yet");
+            } else {
+                for line in history_lines {
+                    emit(ui_state, tui_mode, "·", "HISTORY", line);
                 }
             }
         }
         ParsedCommand::Update => {
-            match check_latest_release() {
-                Ok(Some(release)) => {
+            emit(ui_state, tui_mode, "…", "UPDATE", "Checking latest release...");
+
+            let (release_tx, release_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = release_tx.send(check_latest_release());
+            });
+
+            match release_rx.recv_timeout(Duration::from_secs(8)) {
+                Ok(Ok(Some(release))) => {
                     emit(
                         ui_state,
                         tui_mode,
@@ -789,8 +808,14 @@ fn execute_command(
                         format!("New release {} available: {}", release.tag_name, release.html_url),
                     );
                 }
-                Ok(None) => emit(ui_state, tui_mode, "✓", "UPDATE", "Already up to date"),
-                Err(e) => emit(ui_state, tui_mode, "⚠", "UPDATE", format!("Check failed: {}", e)),
+                Ok(Ok(None)) => emit(ui_state, tui_mode, "✓", "UPDATE", "Already up to date"),
+                Ok(Err(e)) => emit(ui_state, tui_mode, "⚠", "UPDATE", format!("Check failed: {}", e)),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    emit(ui_state, tui_mode, "⚠", "UPDATE", "Check timed out after 8s");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    emit(ui_state, tui_mode, "⚠", "UPDATE", "Check failed: worker disconnected");
+                }
             }
         }
         ParsedCommand::GitUpdate => {

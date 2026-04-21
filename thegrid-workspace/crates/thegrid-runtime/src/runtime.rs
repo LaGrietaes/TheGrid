@@ -10,7 +10,7 @@ use thegrid_core::{
     fingerprint_file, match_rules, should_skip_dir, should_skip_path, AppEvent, Config, Database,
     DetectionSourceDistribution, FileChange, FileWatcher, SyncHealthMetrics,
 };
-use thegrid_net::{AgentClient, AgentServer, TailscaleClient, WolSentry};
+use thegrid_net::{AgentClient, AgentServer, TailscaleClient, TermuxAgent, WolSentry};
 use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
 
 fn apply_automation_rules_for_file(
@@ -114,6 +114,7 @@ pub struct AppRuntime {
     
     // Remote AI Capabilities (device_id -> ip)
     pub remote_ai_nodes: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    pub termux_agent: Arc<Mutex<Option<TermuxAgent>>>,
     
     // State
     pub is_ai_node: bool,
@@ -124,6 +125,25 @@ pub struct AppRuntime {
 }
 
 impl AppRuntime {
+    fn parse_agent_target(endpoint: &str, fallback_port: u16) -> Option<(String, u16)> {
+        let trimmed = endpoint.trim();
+        let without_scheme = trimmed
+            .strip_prefix("http://")
+            .or_else(|| trimmed.strip_prefix("https://"))
+            .unwrap_or(trimmed);
+        let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+        if host_port.is_empty() {
+            return None;
+        }
+
+        if let Some((host, port_str)) = host_port.rsplit_once(':') {
+            let port = port_str.parse::<u16>().ok().unwrap_or(fallback_port);
+            Some((host.to_string(), port))
+        } else {
+            Some((host_port.to_string(), fallback_port))
+        }
+    }
+
     pub fn new(config: Config, event_tx: mpsc::Sender<AppEvent>) -> Result<Self> {
         let db_path = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -165,6 +185,7 @@ impl AppRuntime {
             file_watcher,
             semantic_search: Arc::new(Mutex::new(None)),
             remote_ai_nodes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            termux_agent: Arc::new(Mutex::new(None)),
             is_ai_node,
             media_analyzer: Arc::new(Mutex::new(None)),
             agent_shutdown: Arc::new(Mutex::new(None)),
@@ -180,6 +201,15 @@ impl AppRuntime {
             let cfg = self.config.lock().unwrap();
             (cfg.agent_port, cfg.api_key.clone(), cfg.clone())
         };
+
+        let _ = self.event_tx.send(AppEvent::Status(format!(
+            "security_gates:file_access={},terminal_access={},ai_access={},remote_control={},rdp={}",
+            c.enable_file_access,
+            c.enable_terminal_access,
+            c.enable_ai_access,
+            c.enable_remote_control,
+            c.enable_rdp
+        )));
 
         // Start agent server
         let transfers_dir = c.effective_transfers_dir();
@@ -198,8 +228,23 @@ impl AppRuntime {
         }
 
         // Detect & setup Termux node via USB-C OTG (faster than WiFi)
-        if let Err(e) = thegrid_net::setup_termux_otg() {
-            log::debug!("[Runtime] Termux setup: {}", e);
+        if let Some(agent) = thegrid_net::setup_termux_agent() {
+            let method = agent.connection_method();
+            let endpoint = agent.endpoint().to_string();
+            {
+                let mut slot = self.termux_agent.lock().unwrap();
+                *slot = Some(agent);
+            }
+            log::info!("[Runtime] Tablet (Android) available via {} at {}", method, endpoint);
+            let _ = self.event_tx.send(AppEvent::Status(format!(
+                "termux_ready:{}:{}",
+                method,
+                endpoint
+            )));
+        } else {
+            let mut slot = self.termux_agent.lock().unwrap();
+            *slot = None;
+            log::debug!("[Runtime] No Termux/Android device available");
         }
 
         // Start AI if capable OR if provider URL is set (which overrides local specs)
@@ -861,6 +906,7 @@ impl AppRuntime {
         std::thread::spawn(move || {
             const LOCAL_OLLAMA: &str = "http://127.0.0.1:11434";
             const REMOTE_LOCALAI: &str = "http://100.67.58.127:8080";
+            let prefer_remote_first = !thegrid_ai::AiNodeDetector::new().is_ai_node();
 
             // Resolve provider URL + model — explicit config wins, then auto-detect with fallback.
             let (resolved_url, resolved_model) = {
@@ -869,10 +915,17 @@ impl AppRuntime {
                     (Some(u), m) => (u, m.unwrap_or_else(|| "nomic-embed-text".to_string())),
                     (None, _) => {
                         // Auto-detect: try local Ollama first, then remote LocalAI, then fallback
-                        let endpoints = vec![
-                            (LOCAL_OLLAMA, "Local Ollama (GPU-accel)"),
-                            (REMOTE_LOCALAI, "Tablet LocalAI (backup)"),
-                        ];
+                        let endpoints = if prefer_remote_first {
+                            vec![
+                                (REMOTE_LOCALAI, "Tablet LocalAI (preferred for non-AI node)"),
+                                (LOCAL_OLLAMA, "Local Ollama (fallback)"),
+                            ]
+                        } else {
+                            vec![
+                                (LOCAL_OLLAMA, "Local Ollama (GPU-accel)"),
+                                (REMOTE_LOCALAI, "Tablet LocalAI (backup)"),
+                            ]
+                        };
 
                         let mut found_endpoint = None;
                         for (url, label) in endpoints {
@@ -971,6 +1024,7 @@ impl AppRuntime {
         let event_tx = self.event_tx.clone();
         let semantic = self.semantic_search.clone();
         let remote_ai = self.remote_ai_nodes.clone();
+        let termux_agent = self.termux_agent.clone();
         let (api_key, port) = {
             let cfg = self.config.lock().unwrap();
             (cfg.api_key.clone(), cfg.agent_port)
@@ -979,12 +1033,53 @@ impl AppRuntime {
         std::thread::spawn(move || {
             let total = db.lock().ok().and_then(|g| g.count_unindexed_files().ok()).unwrap_or(0);
             let mut indexed = 0;
+            let mut last_termux_heartbeat = std::time::Instant::now() - std::time::Duration::from_secs(60);
 
             loop {
                 let has_local_engine = {
                     let lock = semantic.lock().expect("semantic lock");
                     lock.is_some()
                 };
+
+                // Lightweight heartbeat + auto-degradation: if current Termux endpoint fails,
+                // attempt to re-establish via OTG -> LAN -> Tailscale.
+                if last_termux_heartbeat.elapsed() >= std::time::Duration::from_secs(15) {
+                    let mut heartbeat_status: Option<(String, String)> = None;
+                    {
+                        let mut lock = termux_agent.lock().unwrap();
+                        if let Some(agent) = lock.as_mut() {
+                            let endpoint = agent.endpoint().to_string();
+                            if let Some((ip, p)) = AppRuntime::parse_agent_target(&endpoint, port) {
+                                let ok = AgentClient::new(&ip, p, api_key.clone())
+                                    .and_then(|c| c.ping())
+                                    .map(|r| r.authorized)
+                                    .unwrap_or(false);
+
+                                if !ok {
+                                    match agent.establish_best_connection() {
+                                        Ok(()) => {
+                                            heartbeat_status = Some((
+                                                "termux_recovered".to_string(),
+                                                format!("{}:{}", agent.connection_method(), agent.endpoint()),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            heartbeat_status = Some((
+                                                "termux_unreachable".to_string(),
+                                                e.to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some((kind, payload)) = heartbeat_status {
+                        let _ = event_tx.send(AppEvent::Status(format!("{}:{}", kind, payload)));
+                    }
+                    last_termux_heartbeat = std::time::Instant::now();
+                }
 
                 let batch = match db.lock() {
                     Ok(guard) => guard.get_files_needing_embedding(20).unwrap_or_default(),
@@ -1008,7 +1103,28 @@ impl AppRuntime {
                                 success = true;
                             }
                         }
-                    } else {
+                    }
+
+                    if !success {
+                        // First fallback: tablet node through the current Termux route.
+                        let termux_target = {
+                            let lock = termux_agent.lock().unwrap();
+                            lock.as_ref().and_then(|a| {
+                                AppRuntime::parse_agent_target(a.endpoint(), port)
+                            })
+                        };
+
+                        if let Some((ip, p)) = termux_target {
+                            if let Ok(client) = AgentClient::new(&ip, p, api_key.clone()) {
+                                if let Ok(v) = client.remote_embed(&text) {
+                                    vector = v;
+                                    success = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !success {
                         // Try remote AI delegation
                         let remote_node = {
                             let nodes = remote_ai.lock().unwrap();
@@ -1299,10 +1415,29 @@ impl AppRuntime {
 
     pub fn handle_remote_ai_embed(&self, text: String, response_tx: mpsc::Sender<Vec<f32>>) {
         let semantic = self.semantic_search.clone();
+        let config = self.config.clone();
         std::thread::spawn(move || {
-            let lock = semantic.lock().unwrap();
-            if let Some(engine) = &*lock {
-                if let Ok(v) = engine.embed(&text) {
+            {
+                let lock = semantic.lock().unwrap();
+                if let Some(engine) = &*lock {
+                    if let Ok(v) = engine.embed(&text) {
+                        let _ = response_tx.send(v);
+                        return;
+                    }
+                }
+            }
+
+            // Fallback for nodes that changed provider at runtime or are still initializing.
+            let (provider_url, model_name) = {
+                let cfg = config.lock().unwrap();
+                (
+                    cfg.ai_provider_url.clone().unwrap_or_else(|| "http://100.67.58.127:8080".to_string()),
+                    cfg.ai_model.clone().unwrap_or_else(|| "nomic-embed-text".to_string()),
+                )
+            };
+
+            if let Ok(provider) = thegrid_ai::HttpEmbeddingProvider::new(model_name, provider_url) {
+                if let Ok(v) = provider.embed(&text) {
                     let _ = response_tx.send(v);
                 }
             }

@@ -95,6 +95,17 @@ impl AgentServer {
         }
     }
 
+    fn capability_snapshot_json(&self) -> serde_json::Value {
+        let cfg = self.config.lock().unwrap();
+        serde_json::json!({
+            "file_access": cfg.enable_file_access,
+            "terminal_access": cfg.enable_terminal_access,
+            "ai_access": cfg.enable_ai_access,
+            "remote_control": cfg.enable_remote_control,
+            "rdp_enabled": cfg.enable_rdp,
+        })
+    }
+
     fn respond_capability_forbidden(req: Request, capability: &str) -> Result<()> {
         let body = serde_json::json!({
             "error": "forbidden",
@@ -266,6 +277,18 @@ impl AgentServer {
                 collect_telemetry(&cfg)
             };
             let json = serde_json::to_string(&telemetry).unwrap_or_default();
+            req.respond(Response::from_string(json)
+                .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            )?;
+            return Ok(());
+        }
+
+        if method == "GET" && url == "/v1/capabilities" {
+            let body = serde_json::json!({
+                "ok": true,
+                "capabilities": self.capability_snapshot_json(),
+            });
+            let json = body.to_string();
             req.respond(Response::from_string(json)
                 .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
             )?;

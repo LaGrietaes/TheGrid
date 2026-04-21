@@ -10,4 +10,4 @@ pub use rdp::{RdpLauncher, RdpResolution};
 pub use agent::{AgentServer, AgentClient};
 pub use wol::WolSentry;
 pub use win_sys::{is_rdp_enabled, enable_rdp};
-pub use termux_agent::{TermuxAgent, setup_termux_otg};
+pub use termux_agent::{TermuxAgent, ConnectionMethod, setup_termux_agent};
