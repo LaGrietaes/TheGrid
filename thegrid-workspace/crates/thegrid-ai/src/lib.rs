@@ -40,25 +40,54 @@ pub struct HttpEmbeddingProvider {
     model_name: String,
     base_url: String,
     client: reqwest::blocking::Client,
+    dims: usize,
 }
 
 impl HttpEmbeddingProvider {
-    pub fn new(model_name: String, base_url: String) -> Self {
-        log::info!("[AI] Initializing HTTP AI provider: {} at {}", model_name, base_url);
-        Self {
-            model_name,
-            base_url,
-            client: reqwest::blocking::Client::new(),
+    /// Connect to the Ollama endpoint, confirm reachability, and probe actual vector dimensions.
+    pub fn new(model_name: String, base_url: String) -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+
+        let probe_url = format!("{}/api/embeddings", base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": model_name,
+            "prompt": "probe",
+        });
+
+        let resp = client.post(&probe_url)
+            .json(&body)
+            .send()
+            .map_err(|e| anyhow::anyhow!("Ollama not reachable at {}: {}", base_url, e))?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!(
+                "Ollama returned {} for model '{}'. Run: ollama pull {}",
+                resp.status(), model_name, model_name
+            ));
         }
+
+        #[derive(serde::Deserialize)]
+        struct OllamaResp { embedding: Vec<f32> }
+        let data: OllamaResp = resp.json()
+            .map_err(|e| anyhow::anyhow!("Bad Ollama probe response: {}", e))?;
+
+        let dims = data.embedding.len();
+        if dims == 0 {
+            return Err(anyhow::anyhow!("Ollama returned empty embedding for '{}'", model_name));
+        }
+
+        log::info!("[AI] Ollama ready: model={} dims={} url={}", model_name, dims, base_url);
+        Ok(Self { model_name, base_url, client, dims })
     }
 }
 
 impl EmbeddingProvider for HttpEmbeddingProvider {
-    fn dimensions(&self) -> usize { 384 } // Common for many models, should be configurable
+    fn dimensions(&self) -> usize { self.dims }
     fn model_id(&self) -> &str { &self.model_name }
 
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        // Simple Ollama-style embedding request
         let url = format!("{}/api/embeddings", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model_name,
@@ -76,34 +105,112 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
 
         #[derive(serde::Deserialize)]
         struct OllamaResp { embedding: Vec<f32> }
-        let data: OllamaResp = resp.json().map_err(|e| anyhow::anyhow!("Failed to parse AI response: {}", e))?;
+        let data: OllamaResp = resp.json()
+            .map_err(|e| anyhow::anyhow!("Failed to parse AI response: {}", e))?;
         Ok(data.embedding)
     }
 
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let mut results = Vec::new();
-        for t in texts {
-            results.push(self.embed(t)?);
+        texts.iter().map(|t| self.embed(t)).collect()
+    }
+}
+
+/// Probe a local Ollama instance and return the list of available model names.
+/// Returns `None` if Ollama is not running or not reachable.
+pub fn probe_ollama_models(base_url: &str) -> Option<Vec<String>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build().ok()?;
+
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let resp = client.get(&url).send().ok()?;
+    if !resp.status().is_success() { return None; }
+
+    #[derive(serde::Deserialize)]
+    struct Model { name: String }
+    #[derive(serde::Deserialize)]
+    struct TagsResp { models: Vec<Model> }
+
+    let data: TagsResp = resp.json().ok()?;
+    Some(data.models.into_iter().map(|m| m.name).collect())
+}
+
+/// Pick the best embedding-capable model from an available Ollama model list.
+/// Preference order: nomic-embed-text > mxbai-embed-large > all-minilm > any *embed* > first.
+pub fn pick_best_embed_model(models: &[String]) -> Option<String> {
+    let preferred = ["nomic-embed-text", "mxbai-embed-large", "all-minilm"];
+    for p in &preferred {
+        if let Some(m) = models.iter().find(|m| m.starts_with(p)) {
+            return Some(m.clone());
         }
-        Ok(results)
     }
+    models.iter().find(|m| m.contains("embed")).cloned()
+        .or_else(|| models.first().cloned())
 }
 
-/// Mock implementation of VectorIndex.
-pub struct USearchIndex {
-    _dims: usize,
+/// Pure-Rust in-memory vector index using pre-normalized cosine similarity.
+/// Suitable for local file indexes (up to ~1M vectors on a modern CPU).
+pub struct VectorIndex {
+    dims: usize,
+    entries: Vec<(i64, Vec<f32>)>, // (file_id, L2-normalized vector)
 }
 
-impl USearchIndex {
+impl VectorIndex {
     pub fn new(dims: usize) -> Result<Self> {
-        Ok(Self { _dims: dims })
+        Ok(Self { dims, entries: Vec::new() })
     }
-    pub fn add(&mut self, _file_id: i64, _vector: &[f32]) -> Result<()> {
+
+    /// Upsert a vector for a file. Normalizes to unit length for cosine similarity.
+    pub fn add(&mut self, file_id: i64, vector: &[f32]) -> Result<()> {
+        if vector.is_empty() { return Ok(()); }
+        // Accept dimension mismatch on first add (model may differ from init probe)
+        if self.entries.is_empty() {
+            self.dims = vector.len();
+        } else if vector.len() != self.dims {
+            // Skip silently — model change mid-session; caller should reinit
+            return Ok(());
+        }
+
+        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let normalized: Vec<f32> = if norm > 1e-9 {
+            vector.iter().map(|x| x / norm).collect()
+        } else {
+            vector.to_vec()
+        };
+
+        if let Some(entry) = self.entries.iter_mut().find(|(id, _)| *id == file_id) {
+            entry.1 = normalized;
+        } else {
+            self.entries.push((file_id, normalized));
+        }
         Ok(())
     }
-    pub fn search(&self, _query: &[f32], _k: usize) -> Result<Vec<(i64, f32)>> {
-        Ok(Vec::new())
+
+    /// Return top-k (file_id, cosine_score) pairs, sorted descending.
+    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(i64, f32)>> {
+        if self.entries.is_empty() || k == 0 { return Ok(Vec::new()); }
+
+        let norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let q: Vec<f32> = if norm > 1e-9 {
+            query.iter().map(|x| x / norm).collect()
+        } else {
+            query.to_vec()
+        };
+
+        let mut scores: Vec<(i64, f32)> = self.entries.iter()
+            .map(|(id, v)| {
+                let score: f32 = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                (*id, score)
+            })
+            .collect();
+
+        scores.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scores.truncate(k);
+        Ok(scores)
     }
+
+    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
 }
 
 pub struct AiNodeDetector {
@@ -168,30 +275,38 @@ impl Default for AiNodeDetector {
 
 pub struct SemanticSearch {
     provider: Arc<dyn EmbeddingProvider>,
-    _index: USearchIndex,
+    index: VectorIndex,
 }
 
 impl SemanticSearch {
     pub fn new(provider: Arc<dyn EmbeddingProvider>) -> Result<Self> {
         let dims = provider.dimensions();
-        let index = USearchIndex::new(dims)?;
-        Ok(Self { provider, _index: index })
+        let index = VectorIndex::new(dims)?;
+        Ok(Self { provider, index })
     }
     pub fn model_id(&self) -> &str {
         self.provider.model_id()
     }
-    pub fn index_file(&mut self, _file_id: i64, _text: &str) -> Result<Vec<f32>> {
-        Ok(vec![0.0; 384])
+    /// Embed `text`, store the vector in the index, and return the raw vector.
+    pub fn index_file(&mut self, file_id: i64, text: &str) -> Result<Vec<f32>> {
+        let vector = self.provider.embed(text)?;
+        self.index.add(file_id, &vector)?;
+        Ok(vector)
     }
-    pub fn add_vector(&mut self, _file_id: i64, _vector: &[f32]) -> Result<()> {
-        Ok(())
+    /// Insert a pre-computed vector (e.g. loaded from DB on startup).
+    pub fn add_vector(&mut self, file_id: i64, vector: &[f32]) -> Result<()> {
+        self.index.add(file_id, vector)
     }
-    pub fn embed(&self, _text: &str) -> Result<Vec<f32>> {
-        Ok(vec![0.0; 384])
+    /// Embed a query string and return the raw vector.
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        self.provider.embed(text)
     }
-    pub fn search(&self, _query: &str, _k: usize) -> Result<Vec<(i64, f32)>> {
-        Ok(Vec::new())
+    /// Semantic search: embed query, return top-k (file_id, score) pairs.
+    pub fn search(&self, query: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        let q_vec = self.provider.embed(query)?;
+        self.index.search(&q_vec, k)
     }
+    pub fn vector_count(&self) -> usize { self.index.len() }
 }
 
 /// Metadata extracted from media files (images, video) using AI models.

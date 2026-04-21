@@ -852,37 +852,70 @@ impl AppRuntime {
         let db       = self.db.clone();
         let semantic = self.semantic_search.clone();
         let config   = self.config.clone();
-        
+
         std::thread::spawn(move || {
-            let (model, url) = {
+            const LOCAL_OLLAMA: &str = "http://127.0.0.1:11434";
+
+            // Resolve provider URL + model — explicit config wins, then auto-detect Ollama.
+            let (resolved_url, resolved_model) = {
                 let cfg = config.lock().unwrap();
-                (cfg.ai_model.clone(), cfg.ai_provider_url.clone())
+                match (cfg.ai_provider_url.clone(), cfg.ai_model.clone()) {
+                    (Some(u), m) => (u, m.unwrap_or_else(|| "nomic-embed-text".to_string())),
+                    (None, _) => {
+                        // Auto-detect local Ollama
+                        match thegrid_ai::probe_ollama_models(LOCAL_OLLAMA) {
+                            Some(models) if !models.is_empty() => {
+                                let best = thegrid_ai::pick_best_embed_model(&models)
+                                    .unwrap_or_else(|| "nomic-embed-text".to_string());
+                                log::info!("[AI] Auto-detected Ollama ({} model(s)), selecting '{}'", models.len(), best);
+                                (LOCAL_OLLAMA.to_string(), best)
+                            }
+                            _ => {
+                                log::warn!("[AI] No Ollama found at {} and no ai_provider_url configured. Semantic search unavailable.", LOCAL_OLLAMA);
+                                let _ = event_tx.send(AppEvent::SemanticFailed(
+                                    "No AI provider: start Ollama or set ai_provider_url in config.".to_string()
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
             };
 
-            let provider: Result<Arc<dyn EmbeddingProvider>> = if let Some(u) = url {
-                let m = model.unwrap_or_else(|| "llama3".to_string());
-                log::info!("[AI] Using remote HTTP provider {} at {}", m, u);
-                Ok(Arc::new(thegrid_ai::HttpEmbeddingProvider::new(m, u)))
-            } else {
-                log::info!("[AI] Initializing local provider...");
-                thegrid_ai::FastEmbedProvider::new().map(|p| Arc::new(p) as Arc<dyn EmbeddingProvider>)
-            };
+            // Persist discovered config for subsequent runs.
+            if let Ok(mut cfg) = config.lock() {
+                if cfg.ai_provider_url.is_none() {
+                    cfg.ai_provider_url = Some(resolved_url.clone());
+                    cfg.ai_model = Some(resolved_model.clone());
+                    let _ = cfg.save();
+                }
+            }
 
-            match provider {
+            log::info!("[AI] Initializing embedding provider: model={} url={}", resolved_model, resolved_url);
+            let provider_result = thegrid_ai::HttpEmbeddingProvider::new(resolved_model, resolved_url)
+                .map(|p| Arc::new(p) as Arc<dyn EmbeddingProvider>);
+
+            match provider_result {
                 Ok(p) => {
                     match SemanticSearch::new(p) {
                         Ok(mut search) => {
+                            // Warm up index from previously stored embeddings.
                             if let Ok(guard) = db.lock() {
                                 if let Ok(all) = guard.get_all_embeddings() {
+                                    let n = all.len();
                                     for (fid, vec) in all {
                                         let _ = search.add_vector(fid, &vec);
                                     }
+                                    log::info!("[AI] Loaded {} existing embeddings into vector index", n);
                                 }
                             }
+                            let model_id = search.model_id().to_string();
+                            let count = search.vector_count();
                             {
                                 let mut lock = semantic.lock().expect("semantic lock");
                                 *lock = Some(search);
                             }
+                            log::info!("[AI] Semantic engine ready: model={} vectors={}", model_id, count);
                             let _ = event_tx.send(AppEvent::SemanticReady);
                         }
                         Err(e) => {
@@ -891,7 +924,8 @@ impl AppRuntime {
                     }
                 }
                 Err(e) => {
-                    let _ = event_tx.send(AppEvent::SemanticFailed(format!("Provider init: {}", e)));
+                    log::error!("[AI] Provider init failed: {}", e);
+                    let _ = event_tx.send(AppEvent::SemanticFailed(format!("Provider: {}", e)));
                 }
             }
         });
@@ -956,9 +990,13 @@ impl AppRuntime {
                         }
                     }
 
-                    if success {
+                    if success && !vector.is_empty() {
+                        let model_id = {
+                            let lock = semantic.lock().expect("semantic lock");
+                            lock.as_ref().map(|s| s.model_id().to_string()).unwrap_or_else(|| "remote".to_string())
+                        };
                         if let Ok(db_lock) = db.lock() {
-                            let _ = db_lock.save_embedding(fid, "delegated", &vector);
+                            let _ = db_lock.save_embedding(fid, &model_id, &vector);
                         }
                     }
                     indexed += 1;
