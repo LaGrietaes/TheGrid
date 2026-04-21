@@ -19,7 +19,7 @@ pub mod utils;
 
 // Re-export the most-used types so callers can `use thegrid_core::*`
 pub use config::Config;
-pub use db::{Database, should_skip_dir, unix_now};
+pub use db::{Database, should_skip_dir, should_skip_path, unix_now};
 pub use events::AppEvent;
 pub use models::*;
 pub use watcher::FileWatcher;

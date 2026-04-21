@@ -7,7 +7,7 @@ use anyhow::Result;
 use rusqlite::params;
 
 use thegrid_core::{
-    fingerprint_file, match_rules, should_skip_dir, AppEvent, Config, Database,
+    fingerprint_file, match_rules, should_skip_dir, should_skip_path, AppEvent, Config, Database,
     DetectionSourceDistribution, FileChange, FileWatcher, SyncHealthMetrics,
 };
 use thegrid_net::{AgentClient, AgentServer, TailscaleClient, WolSentry};
@@ -483,6 +483,9 @@ impl AppRuntime {
 
                 for entry in entries.filter_map(|e| e.ok()) {
                     let path = entry.path();
+                    if should_skip_path(&path) {
+                        continue;
+                    }
                     let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
 
                     if meta.is_dir() {

@@ -751,6 +751,9 @@ impl Database {
 
             for entry in entries.filter_map(|e| e.ok()) {
                 let path = entry.path();
+                if should_skip_path(&path) {
+                    continue;
+                }
                 let meta = match entry.metadata() {
                     Ok(m)  => m,
                     Err(_) => continue,
@@ -1320,6 +1323,50 @@ pub fn should_skip_dir(name: &str) -> bool {
         | "$RECYCLE.BIN" | "System Volume Information"
         | "WindowsApps" | "Windows" | "ProgramData"
     ) || name.starts_with('.')
+}
+
+pub fn should_skip_path(path: &Path) -> bool {
+    let component_names: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+
+    // Skip by component names (case-insensitive), covering common system and dev-noise folders.
+    let blocked_components = [
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        "perflogs",
+        "$recycle.bin",
+        "system volume information",
+        "recovery",
+        "msocache",
+        "intel",
+        "nvidia",
+        ".venv",
+        "venv",
+        ".cache",
+        "dist",
+        "build",
+    ];
+
+    for raw in &component_names {
+        let name = raw.to_lowercase();
+        if should_skip_dir(raw) {
+            return true;
+        }
+        if blocked_components.iter().any(|b| *b == name) {
+            return true;
+        }
+    }
+
+    // Linux/macOS runtime/system paths (only relevant on those targets).
+    let normalized = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let blocked_prefixes = ["/proc", "/sys", "/dev", "/run", "/snap", "/var/lib/docker"];
+    blocked_prefixes
+        .iter()
+        .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{}/", prefix)))
 }
 
 fn path_match_patterns(path: &str) -> (String, String, String) {

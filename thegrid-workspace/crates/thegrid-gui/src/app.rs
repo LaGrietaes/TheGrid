@@ -901,6 +901,12 @@ impl TheGridApp {
             .set_title("Select directory to watch")
             .pick_folder()
         {
+            if thegrid_core::should_skip_path(&path) {
+                self.push_toast(Toast::err("That folder is considered system/software and is blocked for indexing"));
+                self.set_status(format!("Blocked watch path: {}", path.display()));
+                return;
+            }
+
             let is_watching = self.runtime.config.lock().unwrap().watch_paths.contains(&path);
             if is_watching {
                 self.push_toast(Toast::info("Already watching that directory"));
