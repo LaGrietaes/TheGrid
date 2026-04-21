@@ -766,6 +766,30 @@ fn main() -> Result<()> {
 
     emit(&ui_state, tui_mode, "▶", "RUNTIME", "Services started. Press Ctrl+C to stop.");
 
+    {
+        let cfg = runtime.config.lock().unwrap().clone();
+        if cfg.watch_paths.is_empty() {
+            emit(
+                &ui_state,
+                tui_mode,
+                "ℹ",
+                "INDEX",
+                "No watch paths configured. Edit config.json to start indexing.",
+            );
+        } else {
+            emit(
+                &ui_state,
+                tui_mode,
+                "▶",
+                "INDEX",
+                format!("Bootstrapping initial index for {} watch path(s)", cfg.watch_paths.len()),
+            );
+            for path in cfg.watch_paths {
+                runtime.spawn_index_directory(path, cfg.device_name.clone(), cfg.device_name.clone());
+            }
+        }
+    }
+
     let running = Arc::new(AtomicBool::new(true));
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
     spawn_command_reader(cmd_tx, Arc::clone(&running));

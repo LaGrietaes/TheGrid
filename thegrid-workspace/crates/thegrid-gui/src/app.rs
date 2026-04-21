@@ -200,6 +200,7 @@ pub struct TheGridApp {
     // --- Phase 4: Idle & Persistence ---
     last_input_at: std::time::Instant,
     idle_notified: bool,
+    initial_scan_dispatched: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -434,6 +435,31 @@ impl TheGridApp {
             terminal_sessions: HashMap::new(),
             last_input_at: std::time::Instant::now(),
             idle_notified: false,
+            initial_scan_dispatched: false,
+        }
+    }
+
+    fn start_initial_watch_scans(&mut self) {
+        if self.initial_scan_dispatched {
+            return;
+        }
+        self.initial_scan_dispatched = true;
+
+        let cfg = self.runtime.config.lock().unwrap().clone();
+        if cfg.watch_paths.is_empty() {
+            self.set_status("No watch paths configured. Add one to start indexing.");
+            self.push_toast(Toast::info("No watch paths configured yet."));
+            return;
+        }
+
+        self.push_toast(Toast::info(format!(
+            "Starting initial indexing for {} watch path(s)",
+            cfg.watch_paths.len()
+        )));
+        self.set_status(format!("Starting indexing for {} watch path(s)...", cfg.watch_paths.len()));
+
+        for path in cfg.watch_paths {
+            self.spawn_index_directory(path, cfg.device_name.clone(), cfg.device_name.clone());
         }
     }
 
@@ -2261,6 +2287,7 @@ impl eframe::App for TheGridApp {
             }
 
             Screen::Dashboard => {
+                self.start_initial_watch_scans();
                 self.render_titlebar(ctx);
                 self.render_statusbar(ctx);
                 self.render_footer_progress(ctx);
