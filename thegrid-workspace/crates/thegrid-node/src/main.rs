@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
-use thegrid_core::{AppEvent, Config};
+use thegrid_core::{AppEvent, Config, models::SyncHealthMetrics};
 use thegrid_runtime::AppRuntime;
 
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
@@ -31,6 +31,8 @@ const COMMAND_REGISTRY: &[(&str, &str)] = &[
     ("ping <ip|#>", "Ping device + agent"),
     ("pingdev <ip|#>", "Ping device endpoint"),
     ("pingagent <ip|#>", "Ping agent endpoint"),
+    ("mesh [status]", "Sync health overview"),
+    ("mesh sync <ip|#>", "Trigger sync to device"),
     ("history | !! | !N", "Command history and replay"),
     ("update", "Check latest release"),
     ("gitupdate", "Fetch, pull, build, restart"),
@@ -59,6 +61,7 @@ enum ParsedCommand<'a> {
     Ping,
     PingDevice,
     PingAgent,
+    Mesh,
     History,
     Update,
     GitUpdate,
@@ -73,6 +76,7 @@ fn parse_command(token: &str) -> ParsedCommand<'_> {
         "ping" => ParsedCommand::Ping,
         "pingdev" => ParsedCommand::PingDevice,
         "pingagent" => ParsedCommand::PingAgent,
+        "mesh" => ParsedCommand::Mesh,
         "history" => ParsedCommand::History,
         "update" => ParsedCommand::Update,
         "gitupdate" => ParsedCommand::GitUpdate,
@@ -322,6 +326,8 @@ struct TuiState {
     ping_ok: u64,
     ping_fail: u64,
     command_history: VecDeque<String>,
+    // S2-C3: sync health snapshot keyed by device_id
+    sync_health: std::collections::HashMap<String, SyncHealthMetrics>,
     dirty: bool,
 }
 
@@ -335,6 +341,7 @@ impl TuiState {
             ping_ok: 0,
             ping_fail: 0,
             command_history: VecDeque::with_capacity(128),
+            sync_health: std::collections::HashMap::new(),
             dirty: true,
         }
     }
@@ -432,6 +439,16 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
 
     let uptime = state.started_at.elapsed().as_secs();
     let pulse = pulse_frame(state.started_at.elapsed());
+    // S2-C3: build sync health summary line(s)
+    let sync_summary: Vec<String> = {
+        let mut lines = Vec::new();
+        for (id, h) in &state.sync_health {
+            let age = h.sync_age_secs.map(|s| format!("{}s ago", s)).unwrap_or_else(|| "never".to_string());
+            lines.push(format!("Sync {}: age={} tombs={} fail={}", id, age, h.tombstone_count, h.sync_failures));
+        }
+        lines
+    };
+
     let mut left = vec![
         format!("{} ████████╗██╗  ██╗███████╗ ██████╗ ██████╗ ██╗██████╗", pulse),
         "   ╚══██╔══╝██║  ██║██╔════╝██╔════╝ ██╔══██╗██║██╔══██╗".to_string(),
@@ -445,8 +462,13 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
         format!("Agent Port: {port}"),
         format!("Uptime: {}s", uptime),
         format!("Ping OK/Fail: {}/{}", state.ping_ok, state.ping_fail),
-        format!("Last: {}", state.last_status),
     ];
+    if sync_summary.is_empty() {
+        left.push("Sync: no data yet".to_string());
+    } else {
+        left.extend(sync_summary.into_iter().take(3));
+    }
+    left.push(format!("Last: {}", state.last_status));
 
     let mut logo_rows = 7usize;
     // Keep key runtime fields near the bottom when width is tight.
@@ -692,6 +714,49 @@ fn execute_command(
                 }
             } else {
                 emit(ui_state, tui_mode, "⚠", "CMD", "Usage: pingagent <ip|device_index>");
+            }
+        }
+        // S2-C4: mesh command group — status + per-device sync trigger
+        ParsedCommand::Mesh => {
+            let sub = parts.get(1).copied().unwrap_or("status");
+            match sub {
+                "sync" => {
+                    if let Some(target) = parts.get(2) {
+                        if let Some((label, ip)) = resolve_ping_target(target, ui_state) {
+                            // Use the label as both device_id and hostname for now;
+                            // the runtime will do the actual push over the agent protocol.
+                            runtime.spawn_sync_node(label.clone(), ip.clone(), label.clone());
+                            emit(ui_state, tui_mode, "⇄", "MESH", format!("Sync triggered -> {}", label));
+                        } else {
+                            emit(ui_state, tui_mode, "⚠", "MESH", format!("Device {} not found", target));
+                        }
+                    } else {
+                        emit(ui_state, tui_mode, "⚠", "MESH", "Usage: mesh sync <ip|#>");
+                    }
+                }
+                "status" | _ => {
+                    if let Ok(s) = ui_state.lock() {
+                        if s.sync_health.is_empty() {
+                            emit(ui_state, tui_mode, "ℹ", "MESH", "No sync health data yet");
+                        } else {
+                            for (id, h) in &s.sync_health {
+                                let age = h.sync_age_secs
+                                    .map(|a| format!("{}s", a))
+                                    .unwrap_or_else(|| "never".to_string());
+                                emit(
+                                    ui_state, tui_mode, "⇄", "MESH",
+                                    format!("{}: sync_age={} tombs={} fails={} sources={{fs={},watch={},sync={}}}",
+                                        id, age,
+                                        h.tombstone_count, h.sync_failures,
+                                        h.detection_sources.full_scan,
+                                        h.detection_sources.watcher,
+                                        h.detection_sources.sync,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
         ParsedCommand::History => {
@@ -1105,6 +1170,17 @@ fn main() -> Result<()> {
                             s.ping_fail += 1;
                         }
                         emit(&ui_state, tui_mode, "⚠", "PING", format!("{} failed: {}", ip, error));
+                    }
+                }
+                AppEvent::SyncHealthUpdated { device_id, metrics } => {
+                    let age_str = metrics.sync_age_secs
+                        .map(|a| format!("{}s ago", a))
+                        .unwrap_or_else(|| "never".to_string());
+                    emit(&ui_state, tui_mode, "⇄", "SYNC",
+                        format!("{}: age={} tombs={} fails={}",
+                            device_id, age_str, metrics.tombstone_count, metrics.sync_failures));
+                    if let Ok(mut s) = ui_state.lock() {
+                        s.sync_health.insert(device_id, metrics);
                     }
                 }
                 AppEvent::IndexProgress { scanned, total, current, .. } => {
