@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use anyhow::Result;
@@ -490,114 +490,135 @@ impl AppRuntime {
         root_filter:  Option<String>,
     ) {
         let start = std::time::Instant::now();
-        let mut scanned_count = 0u64;
+        let scanned_total = Arc::new(AtomicU64::new(0));
+        let mut worker_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        worker_count = worker_count.clamp(2, 8);
+        if root_filter.is_some() {
+            worker_count = worker_count.min(4);
+        }
 
-        loop {
-            let task = {
-                let guard = db.lock().unwrap();
-                guard
-                    .get_next_index_task_for_root(root_filter.as_deref())
-                    .unwrap_or(None)
-            };
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let db = Arc::clone(&db);
+            let config = Arc::clone(&config);
+            let tx = tx.clone();
+            let device_id = device_id.clone();
+            let device_name = device_name.clone();
+            let root_filter = root_filter.clone();
+            let scanned_total = Arc::clone(&scanned_total);
 
-            if let Some((root, dir_str)) = task {
-                let dir_path = PathBuf::from(&dir_str);
-                log::info!("[Runtime] Persistent scan: {:?}", dir_path);
+            workers.push(std::thread::spawn(move || -> u64 {
+                let mut local_scanned = 0u64;
+                loop {
+                    let task = {
+                        let guard = match db.lock() {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        };
+                        guard
+                            .claim_next_index_task_for_root(root_filter.as_deref())
+                            .unwrap_or(None)
+                    };
 
-                // Parse file-system entries outside DB lock to reduce contention
-                let entries = match std::fs::read_dir(&dir_path) {
-                    Ok(e) => e,
-                    Err(_) => {
-                        if let Ok(guard) = db.lock() {
-                            let _ = guard.complete_index_task(&root, &dir_str);
-                        }
-                        continue;
-                    }
-                };
+                    let Some((root, dir_str)) = task else {
+                        break;
+                    };
 
-                let cfg_snapshot = config.lock().ok().map(|c| c.clone());
-                let mut subdirs: Vec<PathBuf> = Vec::new();
-                let mut files_to_index: Vec<(PathBuf, u64, Option<i64>, Option<String>)> = Vec::new();
+                    let dir_path = PathBuf::from(&dir_str);
+                    let entries = match std::fs::read_dir(&dir_path) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
 
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let path = entry.path();
-                    if should_skip_path(&path) {
-                        continue;
-                    }
-                    let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+                    let cfg_snapshot = config.lock().ok().map(|c| c.clone());
+                    let mut subdirs: Vec<PathBuf> = Vec::new();
+                    let mut files_to_index: Vec<(PathBuf, u64, Option<i64>, Option<String>)> = Vec::new();
 
-                    if meta.is_dir() {
-                        let name = path.file_name().unwrap_or_default().to_string_lossy();
-                        if should_skip_dir(&name) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if should_skip_path(&path) {
                             continue;
                         }
-                        subdirs.push(path);
-                    } else if meta.is_file() {
-                        let size = meta.len();
-                        let modified = meta.modified().ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64);
-                        let quick_hash = thegrid_core::quick_hash_file(&path).ok();
-                        files_to_index.push((path, size, modified, quick_hash));
-                    }
-                }
+                        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
 
-                let mut dir_count = 0u64;
-                match db.lock() {
-                    Ok(guard) => {
-                        for (path, size, modified, quick_hash) in &files_to_index {
-                            if let Ok(fid) = guard.index_file_with_source(
-                                &device_id,
-                                &device_name,
-                                path,
-                                *size,
-                                *modified,
-                                quick_hash.as_deref(),
-                                None,
-                                thegrid_core::DetectionSource::FullScan,
-                                chrono::Utc::now().timestamp(),
-                            ) {
-                                if let Some(cfg) = cfg_snapshot.as_ref() {
-                                    apply_automation_rules_for_file(
-                                        &guard,
-                                        cfg,
-                                        fid,
-                                        path,
-                                        *size,
-                                        *modified,
-                                    );
-                                }
-                                dir_count += 1;
+                        if meta.is_dir() {
+                            let name = path.file_name().unwrap_or_default().to_string_lossy();
+                            if should_skip_dir(&name) {
+                                continue;
                             }
+                            subdirs.push(path);
+                        } else if meta.is_file() {
+                            let size = meta.len();
+                            let modified = meta.modified().ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64);
+                            let quick_hash = thegrid_core::quick_hash_file(&path).ok();
+                            files_to_index.push((path, size, modified, quick_hash));
                         }
-
-                        for s in subdirs {
-                            let _ = guard.conn.execute(
-                                "INSERT OR IGNORE INTO index_queue (root_path, dir_path) VALUES (?, ?)",
-                                params![root.as_str(), s.to_string_lossy()]
-                            );
-                        }
-
-                        let _ = guard.complete_index_task(&root, &dir_str);
-                        scanned_count += dir_count;
-
-                        let progress_scanned = if total_hint > 0 {
-                            scanned_count.min(total_hint)
-                        } else {
-                            scanned_count
-                        };
-
-                        let _ = tx.send(AppEvent::IndexProgress {
-                            scanned: progress_scanned,
-                            total:   total_hint,
-                            current: dir_path.file_name().unwrap_or_default().to_string_lossy().into(),
-                            ext:     None,
-                        });
                     }
-                    Err(_) => break,
+
+                    let mut dir_count = 0u64;
+                    let db_guard = match db.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+
+                    for (path, size, modified, quick_hash) in &files_to_index {
+                        if let Ok(fid) = db_guard.index_file_with_source(
+                            &device_id,
+                            &device_name,
+                            path,
+                            *size,
+                            *modified,
+                            quick_hash.as_deref(),
+                            None,
+                            thegrid_core::DetectionSource::FullScan,
+                            chrono::Utc::now().timestamp(),
+                        ) {
+                            if let Some(cfg) = cfg_snapshot.as_ref() {
+                                apply_automation_rules_for_file(
+                                    &db_guard,
+                                    cfg,
+                                    fid,
+                                    path,
+                                    *size,
+                                    *modified,
+                                );
+                            }
+                            dir_count += 1;
+                        }
+                    }
+
+                    for s in subdirs {
+                        let _ = db_guard.conn.execute(
+                            "INSERT OR IGNORE INTO index_queue (root_path, dir_path) VALUES (?, ?)",
+                            params![root.as_str(), s.to_string_lossy()]
+                        );
+                    }
+
+                    local_scanned += dir_count;
+                    let global = scanned_total.fetch_add(dir_count, Ordering::Relaxed) + dir_count;
+                    let progress_scanned = if total_hint > 0 {
+                        global.min(total_hint)
+                    } else {
+                        global
+                    };
+
+                    let _ = tx.send(AppEvent::IndexProgress {
+                        scanned: progress_scanned,
+                        total:   total_hint,
+                        current: dir_path.file_name().unwrap_or_default().to_string_lossy().into(),
+                        ext:     None,
+                    });
                 }
-            } else {
-                break;
+                local_scanned
+            }));
+        }
+
+        let mut scanned_count = 0u64;
+        for worker in workers {
+            if let Ok(n) = worker.join() {
+                scanned_count += n;
             }
         }
 

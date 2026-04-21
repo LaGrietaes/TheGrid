@@ -690,6 +690,10 @@ impl Database {
         self.get_next_index_task_for_root(None)
     }
 
+    pub fn claim_next_index_task(&self) -> Result<Option<(String, String)>> {
+        self.claim_next_index_task_for_root(None)
+    }
+
     pub fn get_next_index_task_for_root(&self, root: Option<&str>) -> Result<Option<(String, String)>> {
         let (sql, use_param) = if root.is_some() {
             ("SELECT root_path, dir_path FROM index_queue WHERE root_path = ?1 LIMIT 1", true)
@@ -706,6 +710,31 @@ impl Database {
 
         if let Some(row) = rows.next()? {
             Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn claim_next_index_task_for_root(&self, root: Option<&str>) -> Result<Option<(String, String)>> {
+        let (sql, use_param) = if root.is_some() {
+            ("SELECT rowid, root_path, dir_path FROM index_queue WHERE root_path = ?1 LIMIT 1", true)
+        } else {
+            ("SELECT rowid, root_path, dir_path FROM index_queue LIMIT 1", false)
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = if use_param {
+            stmt.query(params![root.unwrap_or_default()])?
+        } else {
+            stmt.query([])?
+        };
+
+        if let Some(row) = rows.next()? {
+            let rowid: i64 = row.get(0)?;
+            let root_path: String = row.get(1)?;
+            let dir_path: String = row.get(2)?;
+            self.conn.execute("DELETE FROM index_queue WHERE rowid = ?1", params![rowid])?;
+            Ok(Some((root_path, dir_path)))
         } else {
             Ok(None)
         }
