@@ -197,6 +197,11 @@ impl AppRuntime {
             }
         }
 
+        // Detect & setup Termux node via USB-C OTG (faster than WiFi)
+        if let Err(e) = thegrid_net::setup_termux_otg() {
+            log::debug!("[Runtime] Termux setup: {}", e);
+        }
+
         // Start AI if capable OR if provider URL is set (which overrides local specs)
         let has_remote_provider = {
             let cfg = self.config.lock().unwrap();
