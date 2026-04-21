@@ -105,6 +105,7 @@ pub fn render(
     ctx:   &egui::Context,
     s:     &mut SearchPanelState,
     stats: &IndexStats,
+    current_scope: Option<(String, String)>,
     semantic_enabled: &mut bool,
     semantic_ready:   bool,
     embedding_progress: (usize, usize),
@@ -260,6 +261,22 @@ pub fn render(
                 .inner_margin(egui::Margin::symmetric(16.0, 6.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        let all_active = s.device_filter.is_none();
+                        if ui.selectable_label(all_active, "ALL NODES").clicked() && !all_active {
+                            s.device_filter = None;
+                            action.query_changed = true;
+                        }
+
+                        if let Some((scope_id, scope_name)) = &current_scope {
+                            let this_active = s.device_filter.as_ref() == Some(scope_id);
+                            let label = format!("THIS: {}", scope_name.to_uppercase());
+                            if ui.selectable_label(this_active, label).clicked() && !this_active {
+                                s.device_filter = Some(scope_id.clone());
+                                action.query_changed = true;
+                            }
+                        }
+
+                        ui.add_space(10.0);
                         ui.label(
                             RichText::new(format!("{} FILES INDEXED", stats.total_files))
                                 .color(Colors::TEXT_MUTED).size(8.0)

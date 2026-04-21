@@ -13,6 +13,96 @@ use thegrid_core::{
 use thegrid_net::{AgentClient, AgentServer, TailscaleClient, WolSentry};
 use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
 
+fn apply_automation_rules_for_file(
+    db: &Database,
+    cfg: &Config,
+    file_id: i64,
+    path: &std::path::Path,
+    size: u64,
+    modified: Option<i64>,
+) {
+    if let Ok(rules) = db.get_rules() {
+        let user_rules: Vec<_> = rules.into_iter().map(|r| {
+            thegrid_core::models::UserRule {
+                id: r.0,
+                name: r.1,
+                pattern: r.2,
+                project: r.3,
+                tag: r.4,
+                is_active: r.5,
+            }
+        }).collect();
+
+        let matches = match_rules(path, &user_rules, file_id);
+        for m in matches {
+            let _ = db.add_file_tag(file_id, m.tag.as_deref(), m.project.as_deref(), false);
+        }
+    }
+
+    let ext = path.extension()
+        .map(|e| e.to_string_lossy().to_string().to_lowercase())
+        .unwrap_or_default();
+
+    for rule in &cfg.smart_rules {
+        let mut matched = true;
+        let mut project_output: Option<String> = None;
+        let mut category_output: Option<String> = None;
+
+        for filter in &rule.filters {
+            match filter {
+                thegrid_core::models::SmartFilterType::Extension(expected) => {
+                    let expected = expected.trim_start_matches('.').to_lowercase();
+                    if ext != expected {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::MinSize(min) => {
+                    if size < *min {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::MaxSize(max) => {
+                    if size > *max {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::ModifiedAfter(dt) => {
+                    let ts = modified.unwrap_or(0);
+                    if ts <= dt.timestamp() {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::ModifiedBefore(dt) => {
+                    let ts = modified.unwrap_or(i64::MAX);
+                    if ts >= dt.timestamp() {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::Project(project_id) => {
+                    project_output = Some(project_id.clone());
+                }
+                thegrid_core::models::SmartFilterType::Category(category_id) => {
+                    category_output = Some(category_id.clone());
+                }
+            }
+        }
+
+        if matched {
+            let rule_tag = format!("rule:{}", rule.id);
+            let category_tag = category_output.as_ref().map(|c| format!("category:{}", c));
+            let _ = db.add_file_tag(file_id, Some(&rule_tag), project_output.as_deref(), false);
+            if let Some(cat_tag) = category_tag.as_deref() {
+                let _ = db.add_file_tag(file_id, Some(cat_tag), project_output.as_deref(), false);
+            }
+        }
+    }
+}
+
 pub struct AppRuntime {
     pub config:       Arc<Mutex<Config>>,
     pub db:           Arc<Mutex<Database>>,
@@ -281,6 +371,7 @@ impl AppRuntime {
 
     pub fn spawn_index_directory(&self, path: PathBuf, device_id: String, device_name: String) {
         let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
         let tx = self.event_tx.clone();
         
         let path_for_thread = path.clone();
@@ -327,6 +418,7 @@ impl AppRuntime {
             // We pass the total_count as a hint for the progress bar
             Self::do_process_index_queue(
                 db, 
+                config,
                 tx, 
                 device_id, 
                 device_name, 
@@ -339,6 +431,7 @@ impl AppRuntime {
     /// This is a static-like method to avoid lifetime issues when calling from a thread.
     fn do_process_index_queue(
         db:           Arc<Mutex<Database>>,
+        config:       Arc<Mutex<Config>>,
         tx:           mpsc::Sender<AppEvent>,
         device_id:    String,
         device_name:  String,
@@ -387,7 +480,7 @@ impl AppRuntime {
                                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                     .map(|d| d.as_secs() as i64);
                                 let fingerprint = fingerprint_file(&path).ok();
-                                let _ = guard.index_file_with_source(
+                                if let Ok(fid) = guard.index_file_with_source(
                                     &device_id,
                                     &device_name,
                                     &path,
@@ -397,8 +490,19 @@ impl AppRuntime {
                                     None,
                                     thegrid_core::DetectionSource::FullScan,
                                     chrono::Utc::now().timestamp(),
-                                );
-                                dir_count += 1;
+                                ) {
+                                    if let Ok(cfg) = config.lock() {
+                                        apply_automation_rules_for_file(
+                                            &guard,
+                                            &cfg,
+                                            fid,
+                                            &path,
+                                            size,
+                                            modified,
+                                        );
+                                    }
+                                    dir_count += 1;
+                                }
                             }
                         }
 
@@ -441,6 +545,7 @@ impl AppRuntime {
     pub fn spawn_idle_work(&self) {
         log::info!("Idle worker triggered — looking for unfinished tasks");
         let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
         let tx = self.event_tx.clone();
 
         let device_id   = { self.config.lock().unwrap().device_name.clone() };
@@ -449,6 +554,7 @@ impl AppRuntime {
         std::thread::spawn(move || {
             Self::do_process_index_queue(
                 db, 
+                config,
                 tx, 
                 device_id, 
                 device_name, 
@@ -460,6 +566,7 @@ impl AppRuntime {
 
     pub fn spawn_incremental_index(&self, changes: Vec<FileChange>) {
         let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
         let (device_id, device_name) = {
             let cfg = self.config.lock().unwrap();
             (cfg.device_name.clone(), cfg.device_name.clone())
@@ -471,6 +578,36 @@ impl AppRuntime {
             });
             match result {
                 Ok(Ok((updated, deleted, renamed))) => {
+                    let cfg = config.lock().ok().map(|c| c.clone());
+                    if let (Some(cfg), Ok(guard)) = (cfg, db.lock()) {
+                        for change in &changes {
+                            let candidate = match change.kind {
+                                thegrid_core::FileChangeKind::Created | thegrid_core::FileChangeKind::Modified => Some(change.path.clone()),
+                                thegrid_core::FileChangeKind::Renamed => change.new_path.clone(),
+                                thegrid_core::FileChangeKind::Deleted => None,
+                            };
+
+                            if let Some(path) = candidate {
+                                if !path.exists() || !path.is_file() {
+                                    continue;
+                                }
+                                let fp = change.fingerprint.clone()
+                                    .or_else(|| fingerprint_file(&path).ok());
+                                if let Some(fp) = fp {
+                                    if let Ok(Some(fid)) = guard.get_file_id_by_path(&device_id, &path) {
+                                        apply_automation_rules_for_file(
+                                            &guard,
+                                            &cfg,
+                                            fid,
+                                            &path,
+                                            fp.size,
+                                            fp.modified,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let _ = tx.send(AppEvent::IndexUpdated { paths_updated: updated + deleted + renamed });
                 }
                 _ => {}
@@ -482,9 +619,9 @@ impl AppRuntime {
         let db          = self.db.clone();
         let event_tx    = self.event_tx.clone();
         let sync_health = self.sync_health.clone();
-        let (api_key, port) = {
+        let (api_key, port, requester_device) = {
             let cfg = self.config.lock().unwrap();
-            (cfg.api_key.clone(), cfg.agent_port)
+            (cfg.api_key.clone(), cfg.agent_port, cfg.device_name.clone())
         };
 
         std::thread::spawn(move || {
@@ -510,7 +647,7 @@ impl AppRuntime {
                 }
             };
 
-            let delta = match client.sync_index(last_ts) {
+            let delta = match client.sync_index(last_ts, Some(&requester_device)) {
                 Ok(r) => r,
                 Err(e) => {
                     let now = chrono::Utc::now().timestamp();
@@ -695,6 +832,7 @@ impl AppRuntime {
         }
 
         let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
         let event_tx = self.event_tx.clone();
         let running = Arc::clone(&self.hash_worker_running);
 
@@ -728,17 +866,19 @@ impl AppRuntime {
                             Ok(h) => {
                                 if let Ok(guard) = db.lock() {
                                     let _ = guard.update_file_hash(fid, &h);
-
-                                    if let Ok(rules) = guard.get_rules() {
-                                        let user_rules: Vec<_> = rules.into_iter().map(|r| {
-                                            thegrid_core::models::UserRule {
-                                                id: r.0, name: r.1, pattern: r.2, project: r.3, tag: r.4, is_active: r.5
-                                            }
-                                        }).collect();
-
-                                        let matches = match_rules(&path, &user_rules, fid);
-                                        for m in matches {
-                                            let _ = guard.add_file_tag(fid, m.tag.as_deref(), m.project.as_deref(), false);
+                                    if let Ok(cfg) = config.lock() {
+                                        if let Ok(meta) = path.metadata() {
+                                            let modified = meta.modified().ok()
+                                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                                .map(|d| d.as_secs() as i64);
+                                            apply_automation_rules_for_file(
+                                                &guard,
+                                                &cfg,
+                                                fid,
+                                                &path,
+                                                meta.len(),
+                                                modified,
+                                            );
                                         }
                                     }
                                     hashed_count += 1;

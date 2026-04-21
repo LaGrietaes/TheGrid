@@ -390,13 +390,26 @@ impl AgentServer {
                 Self::respond_capability_forbidden(req, "file_access")?;
                 return Ok(());
             }
-            let after: i64 = url.split("after=")
-                .nth(1)
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(0);
+            let query = url.split('?').nth(1).unwrap_or("");
+            let mut after: i64 = 0;
+            let mut requester_device: Option<String> = None;
+            for pair in query.split('&') {
+                let mut kv = pair.splitn(2, '=');
+                let key = kv.next().unwrap_or("");
+                let val = kv.next().unwrap_or("");
+                if key == "after" {
+                    after = val.parse::<i64>().unwrap_or(0);
+                } else if key == "requester" && !val.trim().is_empty() {
+                    requester_device = Some(urlencoding_decode(val));
+                }
+            }
 
             let (tx, rx) = mpsc::channel();
-            let _ = self.event_tx.send(AppEvent::SyncRequest { after, response_tx: tx });
+            let _ = self.event_tx.send(AppEvent::SyncRequest {
+                after,
+                requester_device,
+                response_tx: tx,
+            });
             let delta = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_default();
 
             let json = serde_json::to_string(&delta)?;
@@ -1134,8 +1147,13 @@ impl AgentClient {
         Ok(r)
     }
 
-    pub fn sync_index(&self, last_sync_ts: i64) -> Result<SyncDelta> {
-        let url = format!("{}/v1/sync?after={}", self.base_url, last_sync_ts);
+    pub fn sync_index(&self, last_sync_ts: i64, requester_device: Option<&str>) -> Result<SyncDelta> {
+        let url = if let Some(requester) = requester_device.filter(|s| !s.trim().is_empty()) {
+            let requester_enc = urlencoding_encode(requester);
+            format!("{}/v1/sync?after={}&requester={}", self.base_url, last_sync_ts, requester_enc)
+        } else {
+            format!("{}/v1/sync?after={}", self.base_url, last_sync_ts)
+        };
         log::debug!("Client: syncing index from {} (after={})", url, last_sync_ts);
         let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).send().context("Requesting index sync")?;
         let status = resp.status();

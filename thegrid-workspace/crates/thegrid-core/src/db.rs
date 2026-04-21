@@ -409,21 +409,39 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_file_id_by_path(&self, device_id: &str, path: &Path) -> Result<Option<i64>> {
+        let path_str = path.to_string_lossy().to_string();
+        let id = self.conn.query_row(
+            "SELECT id FROM files WHERE device_id = ?1 AND path = ?2",
+            params![device_id, path_str],
+            |row| row.get(0),
+        ).optional()?;
+        Ok(id)
+    }
+
     pub fn get_sync_delta_after(&self, after: i64) -> Result<SyncDelta> {
+        self.get_sync_delta_after_filtered(after, None)
+    }
+
+    pub fn get_sync_delta_after_filtered(&self, after: i64, requester_device: Option<&str>) -> Result<SyncDelta> {
+        let requester = requester_device.unwrap_or_default().trim();
         let mut stmt = self.conn.prepare(
             "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank \
-             FROM files WHERE indexed_at > ?1 OR modified > ?1"
+             FROM files
+             WHERE (indexed_at > ?1 OR modified > ?1)
+               AND (?2 = '' OR device_id != ?2)"
         )?;
-        let rows = stmt.query_map(params![after], |row| self.map_search_result(row))?;
+        let rows = stmt.query_map(params![after, requester], |row| self.map_search_result(row))?;
         let mut files = Vec::new();
         for r in rows { files.push(r?); }
 
         let mut tomb_stmt = self.conn.prepare(
             "SELECT device_id, path, size, modified, hash, quick_hash, deleted_at, detected_by
              FROM file_tombstones
-             WHERE deleted_at > ?1"
+             WHERE deleted_at > ?1
+               AND (?2 = '' OR device_id != ?2)"
         )?;
-        let tomb_rows = tomb_stmt.query_map(params![after], |row| {
+        let tomb_rows = tomb_stmt.query_map(params![after, requester], |row| {
             Ok(FileTombstone {
                 device_id: row.get(0)?,
                 path: PathBuf::from(row.get::<_, String>(1)?),

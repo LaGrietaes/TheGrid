@@ -1089,11 +1089,13 @@ impl TheGridApp {
                 }
 
                 // ── Phase 3: Mesh Sync ─────────────────────────────────────────
-                AppEvent::SyncRequest { after, response_tx } => {
+                AppEvent::SyncRequest { after, requester_device, response_tx } => {
                     let db = self.runtime.db.clone();
                     std::thread::spawn(move || {
                         if let Ok(guard) = db.lock() {
-                            let delta = guard.get_sync_delta_after(after).unwrap_or_default();
+                            let delta = guard
+                                .get_sync_delta_after_filtered(after, requester_device.as_deref())
+                                .unwrap_or_default();
                             let _ = response_tx.send(delta);
                         }
                     });
@@ -2479,6 +2481,7 @@ impl eframe::App for TheGridApp {
                 // Search overlay (Ctrl+F)
                 let search_action = crate::views::search::render(
                     ctx, &mut self.search, &self.index_stats,
+                    self.selected_idx.and_then(|idx| self.devices.get(idx)).map(|d| (d.id.clone(), d.display_name().to_string())),
                     &mut self.semantic_enabled,
                     !self.semantic_loading,
                     self.embedding_progress
@@ -2496,6 +2499,9 @@ impl eframe::App for TheGridApp {
                         self.active_tab   = DashTab::Files;
                     }
                     self.push_toast(Toast::info(format!("Navigated to: {}", result.name)));
+                }
+                if let Some(result) = search_action.preview_result {
+                    let _ = self.event_tx.send(AppEvent::RequestFilePreview(result));
                 }
                 // Idle Detection
                 let now = std::time::Instant::now();

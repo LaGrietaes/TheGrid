@@ -125,6 +125,7 @@ pub enum AppEvent {
     /// Incoming request from a remote node for an index sync.
     SyncRequest {
         after: i64,
+        requester_device: Option<String>,
         response_tx: mpsc::Sender<SyncDelta>,
     },
 

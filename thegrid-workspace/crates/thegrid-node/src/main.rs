@@ -959,10 +959,10 @@ fn main() -> Result<()> {
                 AppEvent::DevicesFailed(err) => {
                     emit(&ui_state, tui_mode, "⚠", "DEVICES", format!("Load failed: {}", err));
                 }
-                AppEvent::SyncRequest { after, response_tx } => {
+                AppEvent::SyncRequest { after, requester_device, response_tx } => {
                     emit(&ui_state, tui_mode, "⇄", "SYNC", format!("Incoming sync request (after={})", after));
                     if let Ok(guard) = runtime.db.lock() {
-                        match guard.get_sync_delta_after(after) {
+                        match guard.get_sync_delta_after_filtered(after, requester_device.as_deref()) {
                             Ok(delta) => {
                                 let _ = response_tx.send(delta);
                             }
