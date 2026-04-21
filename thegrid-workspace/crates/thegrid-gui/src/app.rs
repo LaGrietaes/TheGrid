@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use egui_tiles::Tree;
 use egui::{Color32, Context, RichText};
 
 use thegrid_core::{AppEvent, Config};
@@ -40,7 +41,7 @@ use thegrid_runtime::AppRuntime;
 
 use crate::theme::Colors;
 use crate::views::dashboard::{
-    DashTab, DetailState, DetailActions, SettingsState, render_settings_modal,
+    build_default_telemetry_tree, default_telemetry_band_height, DashTab, DetailState, DetailActions, SettingsState, TelemetryPane, render_settings_modal,
 };
 use crate::views::search::SearchPanelState;
 use crate::views::setup::SetupState;
@@ -167,8 +168,12 @@ pub struct TheGridApp {
     telemetry_cache: HashMap<String, NodeTelemetry>,
     // When we last polled each device for telemetry (to rate-limit polls)
     telemetry_last_poll: HashMap<String, std::time::Instant>,
+    telemetry_tree: Tree<TelemetryPane>,
+    telemetry_band_height: f32,
     // Whether a local telemetry collection is in flight
     local_telemetry_pending: bool,
+    // When the in-flight local telemetry collection started (watchdog)
+    local_telemetry_pending_since: Option<std::time::Instant>,
 
     // ── Background event bus ──────────────────────────────────────────────────
     event_tx: mpsc::Sender<AppEvent>,
@@ -251,6 +256,84 @@ pub struct ViewportState {
 }
 
 impl TheGridApp {
+    fn is_local_device(&self, device: &TailscaleDevice) -> bool {
+        let host = self.local_hostname.as_str();
+        let configured = self.config.device_name.as_str();
+        device.hostname.eq_ignore_ascii_case(host)
+            || device.name.eq_ignore_ascii_case(host)
+            || device.display_name().eq_ignore_ascii_case(host)
+            || device.hostname.eq_ignore_ascii_case(configured)
+            || device.name.eq_ignore_ascii_case(configured)
+            || device.display_name().eq_ignore_ascii_case(configured)
+    }
+
+    fn list_usb_adb_devices(&self) -> Vec<TailscaleDevice> {
+        if !Self::command_exists("adb") {
+            return Vec::new();
+        }
+
+        let output = match std::process::Command::new("adb")
+            .arg("devices")
+            .arg("-l")
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return Vec::new(),
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut devices = Vec::new();
+
+        for line in stdout.lines().skip(1) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if !line.contains("\tdevice") || !line.contains("usb:") {
+                continue;
+            }
+
+            let mut parts = line.split_whitespace();
+            let serial = match parts.next() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+
+            let mut model = None;
+            for token in line.split_whitespace() {
+                if let Some(m) = token.strip_prefix("model:") {
+                    model = Some(m.to_string());
+                    break;
+                }
+                if model.is_none() {
+                    if let Some(d) = token.strip_prefix("device:") {
+                        model = Some(d.to_string());
+                    }
+                }
+            }
+
+            let label = model
+                .unwrap_or_else(|| "ANDROID_USB".to_string())
+                .replace('_', "-")
+                .to_uppercase();
+
+            devices.push(TailscaleDevice {
+                id: format!("adb-usb-{}", serial),
+                hostname: format!("{}-USB", label),
+                name: format!("{} (USB ADB)", label),
+                addresses: Vec::new(),
+                os: "Android".to_string(),
+                client_version: "USB ADB".to_string(),
+                last_seen: Some(chrono::Utc::now()),
+                blocks_incoming: false,
+                authorized: true,
+                user: "USB".to_string(),
+            });
+        }
+
+        devices
+    }
+
     fn command_exists(cmd: &str) -> bool {
         #[cfg(target_os = "windows")]
         {
@@ -324,7 +407,10 @@ impl TheGridApp {
             viewport: ViewportState::default(),
             telemetry_cache:     HashMap::new(),
             telemetry_last_poll: HashMap::new(),
+            telemetry_tree: build_default_telemetry_tree(),
+            telemetry_band_height: default_telemetry_band_height(),
             local_telemetry_pending: false,
+            local_telemetry_pending_since: None,
             event_tx: tx,
             event_rx: rx,
             toasts: Vec::new(),
@@ -680,11 +766,11 @@ impl TheGridApp {
     }
 
     /// Collect telemetry for the LOCAL machine via sysinfo (non-blocking).
-    fn spawn_collect_local_telemetry(&mut self) {
+    fn spawn_collect_local_telemetry(&mut self, device_id: String) {
         if self.local_telemetry_pending { return; }
         self.local_telemetry_pending = true;
+        self.local_telemetry_pending_since = Some(std::time::Instant::now());
 
-        let device_id = self.config.device_name.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let telemetry = crate::telemetry::collect_local();
@@ -776,6 +862,10 @@ impl TheGridApp {
                     self.devices_loading     = false;
                     self.tailscale_connected = true;
                     let n = devices.len();
+                    let previous_selected_id = self
+                        .selected_idx
+                        .and_then(|i| self.devices.get(i))
+                        .map(|d| d.id.clone());
 
                     // Register all devices in the DB so names are available offline
                     {
@@ -786,14 +876,34 @@ impl TheGridApp {
                         }
                     }
 
-                     // Prioritize the local node by moving it to the top of the list
-                    let local_name = self.config.device_name.clone();
-                    if let Some(local_idx) = devices.iter().position(|d| d.name == local_name) {
+                    // Prioritize the local node by moving it to the top of the list.
+                    if let Some(local_idx) = devices.iter().position(|d| self.is_local_device(d)) {
                         let local_node = devices.remove(local_idx);
                         devices.insert(0, local_node);
                     }
 
+                    // Append USB-connected Android devices discovered via ADB so they
+                    // appear in the node list even when not yet present in Tailscale.
+                    let adb_usb_devices = self.list_usb_adb_devices();
+                    if !adb_usb_devices.is_empty() {
+                        for adb_dev in adb_usb_devices {
+                            let already_exists = devices.iter().any(|d| d.id == adb_dev.id);
+                            if !already_exists {
+                                devices.push(adb_dev);
+                            }
+                        }
+                    }
+
                     self.devices = devices;
+                    if let Some(selected_id) = previous_selected_id {
+                        self.selected_idx = self.devices.iter().position(|d| d.id == selected_id);
+                    }
+                    if self.selected_idx.is_none() {
+                        self.selected_idx = self.devices.iter().position(|d| self.is_local_device(d));
+                    }
+                    if self.selected_idx.is_none() && !self.devices.is_empty() {
+                        self.selected_idx = Some(0);
+                    }
                     self.set_status(format!("{} nodes discovered", n));
 
                     // Automatically ping every discovered device to determine online status
@@ -809,7 +919,14 @@ impl TheGridApp {
                     }
 
                     // Start local telemetry collection immediately after first load
-                    self.spawn_collect_local_telemetry();
+                    if let Some(local_device_id) = self
+                        .devices
+                        .iter()
+                        .find(|d| self.is_local_device(d))
+                        .map(|d| d.id.clone())
+                    {
+                        self.spawn_collect_local_telemetry(local_device_id);
+                    }
                 }
 
                 AppEvent::DevicesFailed(err) => {
@@ -1113,8 +1230,9 @@ impl TheGridApp {
                     let remote_device_id = device_id.clone();
                     let telemetry_ip = ip.clone();
                     // Mark local telemetry as no longer pending
-                    if device_id == self.config.device_name {
+                    if ip.is_none() {
                         self.local_telemetry_pending = false;
+                        self.local_telemetry_pending_since = None;
                     }
 
                     // Synchronize the runtime's remote AI map
@@ -2041,7 +2159,18 @@ impl eframe::App for TheGridApp {
         // 5. Periodic telemetry and ping refresh (every 30s)
         let mut ping_targets = Vec::new(); // (ip, device_id)
         let mut sync_targets = Vec::new(); // (device_id, ip, hostname)
-        let mut local_telemetry_needed = false;
+        let mut local_telemetry_device_id: Option<String> = None;
+
+        // Recover from a stuck local telemetry worker so updates can resume.
+        if self.local_telemetry_pending {
+            if let Some(started) = self.local_telemetry_pending_since {
+                if started.elapsed().as_secs() > 20 {
+                    self.local_telemetry_pending = false;
+                    self.local_telemetry_pending_since = None;
+                    self.set_status("Local telemetry timeout; retrying...".to_string());
+                }
+            }
+        }
 
         for d in &self.devices {
             if let Some(ip) = d.primary_ip() {
@@ -2049,7 +2178,7 @@ impl eframe::App for TheGridApp {
                 
                 // Tiered polling: 15s for selected/local, 60s for active ones, 300s for idle/offline
                 let is_selected = self.selected_idx.and_then(|i| self.devices.get(i)).map(|sd| sd.id == d.id).unwrap_or(false);
-                let is_local = d.name == self.config.device_name;
+                let is_local = self.is_local_device(d);
                 
                 let interval = if is_selected || is_local {
                     15 
@@ -2064,7 +2193,7 @@ impl eframe::App for TheGridApp {
                 if needs_poll {
                     if is_local {
                         if !self.local_telemetry_pending {
-                            local_telemetry_needed = true;
+                            local_telemetry_device_id = Some(d.id.clone());
                         }
                     } else {
                         ping_targets.push((ip.to_string(), d.id.clone()));
@@ -2084,8 +2213,8 @@ impl eframe::App for TheGridApp {
             }
         }
 
-        if local_telemetry_needed {
-            self.spawn_collect_local_telemetry();
+        if let Some(local_device_id) = local_telemetry_device_id {
+            self.spawn_collect_local_telemetry(local_device_id);
         }
         for (ip, id) in ping_targets {
             self.spawn_ping(ip, id, false);
@@ -2165,7 +2294,7 @@ impl eframe::App for TheGridApp {
                             &mut self.file_manager.active_rule,
                             &mut self.device_filter,
                             &mut needs_refresh,
-                            &self.config.device_name,
+                            &self.local_hostname,
                         );
                     });
 
@@ -2217,7 +2346,7 @@ impl eframe::App for TheGridApp {
                                 &telemetry_snap,
                                 &mut self.cluster_paths,
                                 &self.cluster_files,
-                                &self.config.device_name,
+                                &self.local_hostname,
                                 active_rule,
                             );
 
@@ -2268,13 +2397,18 @@ impl eframe::App for TheGridApp {
                                 remote_model_edit: &mut self.remote_model_edit,
                                 remote_url_edit: &mut self.remote_url_edit,
                                 terminal_view: self.terminal_sessions.get_mut(&device.id),
-                                local_device_name: &self.config.device_name,
+                                local_device_name: &self.local_hostname,
                                 status,
                             };
 
                             // Pass timeline state into the render
                             let actions = crate::views::dashboard::render_detail_panel_with_timeline(
-                                ui, &mut detail, &mut self.timeline, &self.index_stats
+                                ui,
+                                &mut detail,
+                                &mut self.timeline,
+                                &self.index_stats,
+                                &mut self.telemetry_tree,
+                                &mut self.telemetry_band_height,
                             );
 
                             if let Some(ip) = device.primary_ip().map(|s| s.to_string()) {

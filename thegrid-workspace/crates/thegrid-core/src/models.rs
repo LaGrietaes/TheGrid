@@ -11,6 +11,60 @@ pub enum DetectionSource {
     Sync,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct DetectionSourceDistribution {
+    pub full_scan: u64,
+    pub watcher: u64,
+    pub sync: u64,
+}
+
+impl DetectionSourceDistribution {
+    pub fn increment(&mut self, source: DetectionSource) {
+        match source {
+            DetectionSource::FullScan => self.full_scan += 1,
+            DetectionSource::Watcher => self.watcher += 1,
+            DetectionSource::Sync => self.sync += 1,
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.full_scan + self.watcher + self.sync
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncHealthMetrics {
+    pub observed_at: i64,
+    pub last_sync_at: Option<i64>,
+    pub sync_age_secs: Option<u64>,
+    pub tombstone_count: u64,
+    pub sync_failures: u64,
+    pub detection_sources: DetectionSourceDistribution,
+}
+
+impl SyncHealthMetrics {
+    pub fn mark_sync_success(
+        &mut self,
+        at_ts: i64,
+        tombstone_count: u64,
+        detection_sources: DetectionSourceDistribution,
+    ) {
+        self.observed_at = at_ts;
+        self.last_sync_at = Some(at_ts);
+        self.sync_age_secs = Some(0);
+        self.tombstone_count = tombstone_count;
+        self.detection_sources = detection_sources;
+    }
+
+    pub fn mark_sync_failure(&mut self, at_ts: i64) {
+        self.observed_at = at_ts;
+        self.sync_failures += 1;
+        self.sync_age_secs = self
+            .last_sync_at
+            .map(|last| (at_ts - last).max(0) as u64);
+    }
+}
+
 impl DetectionSource {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -225,21 +279,79 @@ impl FileSearchResult {
 pub struct NodeTelemetry {
     pub device_type: String,
     pub cpu_pct: f32,
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub cpu_physical_cores: Option<u32>,
+    #[serde(default)]
+    pub cpu_logical_processors: Option<u32>,
+    pub cpu_cores_pct: Option<Vec<f32>>,
+    pub cpu_freq_ghz: Option<f32>,
     pub ram_used: u64,
     pub ram_total: u64,
+    pub ram_slots_used: Option<u32>,
+    pub ram_slots_total: Option<u32>,
+    pub ram_speed_mhz: Option<u32>,
+    pub ram_form_factor: Option<String>,
+    #[serde(default)]
+    pub ram_modules: Vec<RamModule>,
     pub disk_used: u64,
     pub disk_total: u64,
     pub cpu_temp: Option<f32>,
     pub is_ai_capable: bool,
+    #[serde(default)]
+    pub gpu_devices: Vec<GpuDevice>,
     pub gpu_name: Option<String>,
     pub gpu_pct: Option<f32>,
     pub gpu_mem_used: Option<u64>,
     pub gpu_mem_total: Option<u64>,
     pub local_ips: Vec<String>,
+    pub running_processes: Option<u32>,
+    #[serde(default)]
+    pub top_processes: Vec<String>,
     pub ai_status: Option<String>,
     pub ai_tokens_per_sec: Option<f32>,
     pub ai_thoughts: Option<String>,
     pub capabilities: DeviceCapabilities,
+    /// Network throughput in bytes/sec (last sample interval)
+    #[serde(default)]
+    pub net_rx_bps: Option<u64>,
+    #[serde(default)]
+    pub net_tx_bps: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GpuDevice {
+    pub name: String,
+    #[serde(default)]
+    pub is_discrete: bool,
+    #[serde(default)]
+    pub is_integrated: bool,
+    #[serde(default)]
+    pub is_shared: bool,
+    #[serde(default)]
+    pub is_rtx: bool,
+    #[serde(default)]
+    pub ai_capable: bool,
+    pub vendor: Option<String>,
+    pub bus_type: Option<String>,
+    pub vram_type: Option<String>,
+    pub gpu_pct: Option<f32>,
+    pub mem_used: Option<u64>,
+    pub mem_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RamModule {
+    pub slot: String,
+    pub capacity: u64,
+    pub speed_mhz: Option<u32>,
+    pub configured_speed_mhz: Option<u32>,
+    pub memory_type: Option<String>,
+    pub form_factor: Option<String>,
+    pub latency_cl: Option<u32>,
+    pub manufacturer: Option<String>,
+    pub part_number: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -247,6 +359,7 @@ pub struct DriveInfo {
     pub name: String,
     pub used: u64,
     pub total: u64,
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

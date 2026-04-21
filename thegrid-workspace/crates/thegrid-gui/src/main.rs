@@ -58,8 +58,8 @@ fn main() -> eframe::Result<()> {
 
     let native_opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // Start at a comfortable size; user can resize
-            .with_inner_size([1200.0, 800.0])
+            // Start maximized so telemetry uses the real panel width from frame 1
+            .with_maximized(true)
             .with_min_inner_size([900.0, 600.0])
             // Frameless window — TheGridApp renders its own title bar
             .with_decorations(false)
@@ -80,6 +80,8 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             // Apply brutalist theme before the first frame renders
             theme::apply(&cc.egui_ctx);
+            // Global readability bump for high-resolution displays
+            cc.egui_ctx.set_pixels_per_point(1.12);
             Box::new(TheGridApp::new(cc))
         }),
     )
