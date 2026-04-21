@@ -456,7 +456,15 @@ impl TheGridApp {
             "Starting initial indexing for {} watch path(s)",
             cfg.watch_paths.len()
         )));
-        self.set_status(format!("Starting indexing for {} watch path(s)...", cfg.watch_paths.len()));
+        let resuming = self.runtime.db.lock()
+            .ok()
+            .and_then(|db| db.has_pending_index_tasks().ok())
+            .unwrap_or(false);
+        if resuming {
+            self.set_status("Resuming unfinished indexing tasks...");
+        } else {
+            self.set_status(format!("Starting indexing for {} watch path(s)...", cfg.watch_paths.len()));
+        }
 
         for path in cfg.watch_paths {
             self.spawn_index_directory(path, cfg.device_name.clone(), cfg.device_name.clone());

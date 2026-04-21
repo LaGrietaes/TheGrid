@@ -777,12 +777,20 @@ fn main() -> Result<()> {
                 "No watch paths configured. Edit config.json to start indexing.",
             );
         } else {
+            let resuming = runtime.db.lock()
+                .ok()
+                .and_then(|db| db.has_pending_index_tasks().ok())
+                .unwrap_or(false);
             emit(
                 &ui_state,
                 tui_mode,
                 "▶",
                 "INDEX",
-                format!("Bootstrapping initial index for {} watch path(s)", cfg.watch_paths.len()),
+                if resuming {
+                    "Resuming unfinished index queue from previous run".to_string()
+                } else {
+                    format!("Bootstrapping initial index for {} watch path(s)", cfg.watch_paths.len())
+                },
             );
             for path in cfg.watch_paths {
                 runtime.spawn_index_directory(path, cfg.device_name.clone(), cfg.device_name.clone());

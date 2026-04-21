@@ -653,7 +653,9 @@ impl Database {
     }
 
     pub fn enqueue_index_root(&self, root: &Path) -> Result<()> {
-        self.conn.execute("DELETE FROM index_queue WHERE root_path = ?", [root.to_string_lossy()])?;
+        if self.has_pending_index_root(root)? {
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT INTO index_queue (root_path, dir_path) VALUES (?, ?)",
             [root.to_string_lossy(), root.to_string_lossy()]
@@ -663,6 +665,25 @@ impl Database {
             params![root.to_string_lossy(), root.to_string_lossy(), SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64]
         )?;
         Ok(())
+    }
+
+    pub fn has_pending_index_tasks(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM index_queue",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn has_pending_index_root(&self, root: &Path) -> Result<bool> {
+        let root_str = root.to_string_lossy().to_string();
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM index_queue WHERE root_path = ?1",
+            [root_str],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn get_next_index_task(&self) -> Result<Option<(String, String)>> {
