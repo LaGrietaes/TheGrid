@@ -1131,7 +1131,9 @@ impl TheGridApp {
 
                 // ── Phase 3: Index ────────────────────────────────────────────
                 AppEvent::IndexProgress { scanned, total, current, ext } => {
-                    self.index_stats.scanning = true;
+                    if !self.index_stats.scanning {
+                        self.index_stats.reset_scan();
+                    }
                     self.index_stats.scan_progress = scanned;
                     self.index_stats.scan_total    = total;
 
