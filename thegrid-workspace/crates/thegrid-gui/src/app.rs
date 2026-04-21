@@ -854,9 +854,27 @@ impl TheGridApp {
                         Ok(_) => {
                             let label = path.file_name()
                                 .unwrap_or_default().to_string_lossy().to_string();
-                            rt.config.lock().unwrap().watch_paths.push(path.clone());
+                            {
+                                let mut cfg = rt.config.lock().unwrap();
+                                cfg.watch_paths.push(path.clone());
+                                if let Err(e) = cfg.save() {
+                                    self.push_toast(Toast::err(format!("Saved watcher but failed to persist config: {}", e)));
+                                }
+                            }
+
+                            // Keep local app config/settings mirror in sync so the UI reflects
+                            // the new path immediately without reopening the app.
+                            self.config = rt.config.lock().unwrap().clone();
+                            self.settings.watch_paths = self
+                                .config
+                                .watch_paths
+                                .iter()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .collect();
+
                             drop(watcher_lock);
                             self.push_toast(Toast::ok(format!("Watching: {}", label)));
+                            self.set_status(format!("Watching + indexing: {}", path.display()));
 
                             // Kick off a full index scan for the new path
                             let dev_id   = self.config.device_name.clone();
