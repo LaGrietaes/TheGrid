@@ -208,15 +208,15 @@ impl AppRuntime {
             self.spawn_embedding_worker();
         }
 
-        // Phase 4: Media AI for GPU nodes
+        // Phase 4: Media AI — extract real image metadata (GPU if available, CPU fallback via `image` crate)
         if self.is_ai_node {
             match thegrid_ai::CudaMediaAnalyzer::new() {
                 Ok(analyzer) => {
                     let mut lock = self.media_analyzer.lock().unwrap();
                     *lock = Some(Arc::new(analyzer));
-                    // Keep analyzer initialized for future real kernels, but do not run
-                    // background media analysis while implementation is still a stub.
-                    log::info!("[Runtime] Media analyzer initialized but worker is disabled in STUB mode");
+                    drop(lock);
+                    log::info!("[Runtime] GPU media analyzer ready — starting background worker");
+                    self.spawn_media_analyzer_worker();
                 }
                 Err(e) => {
                     log::warn!("[Runtime] GPU media analyzer unavailable: {}", e);
@@ -663,6 +663,25 @@ impl AppRuntime {
         });
 
         // Background worker triggers could go here
+    }
+
+    /// Scan the local index for exact-duplicate files (same hash + size).
+    /// Emits `AppEvent::DuplicatesFound` with groups ready for UI or CLI display.
+    pub fn spawn_duplicates_scan(&self) {
+        let db = Arc::clone(&self.db);
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting duplicate file scan...");
+            let result = db.lock().map(|guard| guard.get_duplicate_groups());
+            match result {
+                Ok(Ok(groups)) => {
+                    log::info!("[Runtime] Duplicate scan found {} group(s)", groups.len());
+                    let _ = tx.send(AppEvent::DuplicatesFound(groups));
+                }
+                Ok(Err(e)) => log::error!("[Runtime] Duplicate scan DB error: {}", e),
+                Err(_) => log::error!("[Runtime] Duplicate scan: DB lock poisoned"),
+            }
+        });
     }
 
     pub fn spawn_idle_work(&self) {

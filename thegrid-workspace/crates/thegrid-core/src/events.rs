@@ -181,6 +181,9 @@ pub enum AppEvent {
     /// Search results are ready.
     SearchResults(Vec<FileSearchResult>),
 
+    /// Duplicate file groups found: each entry is (hash, size_bytes, files).
+    DuplicatesFound(Vec<(String, u64, Vec<FileSearchResult>)>),
+
     /// Telemetry snapshot from a remote THE GRID agent.
     TelemetryUpdate {
         device_id:  String,

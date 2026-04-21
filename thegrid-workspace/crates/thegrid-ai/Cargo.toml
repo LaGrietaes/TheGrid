@@ -12,7 +12,9 @@ serde         = { workspace = true }
 serde_json    = { workspace = true }
 reqwest       = { workspace = true }
 
-# ── Phase 4 dependencies (stubbed for now to allow building without C++ tools) ──
+# ── Phase 4 dependencies ────────────────────────────────────────────────────
 # usearch     = "2.13"
 # fastembed   = "4.5"
 sysinfo     = "0.33"
+# Basic image metadata extraction (no GPU required)
+image       = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

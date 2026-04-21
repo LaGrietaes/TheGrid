@@ -33,6 +33,7 @@ const COMMAND_REGISTRY: &[(&str, &str)] = &[
     ("pingagent <ip|#>", "Ping agent endpoint"),
     ("mesh [status]", "Sync health overview"),
     ("mesh sync <ip|#>", "Trigger sync to device"),
+    ("dupes", "Scan and report duplicate files"),
     ("history | !! | !N", "Command history and replay"),
     ("update", "Check latest release"),
     ("gitupdate", "Fetch, pull, build, restart"),
@@ -62,6 +63,7 @@ enum ParsedCommand<'a> {
     PingDevice,
     PingAgent,
     Mesh,
+    Dupes,
     History,
     Update,
     GitUpdate,
@@ -77,6 +79,7 @@ fn parse_command(token: &str) -> ParsedCommand<'_> {
         "pingdev" => ParsedCommand::PingDevice,
         "pingagent" => ParsedCommand::PingAgent,
         "mesh" => ParsedCommand::Mesh,
+        "dupes" | "duplicates" => ParsedCommand::Dupes,
         "history" => ParsedCommand::History,
         "update" => ParsedCommand::Update,
         "gitupdate" => ParsedCommand::GitUpdate,
@@ -759,6 +762,11 @@ fn execute_command(
                 }
             }
         }
+        // Duplicate file detection — triggers async scan; results arrive via DuplicatesFound event
+        ParsedCommand::Dupes => {
+            emit(ui_state, tui_mode, "◈", "DUPES", "Scanning index for duplicate files...");
+            runtime.spawn_duplicates_scan();
+        }
         ParsedCommand::History => {
             if let Ok(s) = ui_state.lock() {
                 if s.command_history.is_empty() {
@@ -1170,6 +1178,31 @@ fn main() -> Result<()> {
                             s.ping_fail += 1;
                         }
                         emit(&ui_state, tui_mode, "⚠", "PING", format!("{} failed: {}", ip, error));
+                    }
+                }
+                AppEvent::DuplicatesFound(groups) => {
+                    if groups.is_empty() {
+                        emit(&ui_state, tui_mode, "✓", "DUPES", "No duplicate files found in index");
+                    } else {
+                        let total_files: usize = groups.iter().map(|(_, _, f)| f.len()).sum();
+                        let wasted: u64 = groups.iter().map(|(_, size, f)| size * (f.len() as u64 - 1)).sum();
+                        emit(&ui_state, tui_mode, "!", "DUPES",
+                            format!("{} group(s), {} redundant files, ~{} MB wasted",
+                                groups.len(), total_files - groups.len(),
+                                wasted / 1_048_576));
+                        for (hash, size, files) in groups.iter().take(10) {
+                            let paths: Vec<String> = files.iter()
+                                .map(|f| f.path.file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| f.path.to_string_lossy().to_string()))
+                                .collect();
+                            emit(&ui_state, tui_mode, "·", "DUPES",
+                                format!("[{}] {}B — {}", &hash[..8], size, paths.join(" | ")));
+                        }
+                        if groups.len() > 10 {
+                            emit(&ui_state, tui_mode, "·", "DUPES",
+                                format!("{} more group(s) not shown", groups.len() - 10));
+                        }
                     }
                 }
                 AppEvent::SyncHealthUpdated { device_id, metrics } => {

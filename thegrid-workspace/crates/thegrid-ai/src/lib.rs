@@ -228,31 +228,41 @@ impl CudaMediaAnalyzer {
 
 impl MediaAnalyzer for CudaMediaAnalyzer {
     fn analyze(&self, path: &std::path::Path) -> Result<MediaMetadata> {
-        // Here we would normally load a CLIP or BLIP model and run it on the GPU.
-        // For now, we return a smart stub that represents what the 2070 would see.
-        log::info!(
-            "[AI] [{}] Analyzing media (STUB mode, no CUDA kernels yet): {:?}",
-            self.gpu_name,
-            path
-        );
-        
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         let mut meta = MediaMetadata::default();
-        
+
         match ext.as_str() {
-            "jpg" | "png" | "webp" => {
-                meta.description = "Photographic content detected (AI stub)".to_string();
-                meta.tags = vec!["photography".into(), "visual".into()];
+            "jpg" | "jpeg" | "png" | "webp" => {
+                // Real image metadata via the `image` crate — no GPU needed for this layer.
+                match image::image_dimensions(path) {
+                    Ok((w, h)) => {
+                        let mp = (w as f64 * h as f64) / 1_000_000.0;
+                        meta.description = format!("{}x{} ({:.1}MP)", w, h, mp);
+                        meta.tags = vec![
+                            ext.to_string(),
+                            format!("{}x{}", w, h),
+                            if mp >= 8.0 { "high-res".into() } else if mp >= 2.0 { "mid-res".into() } else { "low-res".into() },
+                        ];
+                    }
+                    Err(e) => {
+                        log::warn!("[AI] Could not read image dimensions for {:?}: {}", path, e);
+                        meta.description = format!("{} (unreadable)", ext);
+                        meta.tags = vec![ext.to_string()];
+                    }
+                }
             }
-            "mp4" | "mkv" | "mov" => {
-                meta.description = "Video sequence (AI stub)".to_string();
-                meta.tags = vec!["motion".into(), "video".into()];
+            "mp4" | "mkv" | "mov" | "avi" => {
+                // No GPU video decode yet — record container format and file size.
+                let size_mb = path.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
+                meta.description = format!("{} container, ~{}MB", ext.to_ascii_uppercase(), size_mb);
+                meta.tags = vec![ext.to_string(), "video".into()];
             }
             _ => {
-                meta.description = "Unsupported media type".to_string();
+                meta.description = format!("Unsupported media type: {}", ext);
             }
         }
-        
+
+        log::debug!("[AI] [{}] Analyzed {:?}: {}", self.gpu_name, path, meta.description);
         Ok(meta)
     }
 }
