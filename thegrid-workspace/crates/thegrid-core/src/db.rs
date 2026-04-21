@@ -676,6 +676,26 @@ impl Database {
         Ok(count > 0)
     }
 
+    pub fn pending_index_task_count(&self) -> Result<u64> {
+        self.pending_index_task_count_for_root(None)
+    }
+
+    pub fn pending_index_task_count_for_root(&self, root: Option<&str>) -> Result<u64> {
+        let (sql, use_param) = if root.is_some() {
+            ("SELECT COUNT(1) FROM index_queue WHERE root_path = ?1", true)
+        } else {
+            ("SELECT COUNT(1) FROM index_queue", false)
+        };
+
+        let count: i64 = if use_param {
+            self.conn.query_row(sql, params![root.unwrap_or_default()], |row| row.get(0))?
+        } else {
+            self.conn.query_row(sql, [], |row| row.get(0))?
+        };
+
+        Ok(count.max(0) as u64)
+    }
+
     pub fn has_pending_index_root(&self, root: &Path) -> Result<bool> {
         let root_str = root.to_string_lossy().to_string();
         let count: i64 = self.conn.query_row(

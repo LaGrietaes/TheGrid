@@ -400,6 +400,9 @@ pub struct IndexStats {
     pub scan_total: u64,
     pub scan_start_ts: Option<i64>,
     pub scan_eta_secs: Option<u64>,
+    pub last_progress_ts: Option<i64>,
+    pub last_progress_scanned: u64,
+    pub smoothed_files_per_sec: Option<f64>,
     pub type_counts: std::collections::HashMap<String, u64>,
 }
 
@@ -410,6 +413,9 @@ impl IndexStats {
         self.scan_total = 0;
         self.scan_start_ts = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64);
         self.scan_eta_secs = None;
+        self.last_progress_ts = None;
+        self.last_progress_scanned = 0;
+        self.smoothed_files_per_sec = None;
         self.type_counts.clear();
     }
 }

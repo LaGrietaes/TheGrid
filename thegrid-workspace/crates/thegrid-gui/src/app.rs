@@ -1249,7 +1249,7 @@ impl TheGridApp {
                 }
 
                 // ── Phase 3: Index ────────────────────────────────────────────
-                AppEvent::IndexProgress { scanned, total, current, ext } => {
+                AppEvent::IndexProgress { scanned, total, current, ext, estimated_total } => {
                     if !self.index_stats.scanning {
                         self.index_stats.reset_scan();
                     }
@@ -1261,21 +1261,39 @@ impl TheGridApp {
                         *count += 1;
                     }
 
-                    // Calculate ETA
-                    if let Some(start_ts) = self.index_stats.scan_start_ts {
-                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-                        let elapsed = (now - start_ts).max(1) as u64;
-                        if scanned > 0 {
-                            let files_per_sec = scanned as f64 / elapsed as f64;
-                            if files_per_sec > 0.0 {
-                                let remaining = total.saturating_sub(scanned);
-                                self.index_stats.scan_eta_secs = Some((remaining as f64 / files_per_sec) as u64);
-                            }
+                    // Stable ETA using smoothed files/s from progress deltas.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    if let Some(last_ts) = self.index_stats.last_progress_ts {
+                        let dt = (now - last_ts).max(1) as f64;
+                        let dfiles = scanned.saturating_sub(self.index_stats.last_progress_scanned) as f64;
+                        if dfiles > 0.0 {
+                            let instant_rate = dfiles / dt;
+                            let smooth = match self.index_stats.smoothed_files_per_sec {
+                                Some(prev) => prev * 0.75 + instant_rate * 0.25,
+                                None => instant_rate,
+                            };
+                            self.index_stats.smoothed_files_per_sec = Some(smooth);
+                        }
+                    }
+                    self.index_stats.last_progress_ts = Some(now);
+                    self.index_stats.last_progress_scanned = scanned;
+
+                    if let Some(rate) = self.index_stats.smoothed_files_per_sec {
+                        if rate > 0.0 {
+                            let remaining = total.saturating_sub(scanned);
+                            self.index_stats.scan_eta_secs = Some((remaining as f64 / rate) as u64);
                         }
                     }
 
                     if total > 0 {
-                        self.set_status(format!("Indexing: {}/{} ({})", scanned, total, current));
+                        if estimated_total {
+                            self.set_status(format!("Indexing~: {}/{} ({})", scanned, total, current));
+                        } else {
+                            self.set_status(format!("Indexing: {}/{} ({})", scanned, total, current));
+                        }
                     } else {
                         self.set_status(format!("Indexing (Resuming...): {} ({})", scanned, current));
                     }
@@ -1291,6 +1309,7 @@ impl TheGridApp {
                             .as_secs() as i64
                     );
                     self.index_stats.scan_eta_secs = None;
+                    self.index_stats.smoothed_files_per_sec = None;
                     self.set_status(format!(
                         "Index complete: {} files in {:.1}s",
                         files_added, duration_ms as f64 / 1000.0

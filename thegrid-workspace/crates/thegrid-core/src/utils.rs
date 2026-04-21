@@ -196,6 +196,7 @@ pub fn scan_and_index_directory(
             total: total_files,
             current: batch_current,
             ext: batch_ext,
+            estimated_total: false,
         });
 
         if idx % 2 == 0 {

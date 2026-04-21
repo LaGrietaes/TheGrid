@@ -491,6 +491,7 @@ impl AppRuntime {
     ) {
         let start = std::time::Instant::now();
         let scanned_total = Arc::new(AtomicU64::new(0));
+        let dirs_processed = Arc::new(AtomicU64::new(0));
         let mut worker_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
         worker_count = worker_count.clamp(2, 8);
         if root_filter.is_some() {
@@ -506,6 +507,7 @@ impl AppRuntime {
             let device_name = device_name.clone();
             let root_filter = root_filter.clone();
             let scanned_total = Arc::clone(&scanned_total);
+            let dirs_processed = Arc::clone(&dirs_processed);
 
             workers.push(std::thread::spawn(move || -> u64 {
                 let mut local_scanned = 0u64;
@@ -598,17 +600,33 @@ impl AppRuntime {
 
                     local_scanned += dir_count;
                     let global = scanned_total.fetch_add(dir_count, Ordering::Relaxed) + dir_count;
+                    let processed = dirs_processed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let pending_dirs = db_guard
+                        .pending_index_task_count_for_root(root_filter.as_deref())
+                        .unwrap_or(0);
+
+                    let avg_files_per_dir = (global as f64 / processed as f64).max(1.0);
+                    let est_remaining = (pending_dirs as f64 * avg_files_per_dir).round() as u64;
+                    let dynamic_total = global.saturating_add(est_remaining).max(global);
+
                     let progress_scanned = if total_hint > 0 {
                         global.min(total_hint)
                     } else {
                         global
                     };
 
+                    let progress_total = if total_hint > 0 {
+                        total_hint.max(progress_scanned)
+                    } else {
+                        dynamic_total
+                    };
+
                     let _ = tx.send(AppEvent::IndexProgress {
                         scanned: progress_scanned,
-                        total:   total_hint,
+                        total:   progress_total,
                         current: dir_path.file_name().unwrap_or_default().to_string_lossy().into(),
                         ext:     None,
+                        estimated_total: total_hint == 0,
                     });
                 }
                 local_scanned

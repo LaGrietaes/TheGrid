@@ -120,6 +120,7 @@ pub enum AppEvent {
         total:   u64,
         current: String,
         ext:     Option<String>,
+        estimated_total: bool,
     },
 
     /// Incoming request from a remote node for an index sync.
