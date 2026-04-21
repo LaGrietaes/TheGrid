@@ -523,9 +523,11 @@ impl TheGridApp {
             self.set_status(format!("Starting indexing for {} watch path(s)...", cfg.watch_paths.len()));
         }
 
-        for path in cfg.watch_paths {
-            self.spawn_index_directory(path, cfg.device_name.clone(), cfg.device_name.clone());
-        }
+        self.runtime.spawn_index_directories(
+            cfg.watch_paths,
+            cfg.device_name.clone(),
+            cfg.device_name.clone(),
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────

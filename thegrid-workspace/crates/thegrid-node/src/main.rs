@@ -792,9 +792,11 @@ fn main() -> Result<()> {
                     format!("Bootstrapping initial index for {} watch path(s)", cfg.watch_paths.len())
                 },
             );
-            for path in cfg.watch_paths {
-                runtime.spawn_index_directory(path, cfg.device_name.clone(), cfg.device_name.clone());
-            }
+            runtime.spawn_index_directories(
+                cfg.watch_paths,
+                cfg.device_name.clone(),
+                cfg.device_name.clone(),
+            );
         }
     }
 

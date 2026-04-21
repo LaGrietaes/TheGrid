@@ -407,6 +407,7 @@ impl AppRuntime {
             let total_count = jwalk::WalkDir::new(&path)
                 .into_iter()
                 .filter_map(|e| e.ok())
+                .filter(|e| !should_skip_path(&e.path()))
                 .filter(|e| e.file_type().is_file())
                 .count() as u64;
 
@@ -436,6 +437,69 @@ impl AppRuntime {
                 device_name, 
                 total_count,
                 Some(path.to_string_lossy().to_string())
+            );
+        });
+    }
+
+    pub fn spawn_index_directories(&self, paths: Vec<PathBuf>, device_id: String, device_name: String) {
+        let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
+        let tx = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            if paths.is_empty() {
+                return;
+            }
+
+            let mut total_count = 0u64;
+            let mut accepted_roots = 0u64;
+
+            for mut root in paths {
+                if root.to_string_lossy().len() == 2 && root.to_string_lossy().ends_with(':') {
+                    root = PathBuf::from(format!("{}\\", root.to_string_lossy()));
+                }
+
+                if !root.exists() || should_skip_path(&root) {
+                    continue;
+                }
+
+                let _ = tx.send(AppEvent::Status(format!("Calculating total files for {}...", root.display())));
+
+                let root_total = jwalk::WalkDir::new(&root)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| !should_skip_path(&e.path()))
+                    .filter(|e| e.file_type().is_file())
+                    .count() as u64;
+
+                if let Ok(guard) = db.lock() {
+                    if guard.enqueue_index_root(&root).is_ok() {
+                        accepted_roots += 1;
+                    }
+                }
+
+                total_count = total_count.saturating_add(root_total);
+            }
+
+            if accepted_roots == 0 {
+                let _ = tx.send(AppEvent::Status("No valid watch roots available for indexing".into()));
+                return;
+            }
+
+            let _ = tx.send(AppEvent::Status(format!(
+                "Indexing {} files across {} root(s)...",
+                total_count,
+                accepted_roots
+            )));
+
+            Self::do_process_index_queue(
+                db,
+                config,
+                tx,
+                device_id,
+                device_name,
+                total_count,
+                None,
             );
         });
     }
