@@ -210,10 +210,22 @@ impl AppRuntime {
 
         // Phase 4: Media AI for GPU nodes
         if self.is_ai_node {
-            if let Ok(analyzer) = thegrid_ai::CudaMediaAnalyzer::new() {
-                let mut lock = self.media_analyzer.lock().unwrap();
-                *lock = Some(Arc::new(analyzer));
-                self.spawn_media_analyzer_worker();
+            match thegrid_ai::CudaMediaAnalyzer::new() {
+                Ok(analyzer) => {
+                    let mut lock = self.media_analyzer.lock().unwrap();
+                    *lock = Some(Arc::new(analyzer));
+                    let _ = self.event_tx.send(AppEvent::Status(
+                        "AI media analyzer initialized on GPU (stub mode: low GPU usage is expected)".into(),
+                    ));
+                    self.spawn_media_analyzer_worker();
+                }
+                Err(e) => {
+                    log::warn!("[Runtime] GPU media analyzer unavailable: {}", e);
+                    let _ = self.event_tx.send(AppEvent::Status(format!(
+                        "AI media analyzer unavailable: {}",
+                        e
+                    )));
+                }
             }
         }
 

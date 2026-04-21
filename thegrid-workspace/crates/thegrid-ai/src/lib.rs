@@ -230,7 +230,11 @@ impl MediaAnalyzer for CudaMediaAnalyzer {
     fn analyze(&self, path: &std::path::Path) -> Result<MediaMetadata> {
         // Here we would normally load a CLIP or BLIP model and run it on the GPU.
         // For now, we return a smart stub that represents what the 2070 would see.
-        log::info!("[AI] [{}] Analyzing media: {:?}", self.gpu_name, path);
+        log::info!(
+            "[AI] [{}] Analyzing media (STUB mode, no CUDA kernels yet): {:?}",
+            self.gpu_name,
+            path
+        );
         
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         let mut meta = MediaMetadata::default();
