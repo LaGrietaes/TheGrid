@@ -1,0 +1,24 @@
+﻿[package]
+name = "thegrid-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Centralized runtime and background task manager for THE GRID"
+
+[dependencies]
+thegrid-core = { path = "../thegrid-core" }
+thegrid-net  = { path = "../thegrid-net" }
+thegrid-ai   = { path = "../thegrid-ai" }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+thiserror  = { workspace = true }
+log        = { workspace = true }
+chrono     = { workspace = true }
+tokio      = { workspace = true }
+reqwest    = { workspace = true }
+jwalk      = { workspace = true }
+hostname   = "0.3"
+dirs       = "5"
+uuid       = { version = "1.7", features = ["v4"] }
+rusqlite   = "0.31"

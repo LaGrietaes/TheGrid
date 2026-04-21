@@ -1,0 +1,1567 @@
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use anyhow::Result;
+use rusqlite::params;
+
+use thegrid_core::{
+    fingerprint_file, match_rules, should_skip_dir, should_skip_path, AppEvent, Config, Database,
+    DetectionSourceDistribution, FileChange, FileWatcher, SyncHealthMetrics,
+};
+use thegrid_net::{AgentClient, AgentServer, TailscaleClient, TermuxAgent, WolSentry};
+use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
+
+fn apply_automation_rules_for_file(
+    db: &Database,
+    cfg: &Config,
+    file_id: i64,
+    path: &std::path::Path,
+    size: u64,
+    modified: Option<i64>,
+) {
+    if let Ok(rules) = db.get_rules() {
+        let user_rules: Vec<_> = rules.into_iter().map(|r| {
+            thegrid_core::models::UserRule {
+                id: r.0,
+                name: r.1,
+                pattern: r.2,
+                project: r.3,
+                tag: r.4,
+                is_active: r.5,
+            }
+        }).collect();
+
+        let matches = match_rules(path, &user_rules, file_id);
+        for m in matches {
+            let _ = db.add_file_tag(file_id, m.tag.as_deref(), m.project.as_deref(), false);
+        }
+    }
+
+    let ext = path.extension()
+        .map(|e| e.to_string_lossy().to_string().to_lowercase())
+        .unwrap_or_default();
+
+    for rule in &cfg.smart_rules {
+        let mut matched = true;
+        let mut project_output: Option<String> = None;
+        let mut category_output: Option<String> = None;
+
+        for filter in &rule.filters {
+            match filter {
+                thegrid_core::models::SmartFilterType::Extension(expected) => {
+                    let expected = expected.trim_start_matches('.').to_lowercase();
+                    if ext != expected {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::MinSize(min) => {
+                    if size < *min {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::MaxSize(max) => {
+                    if size > *max {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::ModifiedAfter(dt) => {
+                    let ts = modified.unwrap_or(0);
+                    if ts <= dt.timestamp() {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::ModifiedBefore(dt) => {
+                    let ts = modified.unwrap_or(i64::MAX);
+                    if ts >= dt.timestamp() {
+                        matched = false;
+                        break;
+                    }
+                }
+                thegrid_core::models::SmartFilterType::Project(project_id) => {
+                    project_output = Some(project_id.clone());
+                }
+                thegrid_core::models::SmartFilterType::Category(category_id) => {
+                    category_output = Some(category_id.clone());
+                }
+            }
+        }
+
+        if matched {
+            let rule_tag = format!("rule:{}", rule.id);
+            let category_tag = category_output.as_ref().map(|c| format!("category:{}", c));
+            let _ = db.add_file_tag(file_id, Some(&rule_tag), project_output.as_deref(), false);
+            if let Some(cat_tag) = category_tag.as_deref() {
+                let _ = db.add_file_tag(file_id, Some(cat_tag), project_output.as_deref(), false);
+            }
+        }
+    }
+}
+
+pub struct AppRuntime {
+    pub config:       Arc<Mutex<Config>>,
+    pub db:           Arc<Mutex<Database>>,
+    pub event_tx:     mpsc::Sender<AppEvent>,
+    
+    // Services
+    pub file_watcher:    Arc<Mutex<Option<FileWatcher>>>,
+    pub semantic_search: Arc<Mutex<Option<SemanticSearch>>>,
+    
+    // Remote AI Capabilities (device_id -> ip)
+    pub remote_ai_nodes: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    pub termux_agent: Arc<Mutex<Option<TermuxAgent>>>,
+    
+    // State
+    pub is_ai_node: bool,
+    pub media_analyzer: Arc<Mutex<Option<Arc<dyn thegrid_ai::MediaAnalyzer>>>>,
+    pub agent_shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    pub hash_worker_running: Arc<AtomicBool>,
+    pub sync_health: Arc<Mutex<std::collections::HashMap<String, SyncHealthMetrics>>>,
+}
+
+impl AppRuntime {
+    fn parse_agent_target(endpoint: &str, fallback_port: u16) -> Option<(String, u16)> {
+        let trimmed = endpoint.trim();
+        let without_scheme = trimmed
+            .strip_prefix("http://")
+            .or_else(|| trimmed.strip_prefix("https://"))
+            .unwrap_or(trimmed);
+        let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+        if host_port.is_empty() {
+            return None;
+        }
+
+        if let Some((host, port_str)) = host_port.rsplit_once(':') {
+            let port = port_str.parse::<u16>().ok().unwrap_or(fallback_port);
+            Some((host.to_string(), port))
+        } else {
+            Some((host_port.to_string(), fallback_port))
+        }
+    }
+
+    pub fn new(config: Config, event_tx: mpsc::Sender<AppEvent>) -> Result<Self> {
+        let db_path = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("thegrid")
+            .join("index.db");
+
+        let db = match Database::open(&db_path) {
+            Ok(d) => Arc::new(Mutex::new(d)),
+            Err(e) => {
+                let msg = format!("DB open failed ({}), using in-memory fallback", e);
+                log::error!("{}", msg);
+                let _ = event_tx.send(AppEvent::Status(format!("db_error:{}", msg)));
+                Arc::new(Mutex::new(Database::open(":memory:")?))
+            }
+        };
+
+        // Initialize services
+        let (file_watcher, _watch_paths) = match FileWatcher::new(event_tx.clone()) {
+            Ok(mut fw) => {
+                let wp = config.watch_paths.clone();
+                for path in &wp {
+                    let _ = fw.watch(path.clone());
+                }
+                (Arc::new(Mutex::new(Some(fw))), wp)
+            }
+            Err(e) => {
+                log::warn!("FileWatcher unavailable: {}", e);
+                (Arc::new(Mutex::new(None)), vec![])
+            }
+        };
+
+        let ai_node_detector = AiNodeDetector::new();
+        let is_ai_node = ai_node_detector.is_ai_node();
+
+        let runtime = Self {
+            config: Arc::new(Mutex::new(config)),
+            db,
+            event_tx,
+            file_watcher,
+            semantic_search: Arc::new(Mutex::new(None)),
+            remote_ai_nodes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            termux_agent: Arc::new(Mutex::new(None)),
+            is_ai_node,
+            media_analyzer: Arc::new(Mutex::new(None)),
+            agent_shutdown: Arc::new(Mutex::new(None)),
+            hash_worker_running: Arc::new(AtomicBool::new(false)),
+            sync_health: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        };
+
+        Ok(runtime)
+    }
+
+    pub fn start_services(&self) {
+        let (p, k, c) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.agent_port, cfg.api_key.clone(), cfg.clone())
+        };
+
+        let _ = self.event_tx.send(AppEvent::Status(format!(
+            "security_gates:file_access={},terminal_access={},ai_access={},remote_control={},rdp={}",
+            c.enable_file_access,
+            c.enable_terminal_access,
+            c.enable_ai_access,
+            c.enable_remote_control,
+            c.enable_rdp
+        )));
+
+        // Start agent server
+        let transfers_dir = c.effective_transfers_dir();
+        let mut server = AgentServer::new(
+            p,
+            k.clone(),
+            transfers_dir,
+            self.event_tx.clone(),
+            Arc::clone(&self.config)
+        );
+
+        if !k.trim().is_empty() {
+            if let Ok(ts_client) = TailscaleClient::new(k) {
+                server = server.with_tailscale(Arc::new(ts_client));
+            }
+        }
+
+        // Detect & setup Termux node via USB-C OTG (faster than WiFi)
+        if let Some(agent) = thegrid_net::setup_termux_agent() {
+            let method = agent.connection_method();
+            let endpoint = agent.endpoint().to_string();
+            {
+                let mut slot = self.termux_agent.lock().unwrap();
+                *slot = Some(agent);
+            }
+            log::info!("[Runtime] Tablet (Android) available via {} at {}", method, endpoint);
+            let _ = self.event_tx.send(AppEvent::Status(format!(
+                "termux_ready:{}:{}",
+                method,
+                endpoint
+            )));
+        } else {
+            let mut slot = self.termux_agent.lock().unwrap();
+            *slot = None;
+            log::debug!("[Runtime] No Termux/Android device available");
+        }
+
+        // Start AI if capable OR if provider URL is set (which overrides local specs)
+        let has_remote_provider = {
+            let cfg = self.config.lock().unwrap();
+            cfg.ai_provider_url.is_some()
+        };
+
+        if self.is_ai_node || has_remote_provider {
+            self.spawn_semantic_initializer();
+            self.spawn_embedding_worker();
+        }
+
+        // Phase 4: Media AI — extract real image metadata (GPU if available, CPU fallback via `image` crate)
+        if self.is_ai_node {
+            match thegrid_ai::CudaMediaAnalyzer::new() {
+                Ok(analyzer) => {
+                    let mut lock = self.media_analyzer.lock().unwrap();
+                    *lock = Some(Arc::new(analyzer));
+                    drop(lock);
+                    log::info!("[Runtime] GPU media analyzer ready — starting background worker");
+                    self.spawn_media_analyzer_worker();
+                }
+                Err(e) => {
+                    log::warn!("[Runtime] GPU media analyzer unavailable: {}", e);
+                    let _ = self.event_tx.send(AppEvent::Status(format!(
+                        "AI media analyzer unavailable: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        // Background indexing helpers
+        self.spawn_hashing_worker();
+
+        let mut shutdown_lock = self.agent_shutdown.lock().unwrap();
+        *shutdown_lock = Some(server.shutdown_handle());
+        server.spawn();
+    }
+
+    pub fn restart_services(&self) {
+        log::info!("[Runtime] Restarting agent services...");
+        
+        // 1. Signal old server to stop
+        let old_shutdown = {
+            let mut lock = self.agent_shutdown.lock().unwrap();
+            lock.take()
+        };
+        
+        if let Some(s) = old_shutdown {
+            log::debug!("[Runtime] Sending shutdown signal to old agent...");
+            s.store(true, Ordering::Relaxed);
+            // Give it a moment to release the port
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+
+        // 2. Start new services with fresh config
+        self.start_services();
+    }
+
+    pub fn refresh_ai_services(&self) {
+        log::info!("[Runtime] Refreshing AI services due to config change...");
+        self.spawn_semantic_initializer();
+    }
+
+    // --- Task Spawners (Migrated from app.rs) ---
+
+    pub fn spawn_load_devices(&self) {
+        let api_key = self.config.lock().unwrap().api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let result = TailscaleClient::new(api_key).and_then(|c| c.fetch_devices());
+            match result {
+                Ok(d)  => { let _ = tx.send(AppEvent::DevicesLoaded(d)); }
+                Err(e) => { let _ = tx.send(AppEvent::DevicesFailed(e.to_string())); }
+            }
+        });
+    }
+
+    pub fn spawn_ping(&self, ip: String, manual: bool) {
+        let (port, api_key) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.agent_port, cfg.api_key.clone())
+        };
+        let tx = self.event_tx.clone();
+        let ip_addr = ip.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.ping()) {
+                Ok(response)  => { let _ = tx.send(AppEvent::AgentPingOk { ip: ip_addr, response, manual }); }
+                Err(e) => { let _ = tx.send(AppEvent::AgentPingFailed { ip: ip_addr, error: e.to_string(), manual }); }
+            }
+        });
+    }
+
+    pub fn spawn_ping_device(&self, ip: String, manual: bool) {
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            #[cfg(target_os = "windows")]
+            let output = Command::new("ping")
+                .args(["-n", "1", "-w", "1200", &ip])
+                .output();
+
+            #[cfg(not(target_os = "windows"))]
+            let output = Command::new("ping")
+                .args(["-c", "1", "-W", "1", &ip])
+                .output();
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let _ = tx.send(AppEvent::Status(format!("device_ping_ok:{}:{}", ip, manual)));
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let msg = if stderr.trim().is_empty() {
+                        "host unreachable or timeout".to_string()
+                    } else {
+                        stderr.trim().to_string()
+                    };
+                    let _ = tx.send(AppEvent::Status(format!("device_ping_fail:{}:{}:{}", ip, manual, msg)));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Status(format!("device_ping_fail:{}:{}:{}", ip, manual, e)));
+                }
+            }
+        });
+    }
+
+    pub fn spawn_list_remote_files(&self, ip: String) {
+        let (port, api_key) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.agent_port, cfg.api_key.clone())
+        };
+        let tx   = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.list_files()) {
+                Ok(f)  => { let _ = tx.send(AppEvent::RemoteFilesLoaded(f)); }
+                Err(e) => { let _ = tx.send(AppEvent::RemoteFilesFailed(e.to_string())); }
+            }
+        });
+    }
+
+    pub fn spawn_send_file(&self, ip: String, path: PathBuf, queue_idx: usize) {
+        let (port, api_key) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.agent_port, cfg.api_key.clone())
+        };
+        let tx     = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "unnamed".to_string());
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.upload_file(&path)) {
+                Ok(_)  => { let _ = tx.send(AppEvent::FileSent { queue_idx, name }); }
+                Err(e) => { let _ = tx.send(AppEvent::FileSendFailed { queue_idx, error: e.to_string() }); }
+            }
+        });
+    }
+
+    pub fn spawn_download_file(&self, ip: String, filename: String) {
+        let (port, api_key, dest_dir) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.agent_port, cfg.api_key.clone(), cfg.effective_transfers_dir())
+        };
+        let tx       = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.download_file(&filename, &dest_dir)) {
+                Ok(p)  => { let _ = tx.send(AppEvent::FileDownloaded { name: filename, path: p }); }
+                Err(e) => { let _ = tx.send(AppEvent::FileDownloadFailed { name: filename, error: e.to_string() }); }
+            }
+        });
+    }
+
+    pub fn spawn_browse_remote_directory(&self, ip: String, device_id: String, path: PathBuf) {
+        let (port, api_key) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.agent_port, cfg.api_key.clone())
+        };
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.browse_directory(&path)) {
+                Ok(files) => { let _ = tx.send(AppEvent::RemoteBrowseLoaded { device_id, path, files }); }
+                Err(e) => { let _ = tx.send(AppEvent::RemoteBrowseFailed { device_id, error: e.to_string() }); }
+            }
+        });
+    }
+
+    pub fn spawn_index_directory(&self, path: PathBuf, device_id: String, device_name: String) {
+        let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
+        let tx = self.event_tx.clone();
+        
+        let path_for_thread = path.clone();
+
+        std::thread::spawn(move || {
+            let mut path = path_for_thread;
+            // Ensure Windows drive letters (e.g., "C:") have a trailing slash for proper walking
+            if path.to_string_lossy().len() == 2 && path.to_string_lossy().ends_with(':') {
+                path = PathBuf::from(format!("{}\\", path.to_string_lossy()));
+            }
+
+            if !path.exists() {
+                let _ = tx.send(AppEvent::Status(format!("Path does not exist: {:?}", path)));
+                return;
+            }
+
+            log::info!("[Runtime] Starting full index task for {:?}", path);
+            let _ = tx.send(AppEvent::Status(format!("Indexing {}...", path.display())));
+
+            // Enqueue the root in the persistent queue
+            {
+                match db.lock() {
+                    Ok(guard) => {
+                        if let Err(e) = guard.enqueue_index_root(&path) {
+                            log::error!("Failed to enqueue index root: {}", e);
+                            return;
+                        }
+                    }
+                    Err(_) => { log::error!("DB LOCK FAILED"); return; }
+                }
+            }
+
+            // Immediately start processing the queue in this thread
+            Self::do_process_index_queue(
+                db, 
+                config,
+                tx, 
+                device_id, 
+                device_name, 
+                0,
+                Some(path.to_string_lossy().to_string())
+            );
+        });
+    }
+
+    pub fn spawn_index_directories(&self, paths: Vec<PathBuf>, device_id: String, device_name: String) {
+        let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
+        let tx = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            if paths.is_empty() {
+                return;
+            }
+
+            let mut accepted_roots = 0u64;
+
+            for mut root in paths {
+                if root.to_string_lossy().len() == 2 && root.to_string_lossy().ends_with(':') {
+                    root = PathBuf::from(format!("{}\\", root.to_string_lossy()));
+                }
+
+                if !root.exists() || should_skip_path(&root) {
+                    continue;
+                }
+
+                if let Ok(guard) = db.lock() {
+                    if guard.enqueue_index_root(&root).is_ok() {
+                        accepted_roots += 1;
+                    }
+                }
+            }
+
+            if accepted_roots == 0 {
+                let _ = tx.send(AppEvent::Status("No valid watch roots available for indexing".into()));
+                return;
+            }
+
+            let _ = tx.send(AppEvent::Status(format!(
+                "Indexing across {} root(s)...",
+                accepted_roots
+            )));
+
+            Self::do_process_index_queue(
+                db,
+                config,
+                tx,
+                device_id,
+                device_name,
+                0,
+                None,
+            );
+        });
+    }
+
+    /// Process the persistent index queue until empty.
+    /// This is a static-like method to avoid lifetime issues when calling from a thread.
+    fn do_process_index_queue(
+        db:           Arc<Mutex<Database>>,
+        config:       Arc<Mutex<Config>>,
+        tx:           mpsc::Sender<AppEvent>,
+        device_id:    String,
+        device_name:  String,
+        total_hint:   u64,
+        root_filter:  Option<String>,
+    ) {
+        let start = std::time::Instant::now();
+        let scanned_total = Arc::new(AtomicU64::new(0));
+        let dirs_processed = Arc::new(AtomicU64::new(0));
+        let max_total_seen = Arc::new(AtomicU64::new(total_hint));
+        let mut worker_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+        worker_count = worker_count.clamp(2, 8);
+        if root_filter.is_some() {
+            worker_count = worker_count.min(4);
+        }
+
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let db = Arc::clone(&db);
+            let config = Arc::clone(&config);
+            let tx = tx.clone();
+            let device_id = device_id.clone();
+            let device_name = device_name.clone();
+            let root_filter = root_filter.clone();
+            let scanned_total = Arc::clone(&scanned_total);
+            let dirs_processed = Arc::clone(&dirs_processed);
+            let max_total_seen = Arc::clone(&max_total_seen);
+
+            workers.push(std::thread::spawn(move || -> u64 {
+                let mut local_scanned = 0u64;
+                loop {
+                    let task = {
+                        let guard = match db.lock() {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        };
+                        guard
+                            .claim_next_index_task_for_root(root_filter.as_deref())
+                            .unwrap_or(None)
+                    };
+
+                    let Some((root, dir_str)) = task else {
+                        break;
+                    };
+
+                    let dir_path = PathBuf::from(&dir_str);
+                    let entries = match std::fs::read_dir(&dir_path) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    let cfg_snapshot = config.lock().ok().map(|c| c.clone());
+                    let mut subdirs: Vec<PathBuf> = Vec::new();
+                    let mut files_to_index: Vec<(PathBuf, u64, Option<i64>, Option<String>)> = Vec::new();
+
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if should_skip_path(&path) {
+                            continue;
+                        }
+                        let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+
+                        if meta.is_dir() {
+                            let name = path.file_name().unwrap_or_default().to_string_lossy();
+                            if should_skip_dir(&name) {
+                                continue;
+                            }
+                            subdirs.push(path);
+                        } else if meta.is_file() {
+                            let size = meta.len();
+                            let modified = meta.modified().ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64);
+                            let quick_hash = thegrid_core::quick_hash_file(&path).ok();
+                            files_to_index.push((path, size, modified, quick_hash));
+                        }
+                    }
+
+                    let mut dir_count = 0u64;
+                    let db_guard = match db.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+
+                    for (path, size, modified, quick_hash) in &files_to_index {
+                        if let Ok(fid) = db_guard.index_file_with_source(
+                            &device_id,
+                            &device_name,
+                            path,
+                            *size,
+                            *modified,
+                            quick_hash.as_deref(),
+                            None,
+                            thegrid_core::DetectionSource::FullScan,
+                            chrono::Utc::now().timestamp(),
+                        ) {
+                            if let Some(cfg) = cfg_snapshot.as_ref() {
+                                apply_automation_rules_for_file(
+                                    &db_guard,
+                                    cfg,
+                                    fid,
+                                    path,
+                                    *size,
+                                    *modified,
+                                );
+                            }
+                            dir_count += 1;
+                        }
+                    }
+
+                    for s in subdirs {
+                        let _ = db_guard.conn.execute(
+                            "INSERT OR IGNORE INTO index_queue (root_path, dir_path) VALUES (?, ?)",
+                            params![root.as_str(), s.to_string_lossy()]
+                        );
+                    }
+
+                    local_scanned += dir_count;
+                    let global = scanned_total.fetch_add(dir_count, Ordering::Relaxed) + dir_count;
+                    let processed = dirs_processed.fetch_add(1, Ordering::Relaxed) + 1;
+                    let pending_dirs = db_guard
+                        .pending_index_task_count_for_root(root_filter.as_deref())
+                        .unwrap_or(0);
+
+                    let avg_files_per_dir = (global as f64 / processed as f64).max(1.0);
+                    let est_remaining = (pending_dirs as f64 * avg_files_per_dir).round() as u64;
+                    let dynamic_total = global.saturating_add(est_remaining).max(global);
+
+                    let progress_scanned = if total_hint > 0 {
+                        global.min(total_hint)
+                    } else {
+                        global
+                    };
+
+                    let progress_total = if total_hint > 0 {
+                        total_hint.max(progress_scanned)
+                    } else {
+                        dynamic_total
+                    };
+
+                    let mut observed_max = max_total_seen.load(Ordering::Relaxed);
+                    while progress_total > observed_max {
+                        match max_total_seen.compare_exchange_weak(
+                            observed_max,
+                            progress_total,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => observed_max = actual,
+                        }
+                    }
+                    let stable_total = max_total_seen.load(Ordering::Relaxed).max(progress_scanned);
+
+                    let _ = tx.send(AppEvent::IndexProgress {
+                        scanned: progress_scanned,
+                        total:   stable_total,
+                        current: dir_path.file_name().unwrap_or_default().to_string_lossy().into(),
+                        ext:     None,
+                        estimated_total: total_hint == 0,
+                    });
+                }
+                local_scanned
+            }));
+        }
+
+        let mut scanned_count = 0u64;
+        for worker in workers {
+            if let Ok(n) = worker.join() {
+                scanned_count += n;
+            }
+        }
+
+        let _ = tx.send(AppEvent::IndexComplete {
+            device_id,
+            files_added: scanned_count,
+            duration_ms: start.elapsed().as_millis() as u64,
+        });
+
+        // Background worker triggers could go here
+    }
+
+    /// Scan the local index for exact-duplicate files (same hash + size).
+    /// Emits `AppEvent::DuplicatesFound` with groups ready for UI or CLI display.
+    pub fn spawn_duplicates_scan(&self) {
+        let db = Arc::clone(&self.db);
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting duplicate file scan...");
+            let result = db.lock().map(|guard| guard.get_duplicate_groups());
+            match result {
+                Ok(Ok(groups)) => {
+                    log::info!("[Runtime] Duplicate scan found {} group(s)", groups.len());
+                    let _ = tx.send(AppEvent::DuplicatesFound(groups));
+                }
+                Ok(Err(e)) => log::error!("[Runtime] Duplicate scan DB error: {}", e),
+                Err(_) => log::error!("[Runtime] Duplicate scan: DB lock poisoned"),
+            }
+        });
+    }
+
+    pub fn spawn_idle_work(&self) {
+        log::info!("Idle worker triggered — looking for unfinished tasks");
+        let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
+        let tx = self.event_tx.clone();
+
+        let device_id   = { self.config.lock().unwrap().device_name.clone() };
+        let device_name = device_id.clone();
+        
+        std::thread::spawn(move || {
+            Self::do_process_index_queue(
+                db, 
+                config,
+                tx, 
+                device_id, 
+                device_name, 
+                0,
+                None
+            );
+        });
+    }
+
+
+    pub fn spawn_incremental_index(&self, changes: Vec<FileChange>) {
+        let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
+        let (device_id, device_name) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.device_name.clone(), cfg.device_name.clone())
+        };
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let result = db.lock().map(|guard| {
+                guard.index_changed_paths(&device_id, &device_name, &changes)
+            });
+            match result {
+                Ok(Ok((updated, deleted, renamed))) => {
+                    let cfg = config.lock().ok().map(|c| c.clone());
+                    if let (Some(cfg), Ok(guard)) = (cfg, db.lock()) {
+                        for change in &changes {
+                            let candidate = match change.kind {
+                                thegrid_core::FileChangeKind::Created | thegrid_core::FileChangeKind::Modified => Some(change.path.clone()),
+                                thegrid_core::FileChangeKind::Renamed => change.new_path.clone(),
+                                thegrid_core::FileChangeKind::Deleted => None,
+                            };
+
+                            if let Some(path) = candidate {
+                                if !path.exists() || !path.is_file() {
+                                    continue;
+                                }
+                                let fp = change.fingerprint.clone()
+                                    .or_else(|| fingerprint_file(&path).ok());
+                                if let Some(fp) = fp {
+                                    if let Ok(Some(fid)) = guard.get_file_id_by_path(&device_id, &path) {
+                                        apply_automation_rules_for_file(
+                                            &guard,
+                                            &cfg,
+                                            fid,
+                                            &path,
+                                            fp.size,
+                                            fp.modified,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let _ = tx.send(AppEvent::IndexUpdated { paths_updated: updated + deleted + renamed });
+                }
+                _ => {}
+            }
+        });
+    }
+
+    pub fn spawn_sync_node(&self, device_id: String, ip: String, hostname: String) {
+        let db          = self.db.clone();
+        let event_tx    = self.event_tx.clone();
+        let sync_health = self.sync_health.clone();
+        let (api_key, port, requester_device) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.api_key.clone(), cfg.agent_port, cfg.device_name.clone())
+        };
+
+        std::thread::spawn(move || {
+            let last_ts = match db.lock() {
+                Ok(guard) => guard.get_node_sync_ts(&device_id).unwrap_or(0),
+                Err(_)    => 0,
+            };
+
+            let client = match AgentClient::new(&ip, port, api_key) {
+                Ok(c) => c,
+                Err(e) => {
+                    let now = chrono::Utc::now().timestamp();
+                    if let Ok(mut guard) = sync_health.lock() {
+                        let metrics = guard.entry(device_id.clone()).or_default();
+                        metrics.mark_sync_failure(now);
+                        let _ = event_tx.send(AppEvent::SyncHealthUpdated {
+                            device_id: device_id.clone(),
+                            metrics: metrics.clone(),
+                        });
+                    }
+                    let _ = event_tx.send(AppEvent::SyncFailed { device_id, error: e.to_string() });
+                    return;
+                }
+            };
+
+            let delta = match client.sync_index(last_ts, Some(&requester_device)) {
+                Ok(r) => r,
+                Err(e) => {
+                    let now = chrono::Utc::now().timestamp();
+                    if let Ok(mut guard) = sync_health.lock() {
+                        let metrics = guard.entry(device_id.clone()).or_default();
+                        metrics.mark_sync_failure(now);
+                        let _ = event_tx.send(AppEvent::SyncHealthUpdated {
+                            device_id: device_id.clone(),
+                            metrics: metrics.clone(),
+                        });
+                    }
+                    let _ = event_tx.send(AppEvent::SyncFailed { device_id, error: e.to_string() });
+                    return;
+                }
+            };
+
+            let mut count = 0;
+            let mut max_ts = last_ts;
+            let now = chrono::Utc::now().timestamp();
+            let tombstone_count = delta.tombstones.len() as u64;
+            let mut detection_sources = DetectionSourceDistribution::default();
+            if let Ok(guard) = db.lock() {
+                for r in delta.files {
+                    let mod_ts = r.modified.unwrap_or(0);
+                    if r.indexed_at > max_ts { max_ts = r.indexed_at; }
+                    if mod_ts > max_ts { max_ts = mod_ts; }
+                    detection_sources.increment(r.detected_by);
+                    if guard.upsert_remote_file(r).is_ok() {
+                        count += 1;
+                    }
+                }
+                for tombstone in delta.tombstones {
+                    if tombstone.deleted_at > max_ts {
+                        max_ts = tombstone.deleted_at;
+                    }
+                    detection_sources.increment(tombstone.detected_by);
+                    let _ = guard.apply_remote_tombstone(&tombstone);
+                }
+                let _ = guard.update_node_sync_ts(&device_id, &hostname, max_ts);
+            }
+
+            if let Ok(mut guard) = sync_health.lock() {
+                let metrics = guard.entry(device_id.clone()).or_default();
+                metrics.mark_sync_success(now, tombstone_count, detection_sources);
+                let _ = event_tx.send(AppEvent::SyncHealthUpdated {
+                    device_id: device_id.clone(),
+                    metrics: metrics.clone(),
+                });
+            }
+
+            if count > 0 {
+                let _ = event_tx.send(AppEvent::SyncComplete { device_id, files_added: count });
+            }
+        });
+    }
+
+    pub fn spawn_semantic_initializer(&self) {
+        let event_tx = self.event_tx.clone();
+        let db       = self.db.clone();
+        let semantic = self.semantic_search.clone();
+        let config   = self.config.clone();
+
+        std::thread::spawn(move || {
+            const LOCAL_OLLAMA: &str = "http://127.0.0.1:11434";
+            const REMOTE_LOCALAI: &str = "http://100.67.58.127:8080";
+            let prefer_remote_first = !thegrid_ai::AiNodeDetector::new().is_ai_node();
+
+            // Resolve provider URL + model — explicit config wins, then auto-detect with fallback.
+            let (resolved_url, resolved_model) = {
+                let cfg = config.lock().unwrap();
+                match (cfg.ai_provider_url.clone(), cfg.ai_model.clone()) {
+                    (Some(u), m) => (u, m.unwrap_or_else(|| "nomic-embed-text".to_string())),
+                    (None, _) => {
+                        // Auto-detect: try local Ollama first, then remote LocalAI, then fallback
+                        let endpoints = if prefer_remote_first {
+                            vec![
+                                (REMOTE_LOCALAI, "Tablet LocalAI (preferred for non-AI node)"),
+                                (LOCAL_OLLAMA, "Local Ollama (fallback)"),
+                            ]
+                        } else {
+                            vec![
+                                (LOCAL_OLLAMA, "Local Ollama (GPU-accel)"),
+                                (REMOTE_LOCALAI, "Tablet LocalAI (backup)"),
+                            ]
+                        };
+
+                        let mut found_endpoint = None;
+                        for (url, label) in endpoints {
+                            match thegrid_ai::probe_ollama_models(url) {
+                                Some(models) if !models.is_empty() => {
+                                    let best = thegrid_ai::pick_best_embed_model(&models)
+                                        .unwrap_or_else(|| "nomic-embed-text".to_string());
+                                    log::info!("[AI] {} → {} model(s), selecting '{}'", label, models.len(), best);
+                                    found_endpoint = Some((url.to_string(), best));
+                                    break;
+                                }
+                                _ => {
+                                    // Try next endpoint
+                                    log::debug!("[AI] {} not reachable, trying next...", label);
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Also try LocalAI via /v1/models endpoint
+                        if found_endpoint.is_none() {
+                            if let Some(models) = thegrid_ai::probe_localai_models(REMOTE_LOCALAI) {
+                                if !models.is_empty() {
+                                    let best = models.first().cloned().unwrap_or_else(|| "deepseek-coder-16b.gguf".to_string());
+                                    log::info!("[AI] Tablet LocalAI (OpenAI API) → {} model(s), selecting '{}'", models.len(), best);
+                                    found_endpoint = Some((REMOTE_LOCALAI.to_string(), best));
+                                }
+                            }
+                        }
+
+                        match found_endpoint {
+                            Some((url, model)) => (url, model),
+                            None => {
+                                log::warn!("[AI] No AI provider found. Start Ollama locally or ensure tablet LocalAI is reachable.");
+                                let _ = event_tx.send(AppEvent::SemanticFailed(
+                                    "No AI provider: start Ollama locally (http://127.0.0.1:11434) or check tablet LocalAI at 100.67.58.127:8080".to_string()
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Persist discovered config for subsequent runs.
+            if let Ok(mut cfg) = config.lock() {
+                if cfg.ai_provider_url.is_none() {
+                    cfg.ai_provider_url = Some(resolved_url.clone());
+                    cfg.ai_model = Some(resolved_model.clone());
+                    let _ = cfg.save();
+                }
+            }
+
+            log::info!("[AI] Initializing embedding provider: model={} url={}", resolved_model, resolved_url);
+            let provider_result = thegrid_ai::HttpEmbeddingProvider::new(resolved_model, resolved_url)
+                .map(|p| Arc::new(p) as Arc<dyn EmbeddingProvider>);
+
+            match provider_result {
+                Ok(p) => {
+                    match SemanticSearch::new(p) {
+                        Ok(mut search) => {
+                            // Warm up index from previously stored embeddings.
+                            if let Ok(guard) = db.lock() {
+                                if let Ok(all) = guard.get_all_embeddings() {
+                                    let n = all.len();
+                                    for (fid, vec) in all {
+                                        let _ = search.add_vector(fid, &vec);
+                                    }
+                                    log::info!("[AI] Loaded {} existing embeddings into vector index", n);
+                                }
+                            }
+                            let model_id = search.model_id().to_string();
+                            let count = search.vector_count();
+                            {
+                                let mut lock = semantic.lock().expect("semantic lock");
+                                *lock = Some(search);
+                            }
+                            log::info!("[AI] Semantic engine ready: model={} vectors={}", model_id, count);
+                            let _ = event_tx.send(AppEvent::SemanticReady);
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(AppEvent::SemanticFailed(format!("Vector engine: {}", e)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("[AI] Provider init failed: {}", e);
+                    let _ = event_tx.send(AppEvent::SemanticFailed(format!("Provider: {}", e)));
+                }
+            }
+        });
+    }
+
+    pub fn spawn_embedding_worker(&self) {
+        let db       = self.db.clone();
+        let event_tx = self.event_tx.clone();
+        let semantic = self.semantic_search.clone();
+        let remote_ai = self.remote_ai_nodes.clone();
+        let termux_agent = self.termux_agent.clone();
+        let (api_key, port, tablet_assist_enabled, tablet_cpu_max, tablet_gpu_max, max_parallel_requests) = {
+            let cfg = self.config.lock().unwrap();
+            (
+                cfg.api_key.clone(),
+                cfg.agent_port,
+                cfg.ai_tablet_assist,
+                cfg.ai_tablet_assist_cpu_max_pct,
+                cfg.ai_tablet_assist_gpu_max_pct,
+                cfg.embedding_parallel_requests.max(1),
+            )
+        };
+        
+        std::thread::spawn(move || {
+            let total = db.lock().ok().and_then(|g| g.count_unindexed_files().ok()).unwrap_or(0);
+            let mut indexed = 0;
+            let mut last_termux_heartbeat = std::time::Instant::now() - std::time::Duration::from_secs(60);
+            let mut last_tablet_probe = std::time::Instant::now() - std::time::Duration::from_secs(60);
+            let mut tablet_is_idle = false;
+
+            loop {
+                let local_engine = {
+                    let lock = semantic.lock().expect("semantic lock");
+                    lock.as_ref().map(|s| (s.provider(), s.model_id().to_string()))
+                };
+                let local_provider = local_engine.as_ref().map(|(p, _)| Arc::clone(p));
+                let local_model_id = local_engine
+                    .as_ref()
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_else(|| "remote".to_string());
+
+                // Lightweight heartbeat + auto-degradation: if current Termux endpoint fails,
+                // attempt to re-establish via OTG -> LAN -> Tailscale.
+                if last_termux_heartbeat.elapsed() >= std::time::Duration::from_secs(15) {
+                    let mut heartbeat_status: Option<(String, String)> = None;
+                    let mut termux_probe_target: Option<(String, u16)> = None;
+                    {
+                        let mut lock = termux_agent.lock().unwrap();
+                        if let Some(agent) = lock.as_mut() {
+                            let endpoint = agent.endpoint().to_string();
+                            if let Some((ip, p)) = AppRuntime::parse_agent_target(&endpoint, port) {
+                                termux_probe_target = Some((ip.clone(), p));
+                                let ok = AgentClient::new(&ip, p, api_key.clone())
+                                    .and_then(|c| c.ping())
+                                    .map(|r| r.authorized)
+                                    .unwrap_or(false);
+
+                                if !ok {
+                                    match agent.establish_best_connection() {
+                                        Ok(()) => {
+                                            heartbeat_status = Some((
+                                                "termux_recovered".to_string(),
+                                                format!("{}:{}", agent.connection_method(), agent.endpoint()),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            heartbeat_status = Some((
+                                                "termux_unreachable".to_string(),
+                                                e.to_string(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if tablet_assist_enabled
+                        && last_tablet_probe.elapsed() >= std::time::Duration::from_secs(20)
+                    {
+                        let new_idle = termux_probe_target
+                            .and_then(|(ip, p)| {
+                                AgentClient::new(&ip, p, api_key.clone())
+                                    .ok()
+                                    .and_then(|c| c.get_telemetry().ok())
+                            })
+                            .map(|t| {
+                                let ai_state = t.ai_status
+                                    .unwrap_or_else(|| "idle".to_string())
+                                    .to_ascii_lowercase();
+                                let ai_ok = ai_state.contains("idle") || ai_state.contains("ready");
+                                let cpu_ok = t.cpu_pct <= tablet_cpu_max;
+                                let gpu_ok = t.gpu_pct.unwrap_or(0.0) <= tablet_gpu_max;
+                                ai_ok && cpu_ok && gpu_ok
+                            })
+                            .unwrap_or(false);
+
+                        if new_idle != tablet_is_idle {
+                            let mode = if new_idle { "idle" } else { "busy" };
+                            let _ = event_tx.send(AppEvent::Status(format!(
+                                "tablet_assist:{}:cpu<={:.0}% gpu<={:.0}%",
+                                mode,
+                                tablet_cpu_max,
+                                tablet_gpu_max
+                            )));
+                        }
+                        tablet_is_idle = new_idle;
+                        last_tablet_probe = std::time::Instant::now();
+                    }
+
+                    if let Some((kind, payload)) = heartbeat_status {
+                        let _ = event_tx.send(AppEvent::Status(format!("{}:{}", kind, payload)));
+                    }
+                    last_termux_heartbeat = std::time::Instant::now();
+                }
+
+                let batch = match db.lock() {
+                    Ok(guard) => {
+                        let target_batch = (20usize).saturating_mul(max_parallel_requests).min(200);
+                        guard.get_files_needing_embedding(target_batch).unwrap_or_default()
+                    }
+                    Err(_) => break,
+                };
+                
+                if batch.is_empty() { 
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    continue;
+                }
+
+                let termux_target = {
+                    let lock = termux_agent.lock().unwrap();
+                    lock.as_ref().and_then(|a| AppRuntime::parse_agent_target(a.endpoint(), port))
+                };
+
+                let remote_node = {
+                    let nodes = remote_ai.lock().unwrap();
+                    nodes.values().next().cloned()
+                };
+
+                let work_items: Vec<(usize, i64, String)> = batch
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, (fid, text))| (idx, fid, text))
+                    .collect();
+
+                let worker_count = max_parallel_requests
+                    .max(1)
+                    .min(8)
+                    .min(work_items.len().max(1));
+                let chunk_size = ((work_items.len() + worker_count - 1) / worker_count).max(1);
+                let mut handles = Vec::new();
+
+                for chunk in work_items.chunks(chunk_size) {
+                    let items = chunk.to_vec();
+                    let key = api_key.clone();
+                    let lp = local_provider.clone();
+                    let model_id = local_model_id.clone();
+                    let tt = termux_target.clone();
+                    let rn = remote_node.clone();
+                    let use_tablet_assist = tablet_assist_enabled;
+                    let tablet_idle_now = tablet_is_idle;
+
+                    let handle = std::thread::spawn(move || {
+                        let mut out: Vec<(usize, i64, Vec<f32>, String)> = Vec::with_capacity(items.len());
+                        for (idx, fid, text) in items {
+                            let tablet_first = use_tablet_assist
+                                && tablet_idle_now
+                                && tt.is_some()
+                                && (lp.is_none() || idx % 2 == 1);
+
+                            let mut vector: Vec<f32> = Vec::new();
+                            let mut source = "remote".to_string();
+
+                            if tablet_first {
+                                if let Some((ip, p)) = &tt {
+                                    if let Ok(client) = AgentClient::new(ip, *p, key.clone()) {
+                                        if let Ok(v) = client.remote_embed(&text) {
+                                            vector = v;
+                                        }
+                                    }
+                                }
+                                if vector.is_empty() {
+                                    if let Some(provider) = &lp {
+                                        if let Ok(v) = provider.embed(&text) {
+                                            vector = v;
+                                            source = model_id.clone();
+                                        }
+                                    }
+                                }
+                            } else {
+                                if let Some(provider) = &lp {
+                                    if let Ok(v) = provider.embed(&text) {
+                                        vector = v;
+                                        source = model_id.clone();
+                                    }
+                                }
+                                if vector.is_empty() {
+                                    if let Some((ip, p)) = &tt {
+                                        if let Ok(client) = AgentClient::new(ip, *p, key.clone()) {
+                                            if let Ok(v) = client.remote_embed(&text) {
+                                                vector = v;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if vector.is_empty() {
+                                if let Some(ip) = &rn {
+                                    if let Ok(client) = AgentClient::new(ip, port, key.clone()) {
+                                        if let Ok(v) = client.remote_embed(&text) {
+                                            vector = v;
+                                        }
+                                    }
+                                }
+                            }
+
+                            out.push((idx, fid, vector, source));
+                        }
+                        out
+                    });
+                    handles.push(handle);
+                }
+
+                let mut merged: Vec<(usize, i64, Vec<f32>, String)> = Vec::new();
+                for handle in handles {
+                    if let Ok(mut rows) = handle.join() {
+                        merged.append(&mut rows);
+                    }
+                }
+                merged.sort_by_key(|(idx, _, _, _)| *idx);
+
+                for (_, fid, vector, source) in merged {
+                    if !vector.is_empty() {
+                        if let Ok(db_lock) = db.lock() {
+                            let _ = db_lock.save_embedding(fid, &source, &vector);
+                        }
+
+                        let mut lock = semantic.lock().expect("semantic lock");
+                        if let Some(search) = &mut *lock {
+                            let _ = search.add_vector(fid, &vector);
+                        }
+                    }
+
+                    indexed += 1;
+                    let _ = event_tx.send(AppEvent::EmbeddingProgress { indexed, total });
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    }
+
+    pub fn spawn_hashing_worker(&self) {
+        if self.hash_worker_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let db = Arc::clone(&self.db);
+        let config = Arc::clone(&self.config);
+        let event_tx = self.event_tx.clone();
+        let running = Arc::clone(&self.hash_worker_running);
+
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting background hashing worker...");
+            let batch_size = 50;
+            let mut hashed_count = 0;
+
+            loop {
+                // 1. Get files needing hashing
+                let batch = match db.lock() {
+                    Ok(guard) => match guard.get_files_needing_hash(batch_size) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!("[Runtime] Hashing error in DB: {}", e);
+                            break;
+                        }
+                    },
+                    Err(_) => break,
+                };
+
+                if batch.is_empty() {
+                    // Nothing to hash right now, wait and check again later (or exit if not needed anymore)
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    continue;
+                }
+
+                for (fid, path) in batch {
+                    if path.exists() && path.is_file() {
+                        match thegrid_core::hash_file(&path) {
+                            Ok(h) => {
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.update_file_hash(fid, &h);
+                                    if let Ok(cfg) = config.lock() {
+                                        if let Ok(meta) = path.metadata() {
+                                            let modified = meta.modified().ok()
+                                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                                .map(|d| d.as_secs() as i64);
+                                            apply_automation_rules_for_file(
+                                                &guard,
+                                                &cfg,
+                                                fid,
+                                                &path,
+                                                meta.len(),
+                                                modified,
+                                            );
+                                        }
+                                    }
+                                    hashed_count += 1;
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[Runtime] Failed to hash {:?}: {}", path, e);
+                                // Mark as failed in DB so we don't retry forever
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.update_file_hash(fid, &format!("ERR_{}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        // File gone, remove from DB or mark as missing
+                        if let Ok(guard) = db.lock() {
+                            let _ = guard.delete_file_by_id(fid);
+                        }
+                    }
+                    
+                    if hashed_count % 10 == 0 {
+                        let _ = event_tx.send(AppEvent::Status(format!("Hashed {} files", hashed_count)));
+                    }
+                }
+                
+                // Yield to other threads
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    pub fn spawn_media_analyzer_worker(&self) {
+        let db = Arc::clone(&self.db);
+        let event_tx = self.event_tx.clone();
+        let analyzer = Arc::clone(&self.media_analyzer);
+
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting background media analyzer worker...");
+            let batch_size = 10;
+            let mut analyzed_count = 0;
+
+            loop {
+                let az = {
+                    let lock = analyzer.lock().unwrap();
+                    lock.clone()
+                };
+
+                if az.is_none() {
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                    continue;
+                }
+                let az = az.unwrap();
+
+                let batch = match db.lock() {
+                    Ok(guard) => match guard.get_files_needing_media_ai(batch_size) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::error!("[Runtime] Media AI error in DB: {}", e);
+                            break;
+                        }
+                    },
+                    Err(_) => break,
+                };
+
+                if batch.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    continue;
+                }
+
+                for (fid, path) in batch {
+                    if path.exists() && path.is_file() {
+                        match az.analyze(&path) {
+                            Ok(meta) => {
+                                if let Ok(json) = serde_json::to_string(&meta) {
+                                    if let Ok(guard) = db.lock() {
+                                        let _ = guard.update_ai_metadata(fid, &json);
+                                        analyzed_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("[Runtime] Failed to analyze media {:?}: {}", path, e);
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.update_ai_metadata(fid, &format!("{{\"error\":\"{}\"}}", e));
+                                }
+                            }
+                        }
+                    } else {
+                        if let Ok(guard) = db.lock() {
+                            let _ = guard.delete_file_by_id(fid);
+                        }
+                    }
+
+                    if analyzed_count % 5 == 0 {
+                        let _ = event_tx.send(AppEvent::Status(format!("Analyzed {} media files with GPU", analyzed_count)));
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+    }
+
+    pub fn spawn_search(&self, query: String, device_filter: Option<String>, semantic_enabled: bool) {
+        let db       = Arc::clone(&self.db);
+        let tx       = self.event_tx.clone();
+        let semantic_search  = self.semantic_search.clone();
+        let remote_ai = self.remote_ai_nodes.clone();
+        let (api_key, port) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.api_key.clone(), cfg.agent_port)
+        };
+
+        std::thread::spawn(move || {
+            let mut results = vec![];
+            
+            if semantic_enabled {
+                let has_local = {
+                    let lock = semantic_search.lock().unwrap();
+                    lock.is_some()
+                };
+
+                if has_local {
+                    if let Ok(mut lock) = semantic_search.lock() {
+                        if let Some(engine) = &mut *lock {
+                            if let Ok(hits) = engine.search(&query, 50) {
+                                let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+                                results = db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default();
+                            }
+                        }
+                    }
+                } else {
+                    // Try remote AI delegation
+                    let remote_node = {
+                        let nodes = remote_ai.lock().unwrap();
+                        nodes.values().next().cloned()
+                    };
+
+                    if let Some(ip) = remote_node {
+                        if let Ok(client) = AgentClient::new(&ip, port, api_key) {
+                            if let Ok(hits) = client.remote_search(&query, 50) {
+                                let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+                                results = db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default();
+                            }
+                        }
+                    }
+                }
+            } else {
+                results = db.lock().ok().and_then(|guard| {
+                    guard.search_fts(&query, 50, device_filter.as_deref()).ok()
+                }).unwrap_or_default();
+            }
+
+            let _ = tx.send(AppEvent::SearchResults(results));
+        });
+    }
+
+    pub fn spawn_get_telemetry(&self, ip: String, device_id: String) {
+        let (port, api_key) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.agent_port, cfg.api_key.clone())
+        };
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.get_telemetry()) {
+                Ok(telemetry) => {
+                    let _ = tx.send(AppEvent::TelemetryUpdate { 
+                        device_id, 
+                        ip: Some(ip), 
+                        telemetry 
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Status(format!("Telemetry failed ({}): {}", device_id, e)));
+                }
+            }
+        });
+    }
+
+    pub fn spawn_wol(&self, device_name: String, mac_addr: String) {
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let _ = WolSentry::send_multi(&mac_addr, &["255.255.255.255", "100.64.0.255"]);
+            let _ = tx.send(AppEvent::WolSent { device_name, target_mac: mac_addr });
+        });
+    }
+
+    pub fn spawn_load_timeline(&self, device_filter: Option<String>) {
+        let db   = Arc::clone(&self.db);
+        let tx   = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let result = db.lock().map(|guard| {
+                guard.get_recent_files(200, device_filter.as_deref())
+            });
+            match result {
+                Ok(Ok(entries)) => { let _ = tx.send(AppEvent::TemporalLoaded(entries)); }
+                _ => {}
+            }
+        });
+    }
+
+    pub fn handle_remote_ai_embed(&self, text: String, response_tx: mpsc::Sender<Vec<f32>>) {
+        let semantic = self.semantic_search.clone();
+        let config = self.config.clone();
+        std::thread::spawn(move || {
+            {
+                let lock = semantic.lock().unwrap();
+                if let Some(engine) = &*lock {
+                    if let Ok(v) = engine.embed(&text) {
+                        let _ = response_tx.send(v);
+                        return;
+                    }
+                }
+            }
+
+            // Fallback for nodes that changed provider at runtime or are still initializing.
+            let (provider_url, model_name) = {
+                let cfg = config.lock().unwrap();
+                (
+                    cfg.ai_provider_url.clone().unwrap_or_else(|| "http://100.67.58.127:8080".to_string()),
+                    cfg.ai_model.clone().unwrap_or_else(|| "nomic-embed-text".to_string()),
+                )
+            };
+
+            if let Ok(provider) = thegrid_ai::HttpEmbeddingProvider::new(model_name, provider_url) {
+                if let Ok(v) = provider.embed(&text) {
+                    let _ = response_tx.send(v);
+                }
+            }
+        });
+    }
+
+    pub fn handle_remote_ai_search(&self, query: String, k: usize, response_tx: mpsc::Sender<Vec<(i64, f32)>>) {
+        let semantic = self.semantic_search.clone();
+        std::thread::spawn(move || {
+            let lock = semantic.lock().unwrap();
+            if let Some(engine) = &*lock {
+                if let Ok(hits) = engine.search(&query, k) {
+                    let _ = response_tx.send(hits);
+                }
+            }
+        });
+    }
+}
