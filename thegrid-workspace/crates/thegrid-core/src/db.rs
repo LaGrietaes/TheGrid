@@ -687,8 +687,23 @@ impl Database {
     }
 
     pub fn get_next_index_task(&self) -> Result<Option<(String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT root_path, dir_path FROM index_queue LIMIT 1")?;
-        let mut rows = stmt.query([])?;
+        self.get_next_index_task_for_root(None)
+    }
+
+    pub fn get_next_index_task_for_root(&self, root: Option<&str>) -> Result<Option<(String, String)>> {
+        let (sql, use_param) = if root.is_some() {
+            ("SELECT root_path, dir_path FROM index_queue WHERE root_path = ?1 LIMIT 1", true)
+        } else {
+            ("SELECT root_path, dir_path FROM index_queue LIMIT 1", false)
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = if use_param {
+            stmt.query(params![root.unwrap_or_default()])?
+        } else {
+            stmt.query([])?
+        };
+
         if let Some(row) = rows.next()? {
             Ok(Some((row.get(0)?, row.get(1)?)))
         } else {

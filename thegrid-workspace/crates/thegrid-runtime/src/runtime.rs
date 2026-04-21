@@ -422,7 +422,8 @@ impl AppRuntime {
                 tx, 
                 device_id, 
                 device_name, 
-                total_count
+                total_count,
+                Some(path.to_string_lossy().to_string())
             );
         });
     }
@@ -436,6 +437,7 @@ impl AppRuntime {
         device_id:    String,
         device_name:  String,
         total_hint:   u64,
+        root_filter:  Option<String>,
     ) {
         let start = std::time::Instant::now();
         let mut scanned_count = 0u64;
@@ -443,70 +445,79 @@ impl AppRuntime {
         loop {
             let task = {
                 let guard = db.lock().unwrap();
-                guard.get_next_index_task().unwrap_or(None)
+                guard
+                    .get_next_index_task_for_root(root_filter.as_deref())
+                    .unwrap_or(None)
             };
 
             if let Some((root, dir_str)) = task {
                 let dir_path = PathBuf::from(&dir_str);
                 log::info!("[Runtime] Persistent scan: {:?}", dir_path);
 
-                let mut dir_count = 0;
+                // Parse file-system entries outside DB lock to reduce contention
+                let entries = match std::fs::read_dir(&dir_path) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        if let Ok(guard) = db.lock() {
+                            let _ = guard.complete_index_task(&root, &dir_str);
+                        }
+                        continue;
+                    }
+                };
+
+                let cfg_snapshot = config.lock().ok().map(|c| c.clone());
+                let mut subdirs: Vec<PathBuf> = Vec::new();
+                let mut files_to_index: Vec<(PathBuf, u64, Option<i64>, Option<String>)> = Vec::new();
+
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let path = entry.path();
+                    let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
+
+                    if meta.is_dir() {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        if should_skip_dir(&name) {
+                            continue;
+                        }
+                        subdirs.push(path);
+                    } else if meta.is_file() {
+                        let size = meta.len();
+                        let modified = meta.modified().ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64);
+                        let quick_hash = thegrid_core::quick_hash_file(&path).ok();
+                        files_to_index.push((path, size, modified, quick_hash));
+                    }
+                }
+
+                let mut dir_count = 0u64;
                 match db.lock() {
                     Ok(guard) => {
-                        // Scan dir and get subdirs
-                        let entries = match std::fs::read_dir(&dir_path) {
-                            Ok(e) => e,
-                            Err(_) => {
-                                // Mark as complete even if failed to avoid infinite loop
-                                let _ = guard.complete_index_task(&root, &dir_str);
-                                continue;
-                            }
-                        };
-
-                        let mut subdirs = vec![];
-                        for entry in entries.filter_map(|e| e.ok()) {
-                            let path = entry.path();
-                            let meta = match entry.metadata() { Ok(m) => m, Err(_) => continue };
-                            
-                            if meta.is_dir() {
-                                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                                if should_skip_dir(&name) {
-                                    continue;
+                        for (path, size, modified, quick_hash) in &files_to_index {
+                            if let Ok(fid) = guard.index_file_with_source(
+                                &device_id,
+                                &device_name,
+                                path,
+                                *size,
+                                *modified,
+                                quick_hash.as_deref(),
+                                None,
+                                thegrid_core::DetectionSource::FullScan,
+                                chrono::Utc::now().timestamp(),
+                            ) {
+                                if let Some(cfg) = cfg_snapshot.as_ref() {
+                                    apply_automation_rules_for_file(
+                                        &guard,
+                                        cfg,
+                                        fid,
+                                        path,
+                                        *size,
+                                        *modified,
+                                    );
                                 }
-                                subdirs.push(path);
-                            } else if meta.is_file() {
-                                let size = meta.len();
-                                let modified = meta.modified().ok()
-                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                    .map(|d| d.as_secs() as i64);
-                                let fingerprint = fingerprint_file(&path).ok();
-                                if let Ok(fid) = guard.index_file_with_source(
-                                    &device_id,
-                                    &device_name,
-                                    &path,
-                                    size,
-                                    modified,
-                                    fingerprint.as_ref().and_then(|f| f.quick_hash.as_deref()),
-                                    None,
-                                    thegrid_core::DetectionSource::FullScan,
-                                    chrono::Utc::now().timestamp(),
-                                ) {
-                                    if let Ok(cfg) = config.lock() {
-                                        apply_automation_rules_for_file(
-                                            &guard,
-                                            &cfg,
-                                            fid,
-                                            &path,
-                                            size,
-                                            modified,
-                                        );
-                                    }
-                                    dir_count += 1;
-                                }
+                                dir_count += 1;
                             }
                         }
 
-                        // Enqueue subdirs
                         for s in subdirs {
                             let _ = guard.conn.execute(
                                 "INSERT OR IGNORE INTO index_queue (root_path, dir_path) VALUES (?, ?)",
@@ -514,13 +525,17 @@ impl AppRuntime {
                             );
                         }
 
-                        // Complete task
                         let _ = guard.complete_index_task(&root, &dir_str);
                         scanned_count += dir_count;
 
-                        // UI progress update
+                        let progress_scanned = if total_hint > 0 {
+                            scanned_count.min(total_hint)
+                        } else {
+                            scanned_count
+                        };
+
                         let _ = tx.send(AppEvent::IndexProgress {
-                            scanned: scanned_count,
+                            scanned: progress_scanned,
                             total:   total_hint,
                             current: dir_path.file_name().unwrap_or_default().to_string_lossy().into(),
                             ext:     None,
@@ -558,7 +573,8 @@ impl AppRuntime {
                 tx, 
                 device_id, 
                 device_name, 
-                0
+                0,
+                None
             );
         });
     }
