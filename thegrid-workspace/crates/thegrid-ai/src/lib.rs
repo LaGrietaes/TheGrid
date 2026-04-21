@@ -338,6 +338,10 @@ impl SemanticSearch {
     pub fn model_id(&self) -> &str {
         self.provider.model_id()
     }
+
+    pub fn provider(&self) -> Arc<dyn EmbeddingProvider> {
+        Arc::clone(&self.provider)
+    }
     /// Embed `text`, store the vector in the index, and return the raw vector.
     pub fn index_file(&mut self, file_id: i64, text: &str) -> Result<Vec<f32>> {
         let vector = self.provider.embed(text)?;
