@@ -559,8 +559,12 @@ fn spawn_command_reader(cmd_tx: mpsc::Sender<String>, running: Arc<AtomicBool>) 
         let stdin = io::stdin();
         while running.load(Ordering::Relaxed) {
             let mut line = String::new();
-            if stdin.read_line(&mut line).is_err() {
-                continue;
+            let read = match stdin.read_line(&mut line) {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
             }
             let cmd = line.trim().to_string();
             if cmd.is_empty() {
@@ -764,9 +768,7 @@ fn main() -> Result<()> {
 
     let running = Arc::new(AtomicBool::new(true));
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
-    if tui_mode {
-        spawn_command_reader(cmd_tx, Arc::clone(&running));
-    }
+    spawn_command_reader(cmd_tx, Arc::clone(&running));
     let mut last_render = Instant::now();
 
     if tui_mode {

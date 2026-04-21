@@ -82,3 +82,136 @@ pub fn match_rules(path: &Path, rules: &[crate::models::UserRule], file_id: i64)
     }
     matches
 }
+
+// ── Directory Scanning & Indexing ─────────────────────────────────────────
+use std::path::PathBuf;
+use std::sync::mpsc;
+use crate::events::AppEvent;
+use crate::db::Database;
+
+/// A file entry discovered during directory scanning.
+#[derive(Debug, Clone)]
+pub struct ScannedFile {
+    pub path: PathBuf,
+    pub fingerprint: FileFingerprint,
+}
+
+/// Recursively scan a directory and collect file information.
+/// Skips common build/cache/vcs directories and hidden files.
+fn scan_directory_recursive(
+    root: &Path,
+    current: &Path,
+    collected: &mut Vec<ScannedFile>,
+    scanned_count: &mut u64,
+) -> Result<()> {
+    // Read directory entries
+    let entries = match std::fs::read_dir(current) {
+        Ok(e) => e,
+        Err(_) => return Ok(()), // Skip inaccessible directories
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+
+        // Skip common build/cache directories and hidden files
+        if crate::db::should_skip_dir(&name_str) {
+            continue;
+        }
+
+        if path.is_dir() {
+            // Recurse into subdirectories
+            let _ = scan_directory_recursive(root, &path, collected, scanned_count);
+        } else if path.is_file() {
+            // Fingerprint the file
+            if let Ok(fingerprint) = fingerprint_file(&path) {
+                collected.push(ScannedFile { path, fingerprint });
+                *scanned_count += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Scan a directory and batch-insert files into the database.
+/// Emits IndexProgress events for UI feedback and IndexComplete when done.
+pub fn scan_and_index_directory(
+    root: &Path,
+    device_id: &str,
+    device_name: &str,
+    db: &Database,
+    event_tx: &mpsc::Sender<AppEvent>,
+) -> Result<()> {
+    let start_time = std::time::Instant::now();
+    log::info!("[SCAN] Starting index of {:?}", root);
+
+    let mut collected = Vec::new();
+    let mut scanned_count = 0u64;
+
+    // Phase 1: Recursively collect all files
+    scan_directory_recursive(root, root, &mut collected, &mut scanned_count)?;
+
+    let total_files = collected.len() as u64;
+    log::info!("[SCAN] Found {} files in {:?}", total_files, root);
+
+    // Phase 2: Batch insert into database with progress reporting
+    let batch_size = 500usize;
+    let mut inserted = 0u64;
+
+    for (idx, batch) in collected.chunks(batch_size).enumerate() {
+        let mut batch_current = String::new();
+        let mut batch_ext = None;
+        
+        // Insert this batch
+        for scanned_file in batch {
+            if let Err(e) = db.index_file_with_source(
+                device_id,
+                device_name,
+                &scanned_file.path,
+                scanned_file.fingerprint.size,
+                scanned_file.fingerprint.modified,
+                scanned_file.fingerprint.quick_hash.as_deref(),
+                None, // full hash will be computed separately in background
+                crate::models::DetectionSource::FullScan,
+                crate::db::unix_now(),
+            ) {
+                log::warn!("Failed to index {:?}: {}", scanned_file.path, e);
+                continue;
+            }
+            inserted += 1;
+            batch_current = scanned_file.path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            batch_ext = scanned_file.path.extension()
+                .map(|e| e.to_string_lossy().to_string());
+        }
+
+        // Emit progress every batch
+        let percent = ((inserted as f32 / total_files as f32) * 100.0).min(99.9);
+        
+        let _ = event_tx.send(AppEvent::IndexProgress {
+            scanned: scanned_count,
+            total: total_files,
+            current: batch_current,
+            ext: batch_ext,
+        });
+
+        if idx % 2 == 0 {
+            log::debug!("[SCAN] Progress: {}/{} ({}%)", inserted, total_files, percent as u32);
+        }
+    }
+
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+    log::info!("[SCAN] Complete: {} files indexed in {}ms", inserted, duration_ms);
+
+    // Emit final completion event
+    let _ = event_tx.send(AppEvent::IndexComplete {
+        device_id: device_id.to_string(),
+        files_added: inserted,
+        duration_ms,
+    });
+
+    Ok(())
+}

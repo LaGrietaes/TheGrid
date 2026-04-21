@@ -8,7 +8,7 @@ use rusqlite::params;
 
 use thegrid_core::{
     fingerprint_file, match_rules, should_skip_dir, AppEvent, Config, Database,
-    FileChange, FileWatcher,
+    DetectionSourceDistribution, FileChange, FileWatcher, SyncHealthMetrics,
 };
 use thegrid_net::{AgentClient, AgentServer, TailscaleClient, WolSentry};
 use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
@@ -30,6 +30,7 @@ pub struct AppRuntime {
     pub media_analyzer: Arc<Mutex<Option<Arc<dyn thegrid_ai::MediaAnalyzer>>>>,
     pub agent_shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub hash_worker_running: Arc<AtomicBool>,
+    pub sync_health: Arc<Mutex<std::collections::HashMap<String, SyncHealthMetrics>>>,
 }
 
 impl AppRuntime {
@@ -78,6 +79,7 @@ impl AppRuntime {
             media_analyzer: Arc::new(Mutex::new(None)),
             agent_shutdown: Arc::new(Mutex::new(None)),
             hash_worker_running: Arc::new(AtomicBool::new(false)),
+            sync_health: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
 
         Ok(runtime)
@@ -479,6 +481,7 @@ impl AppRuntime {
     pub fn spawn_sync_node(&self, device_id: String, ip: String, hostname: String) {
         let db          = self.db.clone();
         let event_tx    = self.event_tx.clone();
+        let sync_health = self.sync_health.clone();
         let (api_key, port) = {
             let cfg = self.config.lock().unwrap();
             (cfg.api_key.clone(), cfg.agent_port)
@@ -493,6 +496,15 @@ impl AppRuntime {
             let client = match AgentClient::new(&ip, port, api_key) {
                 Ok(c) => c,
                 Err(e) => {
+                    let now = chrono::Utc::now().timestamp();
+                    if let Ok(mut guard) = sync_health.lock() {
+                        let metrics = guard.entry(device_id.clone()).or_default();
+                        metrics.mark_sync_failure(now);
+                        let _ = event_tx.send(AppEvent::SyncHealthUpdated {
+                            device_id: device_id.clone(),
+                            metrics: metrics.clone(),
+                        });
+                    }
                     let _ = event_tx.send(AppEvent::SyncFailed { device_id, error: e.to_string() });
                     return;
                 }
@@ -501,6 +513,15 @@ impl AppRuntime {
             let delta = match client.sync_index(last_ts) {
                 Ok(r) => r,
                 Err(e) => {
+                    let now = chrono::Utc::now().timestamp();
+                    if let Ok(mut guard) = sync_health.lock() {
+                        let metrics = guard.entry(device_id.clone()).or_default();
+                        metrics.mark_sync_failure(now);
+                        let _ = event_tx.send(AppEvent::SyncHealthUpdated {
+                            device_id: device_id.clone(),
+                            metrics: metrics.clone(),
+                        });
+                    }
                     let _ = event_tx.send(AppEvent::SyncFailed { device_id, error: e.to_string() });
                     return;
                 }
@@ -508,11 +529,15 @@ impl AppRuntime {
 
             let mut count = 0;
             let mut max_ts = last_ts;
+            let now = chrono::Utc::now().timestamp();
+            let tombstone_count = delta.tombstones.len() as u64;
+            let mut detection_sources = DetectionSourceDistribution::default();
             if let Ok(guard) = db.lock() {
                 for r in delta.files {
                     let mod_ts = r.modified.unwrap_or(0);
                     if r.indexed_at > max_ts { max_ts = r.indexed_at; }
                     if mod_ts > max_ts { max_ts = mod_ts; }
+                    detection_sources.increment(r.detected_by);
                     if guard.upsert_remote_file(r).is_ok() {
                         count += 1;
                     }
@@ -521,10 +546,21 @@ impl AppRuntime {
                     if tombstone.deleted_at > max_ts {
                         max_ts = tombstone.deleted_at;
                     }
+                    detection_sources.increment(tombstone.detected_by);
                     let _ = guard.apply_remote_tombstone(&tombstone);
                 }
                 let _ = guard.update_node_sync_ts(&device_id, &hostname, max_ts);
             }
+
+            if let Ok(mut guard) = sync_health.lock() {
+                let metrics = guard.entry(device_id.clone()).or_default();
+                metrics.mark_sync_success(now, tombstone_count, detection_sources);
+                let _ = event_tx.send(AppEvent::SyncHealthUpdated {
+                    device_id: device_id.clone(),
+                    metrics: metrics.clone(),
+                });
+            }
+
             if count > 0 {
                 let _ = event_tx.send(AppEvent::SyncComplete { device_id, files_added: count });
             }

@@ -140,6 +140,12 @@ pub enum AppEvent {
         error:     String,
     },
 
+    /// Sync observability snapshot for operator-facing health views.
+    SyncHealthUpdated {
+        device_id: String,
+        metrics:   SyncHealthMetrics,
+    },
+
     /// Semantic search engine is initialized.
     SemanticReady,
 

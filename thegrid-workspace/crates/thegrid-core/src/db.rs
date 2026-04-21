@@ -1247,7 +1247,7 @@ struct StoredFileRow {
     quick_hash: Option<String>,
 }
 
-fn unix_now() -> i64 {
+pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
