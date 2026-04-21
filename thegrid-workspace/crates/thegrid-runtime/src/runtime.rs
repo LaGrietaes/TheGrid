@@ -214,10 +214,9 @@ impl AppRuntime {
                 Ok(analyzer) => {
                     let mut lock = self.media_analyzer.lock().unwrap();
                     *lock = Some(Arc::new(analyzer));
-                    let _ = self.event_tx.send(AppEvent::Status(
-                        "AI media analyzer initialized on GPU (stub mode: low GPU usage is expected)".into(),
-                    ));
-                    self.spawn_media_analyzer_worker();
+                    // Keep analyzer initialized for future real kernels, but do not run
+                    // background media analysis while implementation is still a stub.
+                    log::info!("[Runtime] Media analyzer initialized but worker is disabled in STUB mode");
                 }
                 Err(e) => {
                     log::warn!("[Runtime] GPU media analyzer unavailable: {}", e);
@@ -401,18 +400,7 @@ impl AppRuntime {
             }
 
             log::info!("[Runtime] Starting full index task for {:?}", path);
-            let _ = tx.send(AppEvent::Status(format!("Calculating total files for {}...", path.display())));
-
-            // Pass 1: Quick count over the entire tree
-            let total_count = jwalk::WalkDir::new(&path)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| !should_skip_path(&e.path()))
-                .filter(|e| e.file_type().is_file())
-                .count() as u64;
-
-            log::info!("[Runtime] Total files to index in {:?}: {}", path, total_count);
-            let _ = tx.send(AppEvent::Status(format!("Indexing {} files...", total_count)));
+            let _ = tx.send(AppEvent::Status(format!("Indexing {}...", path.display())));
 
             // Enqueue the root in the persistent queue
             {
@@ -428,14 +416,13 @@ impl AppRuntime {
             }
 
             // Immediately start processing the queue in this thread
-            // We pass the total_count as a hint for the progress bar
             Self::do_process_index_queue(
                 db, 
                 config,
                 tx, 
                 device_id, 
                 device_name, 
-                total_count,
+                0,
                 Some(path.to_string_lossy().to_string())
             );
         });
@@ -451,7 +438,6 @@ impl AppRuntime {
                 return;
             }
 
-            let mut total_count = 0u64;
             let mut accepted_roots = 0u64;
 
             for mut root in paths {
@@ -463,22 +449,11 @@ impl AppRuntime {
                     continue;
                 }
 
-                let _ = tx.send(AppEvent::Status(format!("Calculating total files for {}...", root.display())));
-
-                let root_total = jwalk::WalkDir::new(&root)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| !should_skip_path(&e.path()))
-                    .filter(|e| e.file_type().is_file())
-                    .count() as u64;
-
                 if let Ok(guard) = db.lock() {
                     if guard.enqueue_index_root(&root).is_ok() {
                         accepted_roots += 1;
                     }
                 }
-
-                total_count = total_count.saturating_add(root_total);
             }
 
             if accepted_roots == 0 {
@@ -487,8 +462,7 @@ impl AppRuntime {
             }
 
             let _ = tx.send(AppEvent::Status(format!(
-                "Indexing {} files across {} root(s)...",
-                total_count,
+                "Indexing across {} root(s)...",
                 accepted_roots
             )));
 
@@ -498,7 +472,7 @@ impl AppRuntime {
                 tx,
                 device_id,
                 device_name,
-                total_count,
+                0,
                 None,
             );
         });
