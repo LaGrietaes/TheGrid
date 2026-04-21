@@ -1025,31 +1025,47 @@ impl AppRuntime {
         let semantic = self.semantic_search.clone();
         let remote_ai = self.remote_ai_nodes.clone();
         let termux_agent = self.termux_agent.clone();
-        let (api_key, port) = {
+        let (api_key, port, tablet_assist_enabled, tablet_cpu_max, tablet_gpu_max, max_parallel_requests) = {
             let cfg = self.config.lock().unwrap();
-            (cfg.api_key.clone(), cfg.agent_port)
+            (
+                cfg.api_key.clone(),
+                cfg.agent_port,
+                cfg.ai_tablet_assist,
+                cfg.ai_tablet_assist_cpu_max_pct,
+                cfg.ai_tablet_assist_gpu_max_pct,
+                cfg.embedding_parallel_requests.max(1),
+            )
         };
         
         std::thread::spawn(move || {
             let total = db.lock().ok().and_then(|g| g.count_unindexed_files().ok()).unwrap_or(0);
             let mut indexed = 0;
             let mut last_termux_heartbeat = std::time::Instant::now() - std::time::Duration::from_secs(60);
+            let mut last_tablet_probe = std::time::Instant::now() - std::time::Duration::from_secs(60);
+            let mut tablet_is_idle = false;
 
             loop {
-                let has_local_engine = {
+                let local_engine = {
                     let lock = semantic.lock().expect("semantic lock");
-                    lock.is_some()
+                    lock.as_ref().map(|s| (s.provider(), s.model_id().to_string()))
                 };
+                let local_provider = local_engine.as_ref().map(|(p, _)| Arc::clone(p));
+                let local_model_id = local_engine
+                    .as_ref()
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_else(|| "remote".to_string());
 
                 // Lightweight heartbeat + auto-degradation: if current Termux endpoint fails,
                 // attempt to re-establish via OTG -> LAN -> Tailscale.
                 if last_termux_heartbeat.elapsed() >= std::time::Duration::from_secs(15) {
                     let mut heartbeat_status: Option<(String, String)> = None;
+                    let mut termux_probe_target: Option<(String, u16)> = None;
                     {
                         let mut lock = termux_agent.lock().unwrap();
                         if let Some(agent) = lock.as_mut() {
                             let endpoint = agent.endpoint().to_string();
                             if let Some((ip, p)) = AppRuntime::parse_agent_target(&endpoint, port) {
+                                termux_probe_target = Some((ip.clone(), p));
                                 let ok = AgentClient::new(&ip, p, api_key.clone())
                                     .and_then(|c| c.ping())
                                     .map(|r| r.authorized)
@@ -1075,6 +1091,39 @@ impl AppRuntime {
                         }
                     }
 
+                    if tablet_assist_enabled
+                        && last_tablet_probe.elapsed() >= std::time::Duration::from_secs(20)
+                    {
+                        let new_idle = termux_probe_target
+                            .and_then(|(ip, p)| {
+                                AgentClient::new(&ip, p, api_key.clone())
+                                    .ok()
+                                    .and_then(|c| c.get_telemetry().ok())
+                            })
+                            .map(|t| {
+                                let ai_state = t.ai_status
+                                    .unwrap_or_else(|| "idle".to_string())
+                                    .to_ascii_lowercase();
+                                let ai_ok = ai_state.contains("idle") || ai_state.contains("ready");
+                                let cpu_ok = t.cpu_pct <= tablet_cpu_max;
+                                let gpu_ok = t.gpu_pct.unwrap_or(0.0) <= tablet_gpu_max;
+                                ai_ok && cpu_ok && gpu_ok
+                            })
+                            .unwrap_or(false);
+
+                        if new_idle != tablet_is_idle {
+                            let mode = if new_idle { "idle" } else { "busy" };
+                            let _ = event_tx.send(AppEvent::Status(format!(
+                                "tablet_assist:{}:cpu<={:.0}% gpu<={:.0}%",
+                                mode,
+                                tablet_cpu_max,
+                                tablet_gpu_max
+                            )));
+                        }
+                        tablet_is_idle = new_idle;
+                        last_tablet_probe = std::time::Instant::now();
+                    }
+
                     if let Some((kind, payload)) = heartbeat_status {
                         let _ = event_tx.send(AppEvent::Status(format!("{}:{}", kind, payload)));
                     }
@@ -1082,7 +1131,10 @@ impl AppRuntime {
                 }
 
                 let batch = match db.lock() {
-                    Ok(guard) => guard.get_files_needing_embedding(20).unwrap_or_default(),
+                    Ok(guard) => {
+                        let target_batch = (20usize).saturating_mul(max_parallel_requests).min(200);
+                        guard.get_files_needing_embedding(target_batch).unwrap_or_default()
+                    }
                     Err(_) => break,
                 };
                 
@@ -1090,69 +1142,126 @@ impl AppRuntime {
                     std::thread::sleep(std::time::Duration::from_secs(10));
                     continue;
                 }
-                
-                for (fid, text) in batch {
-                    let mut success = false;
-                    let mut vector = vec![];
 
-                    if has_local_engine {
+                let termux_target = {
+                    let lock = termux_agent.lock().unwrap();
+                    lock.as_ref().and_then(|a| AppRuntime::parse_agent_target(a.endpoint(), port))
+                };
+
+                let remote_node = {
+                    let nodes = remote_ai.lock().unwrap();
+                    nodes.values().next().cloned()
+                };
+
+                let work_items: Vec<(usize, i64, String)> = batch
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, (fid, text))| (idx, fid, text))
+                    .collect();
+
+                let worker_count = max_parallel_requests
+                    .max(1)
+                    .min(8)
+                    .min(work_items.len().max(1));
+                let chunk_size = ((work_items.len() + worker_count - 1) / worker_count).max(1);
+                let mut handles = Vec::new();
+
+                for chunk in work_items.chunks(chunk_size) {
+                    let items = chunk.to_vec();
+                    let key = api_key.clone();
+                    let lp = local_provider.clone();
+                    let model_id = local_model_id.clone();
+                    let tt = termux_target.clone();
+                    let rn = remote_node.clone();
+                    let use_tablet_assist = tablet_assist_enabled;
+                    let tablet_idle_now = tablet_is_idle;
+
+                    let handle = std::thread::spawn(move || {
+                        let mut out: Vec<(usize, i64, Vec<f32>, String)> = Vec::with_capacity(items.len());
+                        for (idx, fid, text) in items {
+                            let tablet_first = use_tablet_assist
+                                && tablet_idle_now
+                                && tt.is_some()
+                                && (lp.is_none() || idx % 2 == 1);
+
+                            let mut vector: Vec<f32> = Vec::new();
+                            let mut source = "remote".to_string();
+
+                            if tablet_first {
+                                if let Some((ip, p)) = &tt {
+                                    if let Ok(client) = AgentClient::new(ip, *p, key.clone()) {
+                                        if let Ok(v) = client.remote_embed(&text) {
+                                            vector = v;
+                                        }
+                                    }
+                                }
+                                if vector.is_empty() {
+                                    if let Some(provider) = &lp {
+                                        if let Ok(v) = provider.embed(&text) {
+                                            vector = v;
+                                            source = model_id.clone();
+                                        }
+                                    }
+                                }
+                            } else {
+                                if let Some(provider) = &lp {
+                                    if let Ok(v) = provider.embed(&text) {
+                                        vector = v;
+                                        source = model_id.clone();
+                                    }
+                                }
+                                if vector.is_empty() {
+                                    if let Some((ip, p)) = &tt {
+                                        if let Ok(client) = AgentClient::new(ip, *p, key.clone()) {
+                                            if let Ok(v) = client.remote_embed(&text) {
+                                                vector = v;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if vector.is_empty() {
+                                if let Some(ip) = &rn {
+                                    if let Ok(client) = AgentClient::new(ip, port, key.clone()) {
+                                        if let Ok(v) = client.remote_embed(&text) {
+                                            vector = v;
+                                        }
+                                    }
+                                }
+                            }
+
+                            out.push((idx, fid, vector, source));
+                        }
+                        out
+                    });
+                    handles.push(handle);
+                }
+
+                let mut merged: Vec<(usize, i64, Vec<f32>, String)> = Vec::new();
+                for handle in handles {
+                    if let Ok(mut rows) = handle.join() {
+                        merged.append(&mut rows);
+                    }
+                }
+                merged.sort_by_key(|(idx, _, _, _)| *idx);
+
+                for (_, fid, vector, source) in merged {
+                    if !vector.is_empty() {
+                        if let Ok(db_lock) = db.lock() {
+                            let _ = db_lock.save_embedding(fid, &source, &vector);
+                        }
+
                         let mut lock = semantic.lock().expect("semantic lock");
                         if let Some(search) = &mut *lock {
-                            if let Ok(v) = search.index_file(fid, &text) {
-                                vector = v;
-                                success = true;
-                            }
+                            let _ = search.add_vector(fid, &vector);
                         }
                     }
 
-                    if !success {
-                        // First fallback: tablet node through the current Termux route.
-                        let termux_target = {
-                            let lock = termux_agent.lock().unwrap();
-                            lock.as_ref().and_then(|a| {
-                                AppRuntime::parse_agent_target(a.endpoint(), port)
-                            })
-                        };
-
-                        if let Some((ip, p)) = termux_target {
-                            if let Ok(client) = AgentClient::new(&ip, p, api_key.clone()) {
-                                if let Ok(v) = client.remote_embed(&text) {
-                                    vector = v;
-                                    success = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if !success {
-                        // Try remote AI delegation
-                        let remote_node = {
-                            let nodes = remote_ai.lock().unwrap();
-                            nodes.values().next().cloned() // Just take the first one for now
-                        };
-                        
-                        if let Some(ip) = remote_node {
-                            if let Ok(client) = AgentClient::new(&ip, port, api_key.clone()) {
-                                if let Ok(v) = client.remote_embed(&text) {
-                                    vector = v;
-                                    success = true;
-                                }
-                            }
-                        }
-                    }
-
-                    if success && !vector.is_empty() {
-                        let model_id = {
-                            let lock = semantic.lock().expect("semantic lock");
-                            lock.as_ref().map(|s| s.model_id().to_string()).unwrap_or_else(|| "remote".to_string())
-                        };
-                        if let Ok(db_lock) = db.lock() {
-                            let _ = db_lock.save_embedding(fid, &model_id, &vector);
-                        }
-                    }
                     indexed += 1;
                     let _ = event_tx.send(AppEvent::EmbeddingProgress { indexed, total });
                 }
+
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         });

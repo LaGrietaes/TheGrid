@@ -41,6 +41,22 @@ pub struct Config {
     #[serde(default)]
     pub ai_provider_url: Option<String>,
 
+    /// Use tablet offload as helper when tablet appears idle/low-usage.
+    #[serde(default = "Config::default_true")]
+    pub ai_tablet_assist: bool,
+
+    /// Max CPU usage percentage on tablet to consider it available for assist.
+    #[serde(default = "Config::default_tablet_cpu_max_pct")]
+    pub ai_tablet_assist_cpu_max_pct: f32,
+
+    /// Max GPU usage percentage on tablet to consider it available for assist.
+    #[serde(default = "Config::default_tablet_gpu_max_pct")]
+    pub ai_tablet_assist_gpu_max_pct: f32,
+
+    /// Number of concurrent embedding requests per worker cycle.
+    #[serde(default = "Config::default_embedding_parallel_requests")]
+    pub embedding_parallel_requests: usize,
+
     /// Enable RDP access on this node
     #[serde(default = "Config::default_true")]
     pub enable_rdp: bool,
@@ -86,6 +102,10 @@ impl Default for Config {
             transfers_dir: None,
             ai_model: None,
             ai_provider_url: None,
+            ai_tablet_assist: true,
+            ai_tablet_assist_cpu_max_pct: Self::default_tablet_cpu_max_pct(),
+            ai_tablet_assist_gpu_max_pct: Self::default_tablet_gpu_max_pct(),
+            embedding_parallel_requests: Self::default_embedding_parallel_requests(),
             enable_rdp: true,
             enable_file_access: true,
             enable_terminal_access: true,
@@ -110,6 +130,15 @@ impl Config {
     }
     fn default_true() -> bool {
         true
+    }
+    fn default_tablet_cpu_max_pct() -> f32 {
+        55.0
+    }
+    fn default_tablet_gpu_max_pct() -> f32 {
+        60.0
+    }
+    fn default_embedding_parallel_requests() -> usize {
+        3
     }
     fn default_device_type() -> String {
         "Desktop".to_string()
