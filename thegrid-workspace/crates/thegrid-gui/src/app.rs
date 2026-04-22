@@ -127,6 +127,7 @@ pub struct TheGridApp {
     /// Phase 3: IDs of nodes currently participating in a cluster operation
     selected_node_ids:   Vec<String>,
     tailscale_connected: bool,
+    active_tab:          DashTab,
 
     // ── Per-device RDP preferences ───────────────────────────────────────────
     rdp_usernames:   HashMap<String, String>,
@@ -1063,7 +1064,6 @@ impl TheGridApp {
                     if let Err(e) = config.save() {
                         log::error!("Config save failed: {}", e);
                     }
-                    self.rdp_username = config.rdp_username.clone();
                     self.settings     = SettingsState::from_config(&config);
                     self.config       = config;
                     self.screen       = Screen::Dashboard;
@@ -2546,6 +2546,7 @@ impl eframe::App for TheGridApp {
                             let log_snap     = self.transfer_log.clone();
                             let watch_snap   = self.runtime.config.lock().unwrap().watch_paths.clone();
                             let telem_snap   = telemetry_snap.get(&device.id).cloned();
+                            let status = self.get_node_status(&device.id);
 
                             let rdp_user = self.rdp_usernames.entry(device.id.clone())
                                 .or_insert_with(|| self.config.rdp_username.clone());
@@ -2612,7 +2613,6 @@ impl eframe::App for TheGridApp {
                     match new_config.save() {
                         Ok(_) => {
                             self.push_toast(Toast::ok("Settings saved"));
-                            self.rdp_username = new_config.rdp_username.clone();
 
                              // Live update watcher
                             let mut watcher_lock = self.runtime.file_watcher.lock().unwrap();
