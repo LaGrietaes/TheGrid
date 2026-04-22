@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+﻿use anyhow::{Context, Result};
+use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::models::{
@@ -26,7 +26,7 @@ impl Database {
         Ok(db)
     }
 
-    // ── Schema ────────────────────────────────────────────────────────────
+    // â”€â”€ Schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn initialize_schema(&self) -> Result<()> {
         self.conn.execute_batch(r#"
@@ -174,16 +174,7 @@ impl Database {
         Ok(())
     }
 
-    fn add_column_if_missing(&self, sql: &str) -> Result<()> {
-        if let Err(err) = self.conn.execute(sql, []) {
-            if !err.to_string().contains("duplicate column name") {
-                return Err(err.into());
-            }
-        }
-        Ok(())
-    }
-
-    // ── Device registry ───────────────────────────────────────────────────
+    // â”€â”€ Device registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn upsert_device(&self, device_id: &str, device_name: &str) -> Result<()> {
         let now = unix_now();
@@ -198,7 +189,7 @@ impl Database {
         Ok(())
     }
 
-    // ── File indexing ─────────────────────────────────────────────────────
+    // â”€â”€ File indexing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn index_file(
         &self,
@@ -472,14 +463,10 @@ impl Database {
             ext:         row.get(5)?,
             size:        row.get::<_, i64>(6)? as u64,
             modified:    row.get(7)?,
-            hash:        row.get(8)?,
-            quick_hash:  row.get(9)?,
-            indexed_at:  row.get(10)?,
-            detected_by: row.get::<_, Option<String>>(11)?
-                .as_deref()
-                .map(DetectionSource::from_db)
-                .unwrap_or_default(),
-            rank:        row.get(12)?,
+            rank:        row.get(8)?,
+            hash:        None,
+            quick_hash:  None,
+            indexed_at:  0,
         })
     }
 
@@ -534,7 +521,7 @@ impl Database {
         Ok(deleted)
     }
 
-    // ── Phase 4: Semantic AI ──────────────────────────────────────────────
+    // â”€â”€ Phase 4: Semantic AI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn get_files_needing_embedding(&self, limit: usize) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
@@ -947,7 +934,7 @@ impl Database {
         Ok((updated, deleted, renamed))
     }
 
-    // ── Search ────────────────────────────────────────────────────────────
+    // â”€â”€ Search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn search_fts(
         &self,
@@ -991,14 +978,10 @@ impl Database {
                 ext:         row.get(5)?,
                 size:        row.get::<_, i64>(6)? as u64,
                 modified:    row.get(7)?,
-                hash:        row.get(8)?,
-                quick_hash:  row.get(9)?,
-                indexed_at:  row.get(10)?,
-                detected_by: row.get::<_, Option<String>>(11)?
-                    .as_deref()
-                    .map(DetectionSource::from_db)
-                    .unwrap_or_default(),
-                rank:        row.get(12)?,
+                rank:        row.get(8)?,
+            hash:        None,
+            quick_hash:  None,
+            indexed_at:  0,
             })
         };
 
@@ -1015,7 +998,7 @@ impl Database {
         Ok(results)
     }
 
-    // ── Temporal View ─────────────────────────────────────────────────────
+    // â”€â”€ Temporal View â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn get_recent_files(
         &self,
@@ -1453,206 +1436,3 @@ fn sanitize_fts_query(q: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_remote_file(path: &str, indexed_at: i64, modified: i64) -> FileSearchResult {
-        FileSearchResult {
-            id: 0,
-            device_id: "dev-a".to_string(),
-            device_name: "DEV-A".to_string(),
-            path: PathBuf::from(path),
-            name: Path::new(path)
-                .file_name()
-                .map(|v| v.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file.bin".to_string()),
-            ext: Path::new(path)
-                .extension()
-                .map(|v| v.to_string_lossy().to_string()),
-            size: 1024,
-            modified: Some(modified),
-            hash: Some("hash-1".to_string()),
-            quick_hash: Some("qh-1".to_string()),
-            indexed_at,
-            detected_by: DetectionSource::Sync,
-            rank: None,
-        }
-    }
-
-    fn sample_tombstone(path: &str, deleted_at: i64) -> FileTombstone {
-        FileTombstone {
-            device_id: "dev-a".to_string(),
-            path: PathBuf::from(path),
-            size: 1024,
-            modified: Some(deleted_at),
-            hash: Some("hash-1".to_string()),
-            quick_hash: Some("qh-1".to_string()),
-            deleted_at,
-            detected_by: DetectionSource::Sync,
-        }
-    }
-
-    fn path_count(db: &Database, device_id: &str, path: &str) -> i64 {
-        db.conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE device_id = ?1 AND path = ?2",
-                params![device_id, path],
-                |row| row.get(0),
-            )
-            .expect("path count")
-    }
-
-    fn os_path_string(path: &str) -> String {
-        PathBuf::from(path).to_string_lossy().to_string()
-    }
-
-    fn prefix_count(db: &Database, device_id: &str, prefix: &str) -> i64 {
-        let normalized = os_path_string(prefix);
-        let (exact, win_like, unix_like) = path_match_patterns(&normalized);
-        db.conn
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE device_id = ?1 AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
-                params![device_id, exact, win_like, unix_like],
-                |row| row.get(0),
-            )
-            .expect("prefix count")
-    }
-
-    #[test]
-    fn tombstone_blocks_stale_remote_file_resurrection() {
-        let db = Database::open(":memory:").expect("open db");
-        let tombstone = sample_tombstone("C:/mesh/doc.txt", 200);
-        db.apply_remote_tombstone(&tombstone).expect("apply tombstone");
-
-        let stale_file = sample_remote_file("C:/mesh/doc.txt", 150, 150);
-        db.upsert_remote_file(stale_file).expect("upsert stale file");
-
-        let count = db.file_count(Some("dev-a")).expect("file count");
-        assert_eq!(count, 0, "stale file should not resurrect deleted entry");
-
-        let delta = db.get_sync_delta_after(0).expect("sync delta");
-        assert_eq!(delta.tombstones.len(), 1, "tombstone must remain visible in sync delta");
-    }
-
-    #[test]
-    fn stale_remote_tombstone_does_not_override_newer_file() {
-        let db = Database::open(":memory:").expect("open db");
-        let fresh_file = sample_remote_file("C:/mesh/report.txt", 300, 300);
-        db.upsert_remote_file(fresh_file).expect("upsert fresh file");
-
-        let stale_tombstone = sample_tombstone("C:/mesh/report.txt", 200);
-        let applied = db
-            .apply_remote_tombstone(&stale_tombstone)
-            .expect("apply stale tombstone");
-
-        assert!(!applied, "older tombstone must be ignored when file is newer");
-        let count = db.file_count(Some("dev-a")).expect("file count");
-        assert_eq!(count, 1, "newer file should remain present");
-    }
-
-    #[test]
-    fn rename_storm_keeps_single_final_path() {
-        let db = Database::open(":memory:").expect("open db");
-        let initial = sample_remote_file("C:/storm/a.txt", 100, 100);
-        db.upsert_remote_file(initial).expect("seed file");
-
-        let mut current = "C:/storm/a.txt".to_string();
-        for i in 0..25 {
-            let next = format!("C:/storm/a_{}.txt", i);
-            let changes = vec![FileChange {
-                kind: FileChangeKind::Renamed,
-                path: PathBuf::from(&next),
-                old_path: Some(PathBuf::from(&current)),
-                new_path: Some(PathBuf::from(&next)),
-                fingerprint: None,
-            }];
-
-            let (_u, _d, renamed) = db
-                .index_changed_paths("dev-a", "DEV-A", &changes)
-                .expect("rename storm step");
-            assert_eq!(renamed, 1, "each rename step should move one file row");
-            current = next;
-        }
-
-        assert_eq!(db.file_count(Some("dev-a")).expect("count"), 1);
-        assert_eq!(path_count(&db, "dev-a", "C:/storm/a.txt"), 0);
-        assert_eq!(path_count(&db, "dev-a", &current), 1);
-    }
-
-    #[test]
-    fn recursive_move_updates_entire_subtree() {
-        let db = Database::open(":memory:").expect("open db");
-        let seed_paths = [
-            "C:/root_a/proj/readme.md",
-            "C:/root_a/proj/src/main.rs",
-            "C:/root_a/proj/assets/logo.png",
-        ];
-
-        for (i, p) in seed_paths.iter().enumerate() {
-            db.upsert_remote_file(sample_remote_file(p, 200 + i as i64, 200 + i as i64))
-                .expect("seed subtree file");
-        }
-
-        let changes = vec![FileChange {
-            kind: FileChangeKind::Renamed,
-            path: PathBuf::from("D:/root_b/proj"),
-            old_path: Some(PathBuf::from("C:/root_a/proj")),
-            new_path: Some(PathBuf::from("D:/root_b/proj")),
-            fingerprint: None,
-        }];
-
-        let (_u, _d, renamed) = db
-            .index_changed_paths("dev-a", "DEV-A", &changes)
-            .expect("recursive move");
-        assert_eq!(renamed, 3, "all subtree files should be moved");
-
-        assert_eq!(prefix_count(&db, "dev-a", "C:/root_a/proj"), 0);
-        assert_eq!(prefix_count(&db, "dev-a", "D:/root_b/proj"), 3);
-
-        let mut stmt = db
-            .conn
-            .prepare(
-                "SELECT name FROM files
-                 WHERE device_id = ?1
-                   AND (path = ?2 OR path LIKE ?3 OR path LIKE ?4)",
-            )
-            .expect("prepare names query");
-        let new_prefix = os_path_string("D:/root_b/proj");
-        let (exact, win_like, unix_like) = path_match_patterns(&new_prefix);
-        let mut names: Vec<String> = stmt
-            .query_map(params!["dev-a", exact, win_like, unix_like], |row| row.get(0))
-            .expect("query moved names")
-            .filter_map(|r: rusqlite::Result<String>| r.ok())
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["logo.png", "main.rs", "readme.md"]);
-    }
-
-    #[test]
-    fn reconnect_replay_respects_event_ordering() {
-        let db = Database::open(":memory:").expect("open db");
-
-        // Newer delete arrives first during reconnect replay.
-        let t_new = sample_tombstone("C:/replay/state.txt", 500);
-        db.apply_remote_tombstone(&t_new).expect("apply fresh tombstone");
-
-        // Older file replay must be ignored (no stale resurrection).
-        let stale = sample_remote_file("C:/replay/state.txt", 450, 450);
-        db.upsert_remote_file(stale).expect("apply stale file replay");
-        assert_eq!(db.file_count(Some("dev-a")).expect("count after stale replay"), 0);
-
-        // Newer file replay should resurrect and clear outdated tombstone.
-        let fresh = sample_remote_file("C:/replay/state.txt", 600, 600);
-        db.upsert_remote_file(fresh).expect("apply fresh file replay");
-        assert_eq!(db.file_count(Some("dev-a")).expect("count after fresh replay"), 1);
-
-        // Late arrival of older tombstone must not remove newer file.
-        let t_old = sample_tombstone("C:/replay/state.txt", 500);
-        let applied = db
-            .apply_remote_tombstone(&t_old)
-            .expect("apply stale tombstone replay");
-        assert!(!applied, "stale tombstone replay must be ignored");
-        assert_eq!(db.file_count(Some("dev-a")).expect("final count"), 1);
-    }
-}

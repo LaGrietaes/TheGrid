@@ -1364,12 +1364,17 @@ fn collect_telemetry(config: &Config) -> NodeTelemetry {
     }
     
     // BPW: Collect local IPs to identify wired/direct connections
-    let mut local_ips = Vec::new();
-    if let Ok(ifs) = get_if_addrs::get_if_addrs() {
-        for interface in ifs {
-            if !interface.is_loopback() {
-                if let std::net::IpAddr::V4(addr) = interface.ip() {
-                    local_ips.push(addr.to_string());
+    // Use a UDP connect trick to discover the primary outbound interface IP
+    // without requiring any external crate.
+    let mut local_ips: Vec<String> = Vec::new();
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        // Connect to a public address (no packet sent — UDP is connectionless)
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                if let std::net::IpAddr::V4(ip) = addr.ip() {
+                    if !ip.is_loopback() {
+                        local_ips.push(ip.to_string());
+                    }
                 }
             }
         }

@@ -1,8 +1,8 @@
-[package]
+﻿[package]
 name        = "thegrid-ai"
 version     = "0.1.0"
 edition     = "2021"
-description = "Semantic vector indexing for THE GRID (Phase 4 — stubs only)"
+description = "Semantic vector indexing for THE GRID (Phase 4 - stubs only)"
 
 [dependencies]
 thegrid-core = { path = "../thegrid-core" }
@@ -11,10 +11,9 @@ log           = { workspace = true }
 serde         = { workspace = true }
 serde_json    = { workspace = true }
 reqwest       = { workspace = true }
+image         = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
-# ── Phase 4 dependencies ────────────────────────────────────────────────────
+# Phase 4 dependencies (stubbed for now to allow building without C++ tools)
 # usearch     = "2.13"
 # fastembed   = "4.5"
-sysinfo     = "0.33"
-# Basic image metadata extraction (no GPU required)
-image       = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+sysinfo       = "0.33"
