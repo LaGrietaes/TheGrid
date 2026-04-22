@@ -17,6 +17,22 @@ The `main` branch is the comprehensive workspace containing all components, spec
 - Perfect for deployment on Android tablets (via Termux), Raspberry Pi, or any remote Linux servers.
 - It only contains the proper environment code for data processing, the Tailscale agent, and indexing capabilities.
 
+### Headless Update Command
+If you are updating only the TUI/headless line, run this from `thegrid-workspace`:
+
+```powershell
+gitupdate
+```
+
+What it does:
+- fetches and fast-forwards `origin/node`
+- switches to `node` if needed
+- runs `cargo check -p thegrid-node`
+
+Flags:
+- `gitupdate -NoCheck` to skip cargo validation
+- `gitupdate -ReturnToPrevious` to switch back after update
+
 ---
 
 ## Organized Dual Targets (Single Branch)
