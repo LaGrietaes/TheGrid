@@ -176,6 +176,8 @@ pub struct TheGridApp {
     telemetry_cache: HashMap<String, NodeTelemetry>,
     // When we last polled each device for telemetry (to rate-limit polls)
     telemetry_last_poll: HashMap<String, std::time::Instant>,
+    // When we last probed each remote device with /ping (separate from telemetry)
+    ping_last_poll: HashMap<String, std::time::Instant>,
     telemetry_tree: Tree<TelemetryPane>,
     telemetry_band_height: f32,
     // Whether a local telemetry collection is in flight
@@ -266,6 +268,12 @@ pub struct ViewportState {
 }
 
 impl TheGridApp {
+    fn usb_discovery_enabled() -> bool {
+        std::env::var("THEGRID_ENABLE_USB_DISCOVERY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
     fn is_local_device(&self, device: &TailscaleDevice) -> bool {
         let host = self.local_hostname.as_str();
         let configured = self.config.device_name.as_str();
@@ -416,6 +424,7 @@ impl TheGridApp {
             viewport: ViewportState::default(),
             telemetry_cache:     HashMap::new(),
             telemetry_last_poll: HashMap::new(),
+            ping_last_poll:      HashMap::new(),
             telemetry_tree: build_default_telemetry_tree(),
             telemetry_band_height: default_telemetry_band_height(),
             local_telemetry_pending: false,
@@ -564,7 +573,7 @@ impl TheGridApp {
 
     fn spawn_ping(&mut self, ip: String, device_id: String, manual: bool) {
         let now = std::time::Instant::now();
-        self.telemetry_last_poll.insert(device_id, now);
+        self.ping_last_poll.insert(device_id, now);
         self.runtime.spawn_ping(ip, manual);
     }
 
@@ -969,7 +978,17 @@ impl TheGridApp {
     // ─────────────────────────────────────────────────────────────────────────
 
     fn process_events(&mut self) {
-        while let Ok(event) = self.event_rx.try_recv() {
+        // Keep frames responsive even when watcher/index workers emit bursts of events.
+        const MAX_EVENTS_PER_FRAME: usize = 300;
+        let mut processed = 0usize;
+
+        while processed < MAX_EVENTS_PER_FRAME {
+            let event = match self.event_rx.try_recv() {
+                Ok(event) => event,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            };
+            processed += 1;
             match event {
 
                 // ── Devices ───────────────────────────────────────────────────
@@ -982,12 +1001,10 @@ impl TheGridApp {
                         .and_then(|i| self.devices.get(i))
                         .map(|d| d.id.clone());
 
-                    // Register all devices in the DB so names are available offline
-                    {
-                        if let Ok(guard) = self.runtime.db.lock() {
-                            for d in &devices {
-                                let _ = guard.upsert_device(&d.id, d.display_name());
-                            }
+                    // Register all devices in DB without blocking the UI thread.
+                    if let Ok(guard) = self.runtime.db.try_lock() {
+                        for d in &devices {
+                            let _ = guard.upsert_device(&d.id, d.display_name());
                         }
                     }
 
@@ -997,14 +1014,15 @@ impl TheGridApp {
                         devices.insert(0, local_node);
                     }
 
-                    // Append USB-connected Android devices discovered via ADB so they
-                    // appear in the node list even when not yet present in Tailscale.
-                    let adb_usb_devices = self.list_usb_adb_devices();
-                    if !adb_usb_devices.is_empty() {
-                        for adb_dev in adb_usb_devices {
-                            let already_exists = devices.iter().any(|d| d.id == adb_dev.id);
-                            if !already_exists {
-                                devices.push(adb_dev);
+                    // USB discovery can block on some ADB installs, so keep it opt-in.
+                    if Self::usb_discovery_enabled() {
+                        let adb_usb_devices = self.list_usb_adb_devices();
+                        if !adb_usb_devices.is_empty() {
+                            for adb_dev in adb_usb_devices {
+                                let already_exists = devices.iter().any(|d| d.id == adb_dev.id);
+                                if !already_exists {
+                                    devices.push(adb_dev);
+                                }
                             }
                         }
                     }
@@ -1020,18 +1038,6 @@ impl TheGridApp {
                         self.selected_idx = Some(0);
                     }
                     self.set_status(format!("{} nodes discovered", n));
-
-                    // Automatically ping every discovered device to determine online status
-                    let mut initial_pings = Vec::new();
-                    for d in &self.devices {
-                        if let Some(ip) = d.primary_ip() {
-                            initial_pings.push((ip.to_string(), d.id.clone()));
-                        }
-                    }
-                    for (ip, id) in initial_pings {
-                        log::info!("Automatic ping for discovered device: {} ({})", id, ip);
-                        self.spawn_ping(ip, id, false);
-                    }
 
                     // Start local telemetry collection immediately after first load
                     if let Some(local_device_id) = self
@@ -2330,7 +2336,7 @@ impl eframe::App for TheGridApp {
 
         for d in &self.devices {
             if let Some(ip) = d.primary_ip() {
-                let last_poll = self.telemetry_last_poll.get(&d.id);
+                let last_telemetry_poll = self.telemetry_last_poll.get(&d.id);
                 
                 // Tiered polling: 15s for selected/local, 60s for active ones, 300s for idle/offline
                 let is_selected = self.selected_idx.and_then(|i| self.devices.get(i)).map(|sd| sd.id == d.id).unwrap_or(false);
@@ -2344,7 +2350,7 @@ impl eframe::App for TheGridApp {
                     300
                 };
 
-                let needs_poll = last_poll.map(|t| t.elapsed().as_secs() > interval).unwrap_or(true);
+                let needs_poll = last_telemetry_poll.map(|t| t.elapsed().as_secs() > interval).unwrap_or(true);
                 
                 if needs_poll {
                     if is_local {
@@ -2352,7 +2358,13 @@ impl eframe::App for TheGridApp {
                             local_telemetry_device_id = Some(d.id.clone());
                         }
                     } else {
-                        ping_targets.push((ip.to_string(), d.id.clone()));
+                        let should_probe = self.ping_last_poll
+                            .get(&d.id)
+                            .map(|t| t.elapsed().as_secs() > interval)
+                            .unwrap_or(true);
+                        if should_probe {
+                            ping_targets.push((ip.to_string(), d.id.clone()));
+                        }
                     }
                 }
 

@@ -64,24 +64,29 @@ impl AgentServer {
         self
     }
 
-    pub fn spawn(self) {
+    pub fn spawn(self) -> Result<()> {
         let port = self.port;
         let api_key_prefix: String = self.api_key.chars().take(8).collect();
+        let addr = format!("0.0.0.0:{}", self.port);
+        std::fs::create_dir_all(&self.transfers_dir)?;
+        let server = Server::http(&addr)
+            .map_err(|e| anyhow::anyhow!("Starting HTTP server on {}: {}", addr, e))?;
         
         // Move self into the thread — this is why we don't need Arc<Self>
         std::thread::Builder::new()
             .name("thegrid-agent".into())
             .spawn(move || {
-                if let Err(e) = self.run() {
+                if let Err(e) = self.run_with_server(server) {
                     log::error!("AgentServer fatal error: {}", e);
                 }
             })
-            .expect("Spawning agent thread");
+            .context("Spawning agent thread")?;
 
         log::info!("THE GRID agent server started on port {} (X-Grid-Key starts with: {}...)", 
             port, 
             api_key_prefix
         );
+        Ok(())
     }
 
     fn capability_enabled(&self, capability: &str) -> bool {
@@ -121,12 +126,7 @@ impl AgentServer {
         Ok(())
     }
 
-    fn run(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.transfers_dir)?;
-        let addr = format!("0.0.0.0:{}", self.port);
-        let server = Server::http(&addr)
-            .map_err(|e| anyhow::anyhow!("Starting HTTP server on {}: {}", addr, e))?;
-
+    fn run_with_server(&self, server: Server) -> Result<()> {
         let shutdown = self.shutdown.clone();
         for _ in 0.. {
             if shutdown.load(Ordering::Relaxed) { break; }

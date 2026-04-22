@@ -6,6 +6,7 @@ use std::sync::mpsc;
 
 use crate::events::AppEvent;
 use crate::models::{FileChange, FileChangeKind};
+use crate::db::should_skip_path;
 use crate::utils::fingerprint_file;
 
 /// Watches filesystem paths and emits `AppEvent::FileSystemChanged`
@@ -66,30 +67,43 @@ fn normalize_event(event: Event) -> Vec<FileChange> {
     match event.kind {
         EventKind::Create(CreateKind::Any | CreateKind::File | CreateKind::Folder)
         | EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {
-            event.paths.into_iter().map(|path| FileChange {
-                kind: if matches!(event.kind, EventKind::Create(_)) {
-                    FileChangeKind::Created
-                } else {
-                    FileChangeKind::Modified
-                },
-                fingerprint: build_fingerprint(&path),
-                old_path: None,
-                new_path: None,
-                path,
+            event.paths.into_iter().filter_map(|path| {
+                if should_drop_watcher_path(&path) {
+                    return None;
+                }
+                Some(FileChange {
+                    kind: if matches!(event.kind, EventKind::Create(_)) {
+                        FileChangeKind::Created
+                    } else {
+                        FileChangeKind::Modified
+                    },
+                    fingerprint: build_fingerprint(&path),
+                    old_path: None,
+                    new_path: None,
+                    path,
+                })
             }).collect()
         }
         EventKind::Remove(RemoveKind::Any | RemoveKind::File | RemoveKind::Folder) => {
-            event.paths.into_iter().map(|path| FileChange {
-                kind: FileChangeKind::Deleted,
-                path,
-                old_path: None,
-                new_path: None,
-                fingerprint: None,
+            event.paths.into_iter().filter_map(|path| {
+                if should_drop_watcher_path(&path) {
+                    return None;
+                }
+                Some(FileChange {
+                    kind: FileChangeKind::Deleted,
+                    path,
+                    old_path: None,
+                    new_path: None,
+                    fingerprint: None,
+                })
             }).collect()
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if event.paths.len() >= 2 => {
             let old_path = event.paths[0].clone();
             let new_path = event.paths[1].clone();
+            if should_drop_watcher_path(&old_path) || should_drop_watcher_path(&new_path) {
+                return Vec::new();
+            }
             vec![FileChange {
                 kind: FileChangeKind::Renamed,
                 path: new_path.clone(),
@@ -99,40 +113,77 @@ fn normalize_event(event: Event) -> Vec<FileChange> {
             }]
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-            event.paths.into_iter().map(|path| FileChange {
-                kind: FileChangeKind::Deleted,
-                path,
-                old_path: None,
-                new_path: None,
-                fingerprint: None,
+            event.paths.into_iter().filter_map(|path| {
+                if should_drop_watcher_path(&path) {
+                    return None;
+                }
+                Some(FileChange {
+                    kind: FileChangeKind::Deleted,
+                    path,
+                    old_path: None,
+                    new_path: None,
+                    fingerprint: None,
+                })
             }).collect()
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-            event.paths.into_iter().map(|path| FileChange {
-                kind: FileChangeKind::Created,
-                fingerprint: build_fingerprint(&path),
-                old_path: None,
-                new_path: None,
-                path,
+            event.paths.into_iter().filter_map(|path| {
+                if should_drop_watcher_path(&path) {
+                    return None;
+                }
+                Some(FileChange {
+                    kind: FileChangeKind::Created,
+                    fingerprint: build_fingerprint(&path),
+                    old_path: None,
+                    new_path: None,
+                    path,
+                })
             }).collect()
         }
         EventKind::Modify(ModifyKind::Name(_)) => {
-            event.paths.into_iter().map(|path| FileChange {
+            event.paths.into_iter().filter_map(|path| {
+                if should_drop_watcher_path(&path) {
+                    return None;
+                }
+                Some(FileChange {
+                    kind: FileChangeKind::Modified,
+                    fingerprint: build_fingerprint(&path),
+                    old_path: None,
+                    new_path: None,
+                    path,
+                })
+            }).collect()
+        }
+        _ => event.paths.into_iter().filter_map(|path| {
+            if should_drop_watcher_path(&path) {
+                return None;
+            }
+            Some(FileChange {
                 kind: FileChangeKind::Modified,
                 fingerprint: build_fingerprint(&path),
                 old_path: None,
                 new_path: None,
                 path,
-            }).collect()
-        }
-        _ => event.paths.into_iter().map(|path| FileChange {
-            kind: FileChangeKind::Modified,
-            fingerprint: build_fingerprint(&path),
-            old_path: None,
-            new_path: None,
-            path,
+            })
         }).collect(),
     }
+}
+
+fn should_drop_watcher_path(path: &Path) -> bool {
+    if should_skip_path(path) {
+        return true;
+    }
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if matches!(name.as_str(), "query-cache.bin" | "work-products.bin") {
+        return true;
+    }
+
+    false
 }
 
 fn build_fingerprint(path: &Path) -> Option<crate::models::FileFingerprint> {

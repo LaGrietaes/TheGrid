@@ -68,8 +68,8 @@ fn main() -> eframe::Result<()> {
             .with_icon(load_icon())
             .with_title("THE GRID"),
 
-        // Persist window position/size between sessions
-        persist_window: true,
+        // Disable persisted window state to avoid restoring off-screen/minimized sessions.
+        persist_window: false,
 
         ..Default::default()
     };

@@ -227,25 +227,29 @@ impl AppRuntime {
             }
         }
 
-        // Detect & setup Termux node via USB-C OTG (faster than WiFi)
-        if let Some(agent) = thegrid_net::setup_termux_agent() {
-            let method = agent.connection_method();
-            let endpoint = agent.endpoint().to_string();
-            {
-                let mut slot = self.termux_agent.lock().unwrap();
-                *slot = Some(agent);
+        // Detect & setup Termux node via USB-C OTG in background so GUI startup stays responsive.
+        let termux_slot = Arc::clone(&self.termux_agent);
+        let termux_event_tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(agent) = thegrid_net::setup_termux_agent() {
+                let method = agent.connection_method();
+                let endpoint = agent.endpoint().to_string();
+                {
+                    let mut slot = termux_slot.lock().unwrap();
+                    *slot = Some(agent);
+                }
+                log::info!("[Runtime] Tablet (Android) available via {} at {}", method, endpoint);
+                let _ = termux_event_tx.send(AppEvent::Status(format!(
+                    "termux_ready:{}:{}",
+                    method,
+                    endpoint
+                )));
+            } else {
+                let mut slot = termux_slot.lock().unwrap();
+                *slot = None;
+                log::debug!("[Runtime] No Termux/Android device available");
             }
-            log::info!("[Runtime] Tablet (Android) available via {} at {}", method, endpoint);
-            let _ = self.event_tx.send(AppEvent::Status(format!(
-                "termux_ready:{}:{}",
-                method,
-                endpoint
-            )));
-        } else {
-            let mut slot = self.termux_agent.lock().unwrap();
-            *slot = None;
-            log::debug!("[Runtime] No Termux/Android device available");
-        }
+        });
 
         // Start AI if capable OR if provider URL is set (which overrides local specs)
         let has_remote_provider = {
@@ -258,32 +262,52 @@ impl AppRuntime {
             self.spawn_embedding_worker();
         }
 
-        // Phase 4: Media AI — extract real image metadata (GPU if available, CPU fallback via `image` crate)
+        // Phase 4: Media AI — GPU analyzer is opt-in to avoid native startup instability.
         if self.is_ai_node {
-            match thegrid_ai::CudaMediaAnalyzer::new() {
-                Ok(analyzer) => {
-                    let mut lock = self.media_analyzer.lock().unwrap();
-                    *lock = Some(Arc::new(analyzer));
-                    drop(lock);
-                    log::info!("[Runtime] GPU media analyzer ready — starting background worker");
-                    self.spawn_media_analyzer_worker();
+            let gpu_media_enabled = std::env::var("THEGRID_ENABLE_GPU_MEDIA")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
+            if gpu_media_enabled {
+                match thegrid_ai::CudaMediaAnalyzer::new() {
+                    Ok(analyzer) => {
+                        let mut lock = self.media_analyzer.lock().unwrap();
+                        *lock = Some(Arc::new(analyzer));
+                        drop(lock);
+                        log::info!("[Runtime] GPU media analyzer ready — starting background worker");
+                        self.spawn_media_analyzer_worker();
+                    }
+                    Err(e) => {
+                        log::warn!("[Runtime] GPU media analyzer unavailable: {}", e);
+                        let _ = self.event_tx.send(AppEvent::Status(format!(
+                            "AI media analyzer unavailable: {}",
+                            e
+                        )));
+                    }
                 }
-                Err(e) => {
-                    log::warn!("[Runtime] GPU media analyzer unavailable: {}", e);
-                    let _ = self.event_tx.send(AppEvent::Status(format!(
-                        "AI media analyzer unavailable: {}",
-                        e
-                    )));
-                }
+            } else {
+                log::info!("[Runtime] GPU media analyzer disabled (set THEGRID_ENABLE_GPU_MEDIA=1 to enable)");
             }
         }
 
         // Background indexing helpers
         self.spawn_hashing_worker();
 
-        let mut shutdown_lock = self.agent_shutdown.lock().unwrap();
-        *shutdown_lock = Some(server.shutdown_handle());
-        server.spawn();
+        let shutdown_handle = server.shutdown_handle();
+        match server.spawn() {
+            Ok(()) => {
+                let mut shutdown_lock = self.agent_shutdown.lock().unwrap();
+                *shutdown_lock = Some(shutdown_handle);
+            }
+            Err(e) => {
+                log::error!("[Runtime] Agent startup failed on port {}: {}", p, e);
+                let _ = self.event_tx.send(AppEvent::Status(format!(
+                    "agent_start_failed:{}:{}",
+                    p,
+                    e
+                )));
+            }
+        }
     }
 
     pub fn restart_services(&self) {

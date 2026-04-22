@@ -1252,6 +1252,13 @@ fn main() -> Result<()> {
                 AppEvent::Status(msg) => {
                     if msg.starts_with("db_error:") {
                         emit(&ui_state, tui_mode, "⚠", "DB", &msg["db_error:".len()..]);
+                    } else if msg.starts_with("agent_start_failed:") {
+                        let parts: Vec<&str> = msg.splitn(3, ':').collect();
+                        if parts.len() == 3 {
+                            emit(&ui_state, tui_mode, "✗", "AGENT", format!("Port {} failed: {}", parts[1], parts[2]));
+                        } else {
+                            emit(&ui_state, tui_mode, "✗", "AGENT", "Startup failed");
+                        }
                     } else if msg.starts_with("device_ping_ok:") {
                         let parts: Vec<&str> = msg.splitn(3, ':').collect();
                         if parts.len() == 3 {
