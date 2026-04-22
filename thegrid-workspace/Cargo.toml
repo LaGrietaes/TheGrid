@@ -29,6 +29,10 @@ default-members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+
 # ── Shared dependency versions (keeps crates in sync) ─────────────────────────
 [workspace.dependencies]
 # Serialization — used by every crate for config, API responses, IPC

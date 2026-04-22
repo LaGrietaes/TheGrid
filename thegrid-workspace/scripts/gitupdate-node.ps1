@@ -1,5 +1,5 @@
 param(
-    [string]$TargetBranch = "node",
+    [string]$TargetBranch = "",
     [switch]$NoCheck,
     [switch]$ReturnToPrevious
 )
@@ -18,6 +18,9 @@ function Run-Command {
 }
 
 $initialBranch = (git rev-parse --abbrev-ref HEAD).Trim()
+if ([string]::IsNullOrWhiteSpace($TargetBranch)) {
+    $TargetBranch = $initialBranch
+}
 $pending = git status --porcelain
 
 if ($pending) {
@@ -35,10 +38,11 @@ Run-Command "git pull --ff-only origin $TargetBranch"
 
 if (-not $NoCheck) {
     Run-Command "cargo check -p thegrid-node"
+    Run-Command "cargo check -p thegrid-gui"
 }
 
 if ($ReturnToPrevious -and $initialBranch -ne $TargetBranch) {
     Run-Command "git checkout $initialBranch"
 }
 
-Write-Host "Headless update complete. Branch: $TargetBranch" -ForegroundColor Green
+Write-Host "Update complete. Branch: $TargetBranch" -ForegroundColor Green

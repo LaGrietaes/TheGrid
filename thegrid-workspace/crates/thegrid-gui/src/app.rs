@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use egui_tiles::Tree;
 use egui::{Color32, Context, RichText};
+use semver::Version;
 use serde::Deserialize;
 
 use thegrid_core::{AppEvent, Config};
@@ -67,6 +68,89 @@ const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGr
 struct ReleaseInfo {
     tag_name: String,
     html_url: String,
+}
+
+enum GitUpdateOutcome {
+    UpToDate,
+    Updated,
+}
+
+fn parse_version_tag(tag: &str) -> Option<Version> {
+    let clean = tag.trim().trim_start_matches('v').trim_start_matches('V');
+    Version::parse(clean).ok()
+}
+
+fn try_git_update() -> Result<GitUpdateOutcome, String> {
+    let probe = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !probe.status.success() {
+        return Err("Current directory is not a git repository".to_string());
+    }
+
+    let before = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !before.status.success() {
+        return Err("Failed to read current git HEAD".to_string());
+    }
+    let before_head = String::from_utf8_lossy(&before.stdout).trim().to_string();
+
+    let fetch = std::process::Command::new("git")
+        .arg("fetch")
+        .arg("--prune")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !fetch.status.success() {
+        return Err(format!("git fetch failed: {}", String::from_utf8_lossy(&fetch.stderr).trim()));
+    }
+
+    let pull = std::process::Command::new("git")
+        .arg("pull")
+        .arg("--ff-only")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !pull.status.success() {
+        return Err(format!("git pull failed: {}", String::from_utf8_lossy(&pull.stderr).trim()));
+    }
+
+    let after = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !after.status.success() {
+        return Err("Failed to read updated git HEAD".to_string());
+    }
+    let after_head = String::from_utf8_lossy(&after.stdout).trim().to_string();
+
+    if before_head == after_head {
+        Ok(GitUpdateOutcome::UpToDate)
+    } else {
+        Ok(GitUpdateOutcome::Updated)
+    }
+}
+
+fn try_rebuild_binaries() -> Result<(), String> {
+    let build = std::process::Command::new("cargo")
+        .arg("build")
+        .arg("-p")
+        .arg("thegrid-node")
+        .arg("-p")
+        .arg("thegrid-gui")
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if build.status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo build failed: {}", String::from_utf8_lossy(&build.stderr).trim()))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -464,6 +548,17 @@ impl TheGridApp {
         }
         self.release_check_dispatched = true;
 
+        let skip_update_check = std::env::var("THEGRID_SKIP_UPDATE_CHECK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if skip_update_check {
+            return;
+        }
+
+        let auto_update = std::env::var("THEGRID_AUTO_UPDATE")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             let client = match reqwest::blocking::Client::builder()
@@ -492,14 +587,47 @@ impl TheGridApp {
                 Err(_) => return,
             };
 
-            let current = env!("CARGO_PKG_VERSION").trim_start_matches('v').to_string();
-            let latest = release.tag_name.trim_start_matches('v').to_string();
-            if latest != current {
-                let _ = tx.send(AppEvent::Status(format!(
-                    "update_available:{}|{}",
-                    release.tag_name,
-                    release.html_url
-                )));
+            let current = match parse_version_tag(env!("CARGO_PKG_VERSION")) {
+                Some(v) => v,
+                None => return,
+            };
+            let latest = match parse_version_tag(&release.tag_name) {
+                Some(v) => v,
+                None => return,
+            };
+
+            if latest > current {
+                if auto_update {
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "update_available:{}|{}",
+                        release.tag_name,
+                        release.html_url
+                    )));
+                    match try_git_update() {
+                        Ok(GitUpdateOutcome::UpToDate) => {
+                            let _ = tx.send(AppEvent::Status("update_latest".to_string()));
+                        }
+                        Ok(GitUpdateOutcome::Updated) => {
+                            match try_rebuild_binaries() {
+                                Ok(()) => {
+                                    let _ = tx.send(AppEvent::Status("update_applied_restart_gui".to_string()));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::Status(format!("update_failed:{}", e)));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Status(format!("update_failed:{}", e)));
+                        }
+                    }
+                } else {
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "update_available:{}|{}",
+                        release.tag_name,
+                        release.html_url
+                    )));
+                }
             }
         });
     }
@@ -1472,6 +1600,15 @@ impl TheGridApp {
                         } else {
                             self.set_status(format!("New version {} available", version));
                         }
+                    } else if msg == "update_applied_restart_gui" {
+                        self.push_toast(Toast::ok("Update applied. Restart THE GRID to run the latest version."));
+                        self.set_status("Updated binaries successfully. Restart required.");
+                    } else if msg == "update_latest" {
+                        self.set_status("Already on latest version.");
+                    } else if msg.starts_with("update_failed:") {
+                        let detail = &msg["update_failed:".len()..];
+                        self.push_toast(Toast::err(format!("Auto-update failed: {}", detail)));
+                        self.set_status("Auto-update failed. Check logs/status and retry manually.");
                     } else if msg.starts_with("config_update:") {
                         // Format: config_update:model="...",url="..."
                         // Simple parser for node-side config syncing

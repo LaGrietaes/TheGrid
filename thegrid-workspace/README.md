@@ -18,16 +18,16 @@ The `main` branch is the comprehensive workspace containing all components, spec
 - It only contains the proper environment code for data processing, the Tailscale agent, and indexing capabilities.
 
 ### Headless Update Command
-If you are updating only the TUI/headless line, run this from `thegrid-workspace`:
+If you are updating your current working branch and validating both binaries, run this from `thegrid-workspace`:
 
 ```powershell
 gitupdate
 ```
 
 What it does:
-- fetches and fast-forwards `origin/node`
-- switches to `node` if needed
-- runs `cargo check -p thegrid-node`
+- fetches and fast-forwards `origin/<current-branch>`
+- keeps/uses your current branch unless `-TargetBranch` is provided
+- runs `cargo check -p thegrid-node` and `cargo check -p thegrid-gui`
 
 Flags:
 - `gitupdate -NoCheck` to skip cargo validation

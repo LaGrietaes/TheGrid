@@ -4784,7 +4784,7 @@ dependencies = [
 
 [[package]]
 name = "thegrid-gui"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4802,6 +4802,7 @@ dependencies = [
  "open",
  "reqwest",
  "rfd",
+ "semver",
  "serde",
  "serde_json",
  "sysinfo 0.30.13",

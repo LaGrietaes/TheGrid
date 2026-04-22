@@ -229,11 +229,13 @@ fn git_branch_head() -> Option<String> {
     Some(format!("{} @ {}", branch, head))
 }
 
-fn try_rebuild_node() -> Result<String> {
+fn try_rebuild_binaries() -> Result<String> {
     let build = Command::new("cargo")
         .arg("build")
         .arg("-p")
         .arg("thegrid-node")
+        .arg("-p")
+        .arg("thegrid-gui")
         .output()?;
 
     if !build.status.success() {
@@ -241,7 +243,7 @@ fn try_rebuild_node() -> Result<String> {
         anyhow::bail!("cargo build failed: {}", stderr.trim());
     }
 
-    Ok("Build completed for thegrid-node".to_string())
+    Ok("Build completed for thegrid-node + thegrid-gui".to_string())
 }
 
 fn restart_current_node_process(updated_from_to: Option<(&str, &str)>) -> Result<String> {
@@ -826,8 +828,8 @@ fn execute_command(
                 }
                 Ok(GitUpdateOutcome::Updated { from, to }) => {
                     emit(ui_state, tui_mode, "✓", "GIT", format!("Updated {} -> {}", from, to));
-                    emit(ui_state, tui_mode, "↻", "BUILD", "Rebuilding thegrid-node...");
-                    match try_rebuild_node() {
+                    emit(ui_state, tui_mode, "↻", "BUILD", "Rebuilding thegrid-node + thegrid-gui...");
+                    match try_rebuild_binaries() {
                         Ok(build_msg) => {
                             emit(ui_state, tui_mode, "✓", "BUILD", build_msg);
                             emit(ui_state, tui_mode, "↻", "RESTART", "Launching updated node process...");
@@ -1021,8 +1023,27 @@ fn main() -> Result<()> {
                         }
                         Ok(GitUpdateOutcome::Updated { from, to }) => {
                             emit(&ui_state, tui_mode, "✓", "UPDATE", format!("Updated {} -> {}", from, to));
-                            emit(&ui_state, tui_mode, "ℹ", "UPDATE", "Restart node to run latest release.");
-                            return Ok(());
+                            emit(&ui_state, tui_mode, "↻", "BUILD", "Rebuilding thegrid-node + thegrid-gui...");
+                            match try_rebuild_binaries() {
+                                Ok(build_msg) => {
+                                    emit(&ui_state, tui_mode, "✓", "BUILD", build_msg);
+                                    emit(&ui_state, tui_mode, "↻", "RESTART", "Launching updated node process...");
+                                    match restart_current_node_process(Some((&from, &to))) {
+                                        Ok(msg) => {
+                                            emit(&ui_state, tui_mode, "✓", "RESTART", msg);
+                                            return Ok(());
+                                        }
+                                        Err(e) => {
+                                            emit(&ui_state, tui_mode, "⚠", "RESTART", format!("> Update Failed Check logs: {}", e));
+                                            emit(&ui_state, tui_mode, "ℹ", "UPDATE", "Continuing with current process.");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    emit(&ui_state, tui_mode, "⚠", "BUILD", format!("> Update Failed Check logs: {}", e));
+                                    emit(&ui_state, tui_mode, "ℹ", "UPDATE", "Continuing with current process.");
+                                }
+                            }
                         }
                         Err(e) => {
                             emit(&ui_state, tui_mode, "⚠", "UPDATE", format!("Auto-update failed: {}", e));

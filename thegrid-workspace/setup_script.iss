@@ -19,16 +19,20 @@ DisableProgramGroupPage=yes
 [Files]
 Source: "target\release\thegrid.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "target\release\thegrid-node.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "gitupdate.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "scripts\gitupdate-node.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "launch_thegrid.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "launch_thegrid_node.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "SETUP.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\The Grid"; Filename: "{app}\thegrid.exe"
-Name: "{group}\The Grid Node (Headless)"; Filename: "{app}\thegrid-node.exe"
-Name: "{commondesktop}\The Grid"; Filename: "{app}\thegrid.exe"
+Name: "{group}\The Grid"; Filename: "{app}\launch_thegrid.cmd"
+Name: "{group}\The Grid Node (Headless)"; Filename: "{app}\launch_thegrid_node.cmd"
+Name: "{commondesktop}\The Grid"; Filename: "{app}\launch_thegrid.cmd"
 
 [Run]
-Filename: "{app}\thegrid.exe"; Description: "Launch The Grid"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\launch_thegrid.cmd"; Description: "Launch The Grid"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
 ; Keep user data (config/index DB) under AppData intact across uninstall/update.
