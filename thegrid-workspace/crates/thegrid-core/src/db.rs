@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+﻿use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +23,7 @@ impl Database {
         Ok(db)
     }
 
-    // ── Schema ────────────────────────────────────────────────────────────
+    // â”€â”€ Schema â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     fn initialize_schema(&self) -> Result<()> {
         self.conn.execute_batch(r#"
@@ -112,7 +112,7 @@ impl Database {
         Ok(())
     }
 
-    // ── Device registry ───────────────────────────────────────────────────
+    // â”€â”€ Device registry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn upsert_device(&self, device_id: &str, device_name: &str) -> Result<()> {
         let now = unix_now();
@@ -127,7 +127,7 @@ impl Database {
         Ok(())
     }
 
-    // ── File indexing ─────────────────────────────────────────────────────
+    // â”€â”€ File indexing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn index_file(
         &self,
@@ -190,6 +190,9 @@ impl Database {
             size:        row.get::<_, i64>(6)? as u64,
             modified:    row.get(7)?,
             rank:        row.get(8)?,
+            hash:        None,
+            quick_hash:  None,
+            indexed_at:  0,
         })
     }
 
@@ -225,7 +228,7 @@ impl Database {
         Ok(n)
     }
 
-    // ── Phase 4: Semantic AI ──────────────────────────────────────────────
+    // â”€â”€ Phase 4: Semantic AI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn get_files_needing_embedding(&self, limit: usize) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
@@ -398,7 +401,7 @@ impl Database {
         Ok((updated, deleted))
     }
 
-    // ── Search ────────────────────────────────────────────────────────────
+    // â”€â”€ Search â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn search_fts(
         &self,
@@ -443,6 +446,9 @@ impl Database {
                 size:        row.get::<_, i64>(6)? as u64,
                 modified:    row.get(7)?,
                 rank:        row.get(8)?,
+            hash:        None,
+            quick_hash:  None,
+            indexed_at:  0,
             })
         };
 
@@ -459,7 +465,7 @@ impl Database {
         Ok(results)
     }
 
-    // ── Temporal View ─────────────────────────────────────────────────────
+    // â”€â”€ Temporal View â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     pub fn get_recent_files(
         &self,
@@ -602,3 +608,4 @@ fn sanitize_fts_query(q: &str) -> String {
     if in_quote { out.push('"'); }
     out
 }
+

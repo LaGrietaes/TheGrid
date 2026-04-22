@@ -1,190 +1,148 @@
-use crate::models::*;
+﻿use crate::models::*;
 use crate::config::Config;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
 #[derive(Debug)]
 pub enum AppEvent {
-    // ── Tailscale ──────────────────────────────────────────────────────────
-    /// Devices fetched successfully from Tailscale API
+    // Tailscale
     DevicesLoaded(Vec<TailscaleDevice>),
-
-    /// Tailscale API call failed
     DevicesFailed(String),
 
-    // ── Agent (remote THE GRID instance) ──────────────────────────────────
-    /// Ping to a remote agent succeeded
+    // Agent (remote THE GRID instance)
     AgentPingOk(AgentPingResponse),
-
-    /// Ping to a remote agent failed
     AgentPingFailed(String),
-
-    /// Remote file list fetched
     RemoteFilesLoaded(Vec<RemoteFile>),
-
-    /// Remote file list fetch failed
     RemoteFilesFailed(String),
 
-    /// A directory list was fetched from a remote node
     RemoteBrowseLoaded {
         device_id: String,
         path:      PathBuf,
         files:     Vec<RemoteFile>,
     },
-
-    /// A remote directory browse failed
     RemoteBrowseFailed {
         device_id: String,
         error:     String,
     },
+    RemoteConfigUpdated { device_id: String },
+    RemoteConfigFailed  { device_id: String, error: String },
 
-    /// Remote configuration was updated successfully
-    RemoteConfigUpdated {
-        device_id: String,
-    },
+    // Remote Terminal
+    RemoteTerminalCreated { device_id: String, session_id: String },
+    RemoteTerminalFailed  { device_id: String, error: String },
+    RemoteTerminalOutput  { device_id: String, data: Vec<u8> },
 
-    /// Remote configuration update failed
-    RemoteConfigFailed {
-        device_id: String,
-        error:     String,
-    },
-
-    // ── Remote Terminal ────────────────────────────────────────────────────
-    /// Terminal session created
-    RemoteTerminalCreated {
-        device_id:  String,
-        session_id: String,
-    },
-
-    /// Terminal session creation failed
-    RemoteTerminalFailed {
-        device_id: String,
-        error:     String,
-    },
-
-    /// Incoming terminal output
-    RemoteTerminalOutput {
-        device_id: String,
-        data:      Vec<u8>,
-    },
-
-    // ── File Transfer ──────────────────────────────────────────────────────
-    /// A file was sent successfully (queue index, file name)
-    FileSent { queue_idx: usize, name: String },
-
-    /// A file send failed (queue index, error)
-    FileSendFailed { queue_idx: usize, error: String },
-
-    /// A file download completed
-    FileDownloaded { name: String, path: PathBuf },
-
-    /// A file download failed
+    // File Transfer
+    FileSent        { queue_idx: usize, name: String },
+    FileSendFailed  { queue_idx: usize, error: String },
+    FileDownloaded  { name: String, path: PathBuf },
     FileDownloadFailed { name: String, error: String },
 
-    // ── Clipboard ──────────────────────────────────────────────────────────
-    /// Clipboard successfully pushed to remote device
+    // Clipboard
     ClipboardSent,
-
-    /// Clipboard send failed
     ClipboardSendFailed(String),
-
-    /// Incoming clipboard from a remote device
     ClipboardReceived(ClipboardEntry),
-
-    /// A file was received by the local agent
     FileReceived { name: String, size: u64 },
 
-    // ── Config ─────────────────────────────────────────────────────────────
-    /// Config validated and saved
+    // Config
     SetupComplete(Config),
-
-    /// Config validation failed
     SetupFailed(String),
 
-    // ── Filesystem Watcher ─────────────────────────────────────────────────
-    /// One or more files changed in a watched directory.
+    // Filesystem Watcher
     FileSystemChanged {
-        paths:  Vec<PathBuf>,
+        paths:   Vec<PathBuf>,
         summary: String,
     },
-
-    /// The filesystem watcher encountered a fatal error
     FileWatcherError(String),
 
-    // ── Phase 3: File Index ────────────────────────────────────────────────
+    // Phase 3: File Index
     IndexProgress {
         scanned: u64,
         total:   u64,
         current: String,
+        ext:     Option<String>,
+        estimated_total: bool,
     },
 
     /// Incoming request from a remote node for an index sync.
     SyncRequest {
-        after: i64,
-        response_tx: mpsc::Sender<Vec<FileSearchResult>>,
+        after:            i64,
+        requester_device: Option<String>,
+        response_tx:      mpsc::Sender<SyncDelta>,
     },
 
-    /// Index synchronization completed.
-    SyncComplete {
-        device_id:   String,
-        files_added: usize,
-    },
+    SyncComplete { device_id: String, files_added: usize },
+    SyncFailed   { device_id: String, error: String },
 
-    /// Index synchronization failed.
-    SyncFailed {
+    SyncHealthUpdated {
         device_id: String,
-        error:     String,
+        metrics:   SyncHealthMetrics,
     },
 
-    /// Semantic search engine is initialized.
     SemanticReady,
-
-    /// Semantic initialization failed.
     SemanticFailed(String),
 
-    /// Progress of the local background embedding generator.
-    EmbeddingProgress {
-        indexed: usize,
-        total:   usize,
-    },
+    EmbeddingProgress { indexed: usize, total: usize },
+    HashingProgress   { hashed: usize,  total: usize },
 
-    /// A full directory scan completed.
-    IndexComplete {
-        device_id:   String,
-        files_added: u64,
-        duration_ms: u64,
-    },
+    IndexComplete { device_id: String, files_added: u64, duration_ms: u64 },
+    IndexUpdated  { paths_updated: usize },
 
-    /// An incremental index update.
-    IndexUpdated {
-        paths_updated: usize,
-    },
-
-    /// Search results are ready.
     SearchResults(Vec<FileSearchResult>),
+    DuplicatesFound(Vec<(String, u64, Vec<FileSearchResult>)>),
 
-    /// Telemetry snapshot from a remote THE GRID agent.
     TelemetryUpdate {
-        device_id:  String,
-        telemetry:  NodeTelemetry,
+        device_id: String,
+        ip:        Option<String>,
+        telemetry: NodeTelemetry,
     },
 
-    /// Wake-on-LAN magic packet was sent.
-    WolSent { device_name: String, target_mac: String },
-
-    /// Wake-on-LAN failed.
+    WolSent   { device_name: String, target_mac: String },
     WolFailed { reason: String },
 
-    /// Temporal view data loaded.
     TemporalLoaded(Vec<TemporalEntry>),
 
-    // ── Status ─────────────────────────────────────────────────────────────
+    /// Incoming AI embed request from a remote node via AgentServer.
+    RemoteAiEmbedRequest {
+        text:        String,
+        response_tx: mpsc::Sender<Vec<f32>>,
+    },
+
+    /// Incoming AI semantic search request from a remote node via AgentServer.
+    RemoteAiSearchRequest {
+        query:       String,
+        k:           usize,
+        response_tx: mpsc::Sender<Vec<(i64, f32)>>,
+    },
+
+    // Status
     Status(String),
 
-    // ── UI ─────────────────────────────────────────────────────────────────
+    // UI
     RequestRefresh,
     OpenSettings,
 
     // ADB Mirroring Preparation
     EnableAdb { ip: String, api_key: String },
+
+    // RDP Support
+    EnableRdp  { ip: String, device_id: String },
+    RdpEnabled { device_id: String },
+    RdpFailed  { device_id: String, error: String },
+
+    // AI Lifecycle
+    RefreshAiServices,
+
+    // Preview
+    RequestFilePreview(FileSearchResult),
+    FilePreviewLoaded  { file_id: i64, content: String, kind: PreviewKind },
+
+    // File Manager Operations
+    DeleteFiles { device_id: String, paths: Vec<String> },
+    RenameFile  { device_id: String, old_path: String, new_name: String },
+    MoveFiles   { device_id: String, paths: Vec<String>, dest_dir: String },
+
+    // Phase 4: Persistence & Idle
+    UserIdle(bool),
+    RequestIdleWork,
 }

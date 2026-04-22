@@ -1,5 +1,5 @@
-use anyhow::Result;
-use std::path::{Path, PathBuf};
+﻿use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use thegrid_core::{AppEvent, Config, Database, FileWatcher};
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
             Arc::new(Mutex::new(d))
         }
         Err(e) => {
-            log::error!("Failed to open database: {} — using in-memory fallback", e);
+            log::error!("Failed to open database: {} â€” using in-memory fallback", e);
             Arc::new(Mutex::new(
                 Database::open(":memory:").expect("In-memory DB must always work")
             ))
@@ -67,12 +67,13 @@ fn main() -> Result<()> {
 
     // 3. Start Agent Server (Port 8080 by default)
     let transfers_dir = config.effective_transfers_dir();
+    let config_arc = Arc::new(Mutex::new(config.clone()));
     let mut agent = AgentServer::new(
         config.agent_port,
         config.api_key.clone(),
         transfers_dir.clone(),
         tx.clone(),
-        config.clone()
+        config_arc.clone()
     );
 
     // If we have an API key, enable Tailscale trust bypass
@@ -108,16 +109,16 @@ fn main() -> Result<()> {
         // Drain events
         while let Ok(event) = rx.try_recv() {
             match event {
-                AppEvent::SyncRequest { after, response_tx } => {
+                AppEvent::SyncRequest { after, requester_device: _, response_tx } => {
                     log::info!("Incoming sync request (after timestamp: {})", after);
                     if let Ok(guard) = db.lock() {
                         match guard.get_files_after(after) {
                             Ok(results) => {
-                                let _ = response_tx.send(results);
+                                let _ = response_tx.send(thegrid_core::SyncDelta { files: results, tombstones: vec![] });
                             }
                             Err(e) => {
                                 log::error!("Failed to query files for sync: {}", e);
-                                let _ = response_tx.send(vec![]);
+                                let _ = response_tx.send(thegrid_core::SyncDelta { files: vec![], tombstones: vec![] });
                             }
                         }
                     }
@@ -162,3 +163,5 @@ fn main() -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
+
+
