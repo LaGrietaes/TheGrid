@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
@@ -253,19 +253,18 @@ pub struct FileSearchResult {
     pub ext: Option<String>,
     pub size: u64,
     pub modified: Option<i64>,
-    #[serde(default)]
     pub hash: Option<String>,
-    #[serde(default)]
     pub quick_hash: Option<String>,
-    #[serde(default)]
     pub indexed_at: i64,
+    #[serde(default)]
+    pub detected_by: DetectionSource,
     pub rank: Option<f64>,
 }
 
 impl FileSearchResult {
     pub fn display_path(&self) -> String {
         format!(
-            "{} / {}",
+            "{} › {}",
             self.device_name,
             self.path
                 .parent()
@@ -274,71 +273,6 @@ impl FileSearchResult {
                 .unwrap_or_default()
         )
     }
-}
-
-/// A delta of file index changes sent in response to a sync request.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SyncDelta {
-    #[serde(default)]
-    pub files: Vec<FileSearchResult>,
-    #[serde(default)]
-    pub tombstones: Vec<FileTombstone>,
-}
-
-/// Physical disk/partition info.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DriveInfo {
-    pub name: String,
-    pub used: u64,
-    pub total: u64,
-    pub kind: Option<String>,
-}
-
-/// Physical RAM module info.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RamModule {
-    pub slot: String,
-    pub capacity: u64,
-    pub speed_mhz: Option<u32>,
-    pub configured_speed_mhz: Option<u32>,
-    pub memory_type: Option<String>,
-    pub form_factor: Option<String>,
-    pub latency_cl: Option<u32>,
-    pub manufacturer: Option<String>,
-    pub part_number: Option<String>,
-}
-
-/// GPU device info.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct GpuDevice {
-    pub name: String,
-    #[serde(default)]
-    pub is_discrete: bool,
-    #[serde(default)]
-    pub is_integrated: bool,
-    #[serde(default)]
-    pub is_shared: bool,
-    #[serde(default)]
-    pub is_rtx: bool,
-    #[serde(default)]
-    pub ai_capable: bool,
-    pub vendor: Option<String>,
-    pub bus_type: Option<String>,
-    pub vram_type: Option<String>,
-    pub gpu_pct: Option<f32>,
-    pub mem_used: Option<u64>,
-    pub mem_total: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct DeviceCapabilities {
-    pub ai_models: Vec<String>,
-    pub has_camera: bool,
-    pub has_microphone: bool,
-    pub has_speakers: bool,
-    pub drives: Vec<DriveInfo>,
-    pub has_rdp: bool,
-    pub has_file_access: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -379,10 +313,64 @@ pub struct NodeTelemetry {
     pub ai_tokens_per_sec: Option<f32>,
     pub ai_thoughts: Option<String>,
     pub capabilities: DeviceCapabilities,
+    /// Network throughput in bytes/sec (last sample interval)
     #[serde(default)]
     pub net_rx_bps: Option<u64>,
     #[serde(default)]
     pub net_tx_bps: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GpuDevice {
+    pub name: String,
+    #[serde(default)]
+    pub is_discrete: bool,
+    #[serde(default)]
+    pub is_integrated: bool,
+    #[serde(default)]
+    pub is_shared: bool,
+    #[serde(default)]
+    pub is_rtx: bool,
+    #[serde(default)]
+    pub ai_capable: bool,
+    pub vendor: Option<String>,
+    pub bus_type: Option<String>,
+    pub vram_type: Option<String>,
+    pub gpu_pct: Option<f32>,
+    pub mem_used: Option<u64>,
+    pub mem_total: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RamModule {
+    pub slot: String,
+    pub capacity: u64,
+    pub speed_mhz: Option<u32>,
+    pub configured_speed_mhz: Option<u32>,
+    pub memory_type: Option<String>,
+    pub form_factor: Option<String>,
+    pub latency_cl: Option<u32>,
+    pub manufacturer: Option<String>,
+    pub part_number: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DriveInfo {
+    pub name: String,
+    pub used: u64,
+    pub total: u64,
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeviceCapabilities {
+    pub ai_models: Vec<String>,
+    pub has_camera: bool,
+    pub has_microphone: bool,
+    pub has_speakers: bool,
+    pub drives: Vec<DriveInfo>,
+    pub has_rdp: bool,
+    pub has_file_access: bool,
 }
 
 impl NodeTelemetry {
@@ -423,8 +411,7 @@ impl IndexStats {
         self.scanning = true;
         self.scan_progress = 0;
         self.scan_total = 0;
-        self.scan_start_ts = Some(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64);
+        self.scan_start_ts = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64);
         self.scan_eta_secs = None;
         self.last_progress_ts = None;
         self.last_progress_scanned = 0;
@@ -462,43 +449,72 @@ impl TemporalEventKind {
             Self::Deleted  => "DELETED",
         }
     }
+    pub fn glyph(&self) -> &'static str {
+        match self {
+            Self::Created  => "⊕",
+            Self::Modified => "⊙",
+            Self::Deleted  => "⊘",
+        }
+    }
 }
 
-/// Sync health observability metrics.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SyncHealthMetrics {
-    pub observed_at:    i64,
-    pub last_sync_at:   Option<i64>,
-    pub sync_age_secs:  Option<u64>,
-    pub tombstone_count: u64,
-    pub sync_failures:  u64,
-}
-
-/// Kind of preview content for a file.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum PreviewKind {
-    Text,
-    Image,
-    Hex,
-    Unsupported,
-}
-
-/// A rule for auto-tagging/categorising files.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRule {
-    pub id:        i64,
-    pub name:      String,
-    pub pattern:   String,
-    pub project:   Option<String>,
-    pub tag:       Option<String>,
+    pub id: i64,
+    pub name: String,
+    pub pattern: String,
+    pub project: Option<String>,
+    pub tag: Option<String>,
     pub is_active: bool,
 }
 
-/// A tombstone representing a deleted file in the sync delta.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FileTombstone {
-    pub device_id: String,
-    pub path: std::path::PathBuf,
-    pub deleted_at: i64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleMatch {
+    pub rule_id: i64,
+    pub file_id: i64,
+    pub tag: Option<String>,
+    pub project: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub enum PreviewKind {
+    #[default]
+    None,
+    Text,
+    Image,
+    Pdf,
+    UnSupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Category {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SmartFilterType {
+    Extension(String),
+    MinSize(u64),
+    MaxSize(u64),
+    ModifiedAfter(chrono::DateTime<chrono::Utc>),
+    ModifiedBefore(chrono::DateTime<chrono::Utc>),
+    Project(String),
+    Category(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SmartRule {
+    pub id: String,
+    pub name: String,
+    pub filters: Vec<SmartFilterType>,
+}
