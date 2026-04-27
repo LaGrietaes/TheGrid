@@ -88,6 +88,34 @@ pub struct Config {
     /// Phase 3: User-defined Categories
     #[serde(default)]
     pub categories: Vec<crate::models::Category>,
+
+    /// Enable staging duplicates/canonicals into a local Drive buffer workspace.
+    #[serde(default = "Config::default_true")]
+    pub drive_buffer_enabled: bool,
+
+    /// Soft quota used for UI/planning (subscription-backed target capacity).
+    #[serde(default = "Config::default_drive_buffer_quota_tb")]
+    pub drive_buffer_quota_tb: u32,
+
+    /// Remote path used by upload tools like rclone, e.g. "gdrive:THEGRID-BUFFER".
+    #[serde(default)]
+    pub drive_buffer_remote: Option<String>,
+
+    /// Local staging folder for preparing categorized files + manifests before upload.
+    #[serde(default)]
+    pub drive_buffer_root: Option<PathBuf>,
+
+    /// User-defined indexing overrides (path patterns → actions).
+    #[serde(default)]
+    pub indexing_overrides: Vec<crate::models::IndexingOverride>,
+
+    /// Allow delegating compute tasks to other devices on the Tailnet.
+    #[serde(default = "Config::default_true")]
+    pub allow_compute_borrowing: bool,
+
+    /// Max number of compute tasks this device will handle simultaneously.
+    #[serde(default = "Config::default_max_parallel_compute")]
+    pub max_parallel_compute_tasks: u8,
 }
 
 impl Default for Config {
@@ -120,6 +148,13 @@ impl Default for Config {
                 crate::models::Category { id: "c1".into(), name: "DOCUMENTS".into(), icon: "📄".into() },
                 crate::models::Category { id: "c2".into(), name: "MEDIA".into(), icon: "🎞".into() },
             ],
+            drive_buffer_enabled: true,
+            drive_buffer_quota_tb: Self::default_drive_buffer_quota_tb(),
+            drive_buffer_remote: Some("gdrive:THEGRID-BUFFER".to_string()),
+            drive_buffer_root: None,
+            indexing_overrides: Vec::new(),
+            allow_compute_borrowing: true,
+            max_parallel_compute_tasks: Self::default_max_parallel_compute(),
         }
     }
 }
@@ -140,8 +175,14 @@ impl Config {
     fn default_embedding_parallel_requests() -> usize {
         3
     }
+    fn default_drive_buffer_quota_tb() -> u32 {
+        15
+    }
     fn default_device_type() -> String {
         "Desktop".to_string()
+    }
+    fn default_max_parallel_compute() -> u8 {
+        2
     }
 
     /// Returns the path to the config file, creating the directory if needed.
@@ -207,5 +248,16 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("thegrid")
             .join("transfers")
+    }
+
+    /// Returns the local staging directory used for Drive buffer exports.
+    pub fn effective_drive_buffer_dir(&self) -> PathBuf {
+        if let Some(d) = &self.drive_buffer_root {
+            return d.clone();
+        }
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("thegrid")
+            .join("drive-buffer")
     }
 }

@@ -22,6 +22,10 @@ const ANSI_RESET: &str = "\x1B[0m";
 const ANSI_BOLD: &str = "\x1B[1m";
 const ANSI_DIM: &str = "\x1B[2m";
 const ANSI_GREEN: &str = "\x1B[32m";
+const ANSI_GREEN_BRIGHT: &str = "\x1B[92m"; // live-node indicator (◉ LIVE)
+const ANSI_YELLOW: &str = "\x1B[33m";
+const ANSI_RED: &str = "\x1B[31m";
+const ANSI_CYAN: &str = "\x1B[36m";
 const ANSI_WHITE: &str = "\x1B[37m";
 
 // S2-C1: command registry metadata used by help output and TUI hints.
@@ -331,8 +335,9 @@ struct TuiState {
     ping_ok: u64,
     ping_fail: u64,
     command_history: VecDeque<String>,
-    // S2-C3: sync health snapshot keyed by device_id
     sync_health: std::collections::HashMap<String, SyncHealthMetrics>,
+    /// Last known ping result per IP: true = ok, false = failed, absent = untested.
+    node_status: std::collections::HashMap<String, bool>,
     dirty: bool,
 }
 
@@ -347,6 +352,7 @@ impl TuiState {
             ping_fail: 0,
             command_history: VecDeque::with_capacity(128),
             sync_health: std::collections::HashMap::new(),
+            node_status: std::collections::HashMap::new(),
             dirty: true,
         }
     }
@@ -374,6 +380,15 @@ impl TuiState {
 }
 
 fn term_width() -> usize {
+    // Explicit override: useful for SSH sessions, tmux panes, or CI.
+    // --width arg in main() sets this env var before threads start.
+    if let Ok(v) = std::env::var("THEGRID_WIDTH") {
+        if let Ok(w) = v.parse::<usize>() {
+            if w >= 40 {
+                return w;
+            }
+        }
+    }
     terminal_size()
         .map(|(Width(w), _)| w as usize)
         .or_else(|| {
@@ -381,15 +396,37 @@ fn term_width() -> usize {
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
         })
-        .map(|v| v.max(80))
         .unwrap_or(110)
 }
 
-fn status_color(_status: &str) -> &'static str {
-    ANSI_GREEN
+fn status_color(status: &str) -> &'static str {
+    let s = status.to_ascii_lowercase();
+    if s.contains("fail") || s.contains("error") || s.contains("refused")
+        || s.contains("timeout") || s.contains("unreachable")
+    {
+        ANSI_RED
+    } else if s.contains("warn") || s.contains("mismatch") || s.contains("retry") {
+        ANSI_YELLOW
+    } else {
+        ANSI_GREEN
+    }
 }
 
-fn log_color(_line: &str) -> &'static str {
+// Routes log-line color by the icon that appears after the timestamp.
+// Format: "HH:MM:SS ICON  LABEL      message"
+fn log_color(line: &str) -> &'static str {
+    if line.contains(" ✗ ") {
+        return ANSI_RED;
+    }
+    if line.contains(" ⚠ ") || line.contains(" ! ") {
+        return ANSI_YELLOW;
+    }
+    if line.contains(" ⇄ ") || line.contains(" Δ ") {
+        return ANSI_CYAN;
+    }
+    if line.contains(" · ") || line.contains(" ℹ ") {
+        return ANSI_DIM;
+    }
     ANSI_WHITE
 }
 
@@ -400,6 +437,56 @@ fn pulse_frame(elapsed: Duration) -> &'static str {
         2 => "◶",
         _ => "◵",
     }
+}
+
+// ── TUI width tiers ────────────────────────────────────────────────────────
+// WIDE     : left panel ≥ 46 cols  (terminal ≥ ~99 cols)  → 5-cell grid logo
+// STANDARD : left panel ≥ 28 cols  (terminal ≥ ~63 cols)  → 3-cell grid logo
+// NARROW   : left panel  < 28 cols                        → single-line mark
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TuiTier { Wide, Standard, Narrow }
+
+fn tui_tier(left_w: usize) -> TuiTier {
+    if left_w >= 46 { TuiTier::Wide }
+    else if left_w >= 28 { TuiTier::Standard }
+    else { TuiTier::Narrow }
+}
+
+// Returns (logo_lines, logo_row_count).
+// Logo rows get ANSI_GREEN coloring; the count tells render_tui where branding ends.
+fn build_logo(tier: TuiTier, pulse: &str) -> (Vec<String>, usize) {
+    match tier {
+        TuiTier::Wide => (vec![
+            format!("{} ╔═══╦═══╦═══╦═══╦═══╗", pulse),
+            "   ║ ◈ ║ ◈ ║ ◈ ║ ◈ ║ ◈ ║".to_string(),
+            "   ╠═══╬═══╬═══╬═══╬═══╣".to_string(),
+            "   ║ ◈ ║ ◈ ║ ◈ ║ ◈ ║ ◈ ║".to_string(),
+            "   ╚═══╩═══╩═══╩═══╩═══╝".to_string(),
+            "    T H E   G R I D".to_string(),
+        ], 6),
+        TuiTier::Standard => (vec![
+            format!("{} ╔═══╦═══╦═══╗", pulse),
+            "   ║ ◈ ║ ◈ ║ ◈ ║".to_string(),
+            "   ╠═══╬═══╬═══╣".to_string(),
+            "   ║ ◈ ║ ◈ ║ ◈ ║".to_string(),
+            "   ╚═══╩═══╩═══╝".to_string(),
+            "   T H E   G R I D".to_string(),
+        ], 6),
+        TuiTier::Narrow => (vec![
+            format!("{} ◈ THE GRID ◈", pulse),
+        ], 1),
+    }
+}
+
+// Prints a full-width section header, e.g.: ╠══[MESH]══════════╣
+fn print_section_header(label: &str, width: usize) {
+    let inner_w = width.saturating_sub(2); // subtract ╠ and ╣
+    let label_block = format!("[{}]", label);
+    let right_fill = inner_w.saturating_sub(label_block.len() + 3);
+    println!(
+        "{ANSI_GREEN}╠══{label_block}{fill}╣{ANSI_RESET}",
+        fill = "═".repeat(right_fill),
+    );
 }
 
 fn render_labeled_line(
@@ -444,124 +531,160 @@ fn render_tui(state: &TuiState, device_name: &str, port: u16) {
 
     let uptime = state.started_at.elapsed().as_secs();
     let pulse = pulse_frame(state.started_at.elapsed());
-    // S2-C3: build sync health summary line(s)
-    let sync_summary: Vec<String> = {
-        let mut lines = Vec::new();
-        for (id, h) in &state.sync_health {
-            let age = h.sync_age_secs.map(|s| format!("{}s ago", s)).unwrap_or_else(|| "never".to_string());
-            lines.push(format!("Sync {}: age={} tombs={} fail={}", id, age, h.tombstone_count, h.sync_failures));
-        }
-        lines
-    };
+    let tier = tui_tier(left_w);
 
-    let mut left = vec![
-        format!("{} ████████╗██╗  ██╗███████╗ ██████╗ ██████╗ ██╗██████╗", pulse),
-        "   ╚══██╔══╝██║  ██║██╔════╝██╔════╝ ██╔══██╗██║██╔══██╗".to_string(),
-        "      ██║   ███████║█████╗  ██║  ███╗██████╔╝██║██║  ██║".to_string(),
-        "      ██║   ██╔══██║██╔══╝  ██║   ██║██╔══██╗██║██║  ██║".to_string(),
-        "      ██║   ██║  ██║███████╗╚██████╔╝██║  ██║██║██████╔╝".to_string(),
-        "      ╚═╝   ╚═╝  ╚═╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝╚═════╝".to_string(),
-        format!("NODE v{}", env!("CARGO_PKG_VERSION")),
-        SIGNATURE_LINE.to_string(),
-        format!("Device: {device_name}"),
-        format!("Agent Port: {port}"),
-        format!("Uptime: {}s", uptime),
-        format!("Ping OK/Fail: {}/{}", state.ping_ok, state.ping_fail),
-    ];
-    if sync_summary.is_empty() {
-        left.push("Sync: no data yet".to_string());
-    } else {
-        left.extend(sync_summary.into_iter().take(3));
-    }
-    left.push(format!("Last: {}", state.last_status));
+    // ── Left panel: branded logo + node metadata ──────────────────────────────
+    let (mut left, logo_rows) = build_logo(tier, pulse);
+    left.push(format!("NODE v{}", env!("CARGO_PKG_VERSION")));
+    left.push(SIGNATURE_LINE.to_string());
+    left.push(format!("Device : {}", device_name));
+    left.push(format!("Port   : {}", port));
+    left.push(format!("Uptime : {}s", uptime));
+    left.push(format!("Ping   : {}/{} ok/fail", state.ping_ok, state.ping_fail));
+    left.push(format!("Last   : {}", state.last_status));
 
-    let mut logo_rows = 7usize;
-    // Keep key runtime fields near the bottom when width is tight.
-    if left_w < 52 {
-        logo_rows = 1;
-        left = vec![
-            format!("{} TG NODE v{}", pulse, env!("CARGO_PKG_VERSION")),
-            "Powered and Designed by: sinergias.lagrieta.es".to_string(),
-            format!("Device: {device_name}"),
-            format!("Agent Port: {port}"),
-            format!("Uptime: {}s", uptime),
-            format!("Ping OK/Fail: {}/{}", state.ping_ok, state.ping_fail),
-            format!("Last: {}", state.last_status),
-        ];
-    }
-
+    // ── Right panel: commands (left sub-col) + dev tools (right sub-col) ─────
     let mut commands = vec!["COMMANDS".to_string()];
     commands.extend(command_hint_lines(8));
-    commands.push("CONNECTED".to_string());
 
-    let mut dev_commands = vec![
-        "DEV COMMANDS".to_string(),
-        "  gitupdate".to_string(),
-        "  pull+build+restart".to_string(),
-    ];
+    let mut dev_commands = vec!["DEV TOOLS".to_string(), "  gitupdate".to_string()];
+    dev_commands.push("  pull+build+restart".to_string());
     if let Some(refs) = git_branch_head() {
         dev_commands.push(format!("  {}", refs));
     } else {
-        dev_commands.push("  git: unavailable".to_string());
+        dev_commands.push("  git: —".to_string());
     }
-    dev_commands.push("  git status (shell)".to_string());
 
+    commands.push("CONNECTED".to_string());
     for (idx, (name, ip)) in state.devices.iter().take(5).enumerate() {
-        commands.push(format!("  {}. {} ({})", idx + 1, name, ip));
+        let dot = match state.node_status.get(ip.as_str()) {
+            Some(true)  => "◉",
+            Some(false) => "◌",
+            None        => "◈",
+        };
+        commands.push(format!("  {} {}. {} ({})", dot, idx + 1, trim_fit(name, 12), ip));
     }
     if state.devices.is_empty() {
-        commands.push("  none yet (run: devices)".to_string());
+        commands.push("  none — run: devices".to_string());
     }
 
-    let cmd_w = (right_w.saturating_sub(3)) / 2;
-    let dev_w = right_w.saturating_sub(3).saturating_sub(cmd_w);
-    let right_lines = commands.len().max(dev_commands.len());
-
-    let upper_lines = left.len().max(right_lines);
+    // ── Top border ────────────────────────────────────────────────────────────
     println!(
         "{ANSI_GREEN}╔{}╦{}╗{ANSI_RESET}",
         "═".repeat(left_w + 2),
         "═".repeat(right_w + 2)
     );
+
+    // ── Upper rows (logo + metadata | commands + dev tools) ───────────────────
+    let cmd_w = (right_w.saturating_sub(3)) / 2;
+    let dev_w = right_w.saturating_sub(3).saturating_sub(cmd_w);
+    let upper_lines = left.len().max(commands.len().max(dev_commands.len()));
+    let status_idx = left.len().saturating_sub(1);
+
     for i in 0..upper_lines {
         let l = left.get(i).map_or("", |s| s.as_str());
         let c = commands.get(i).map_or("", |s| s.as_str());
         let d = dev_commands.get(i).map_or("", |s| s.as_str());
         let r = format!("{} │ {}", trim_fit(c, cmd_w), trim_fit(d, dev_w));
+        let left_color  = if i < logo_rows { ANSI_GREEN } else { ANSI_WHITE };
         let right_color = if i == 0 { ANSI_BOLD } else { ANSI_WHITE };
-        let left_color = if i < logo_rows { ANSI_GREEN } else { ANSI_WHITE };
-        let status_idx = left.len().saturating_sub(1);
         if i == status_idx {
+            let sc = status_color(&state.last_status);
             println!(
-                "{ANSI_GREEN}║{ANSI_RESET} {status_c}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
+                "{ANSI_GREEN}║{ANSI_RESET} {sc}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {right_color}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
                 trim_fit(l, left_w),
-                right_color,
                 trim_fit(&r, right_w),
-                status_c = status_color(&state.last_status),
             );
         } else {
             render_labeled_line(l, &r, left_w, right_w, left_color, right_color);
         }
     }
-    println!("{ANSI_GREEN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
 
-    let max_logs = 12usize;
+    // ── MESH STATUS section (only when there is data and enough width) ────────
+    let has_mesh = !state.sync_health.is_empty() || !state.devices.is_empty();
+    if has_mesh && lower_w >= 40 {
+        print_section_header("MESH", width);
+
+        // Sort for deterministic display order.
+        let mut mesh_entries: Vec<(&String, &SyncHealthMetrics)> = state.sync_health.iter().collect();
+        mesh_entries.sort_by_key(|(id, _)| id.as_str());
+
+        let mut shown: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+        for (id, h) in mesh_entries.iter().take(5) {
+            shown.insert(id.as_str());
+            let age_s = h.sync_age_secs
+                .map(|s| format!("{:>5}s", s))
+                .unwrap_or_else(|| "    —".to_string());
+            let is_live = h.sync_age_secs.map(|s| s < 120).unwrap_or(false);
+            // Build the main part of the line (plain, for trim_fit width accounting)
+            let body = format!(
+                " ⇄  {:16}  age {}  tombs {:>3}  fail {:>2}  ",
+                trim_fit(id, 16), age_s, h.tombstone_count, h.sync_failures,
+            );
+            // Status marker — bright green for live, dim for stale
+            let (status_col, dot, state_txt) = if is_live {
+                (ANSI_GREEN_BRIGHT, "◉", "LIVE ")
+            } else {
+                (ANSI_DIM, "◌", "STALE")
+            };
+            let body_fit = trim_fit(&body, lower_w.saturating_sub(7));
+            println!(
+                "{ANSI_GREEN}║{ANSI_RESET} {ANSI_CYAN}{body_fit}{ANSI_RESET}{status_col}{dot} {state_txt}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
+            );
+        }
+
+        // Devices not yet in sync_health: show them as pending.
+        for (name, ip) in state.devices.iter().take(5) {
+            if shown.contains(name.as_str()) { continue; }
+            let dot = match state.node_status.get(ip.as_str()) {
+                Some(true)  => "◉",
+                Some(false) => "◌",
+                None        => "◈",
+            };
+            let line = format!(
+                " {}  {:16}  ({})  pending sync",
+                dot, trim_fit(name, 16), ip,
+            );
+            println!(
+                "{ANSI_GREEN}║{ANSI_RESET} {ANSI_DIM}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
+                trim_fit(&line, lower_w),
+            );
+        }
+
+        if state.sync_health.is_empty() && state.devices.is_empty() {
+            println!(
+                "{ANSI_GREEN}║{ANSI_RESET} {ANSI_DIM}{:<lower_w$}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
+                "  no nodes — run: devices",
+            );
+        }
+    }
+
+    // ── LOG section ───────────────────────────────────────────────────────────
+    print_section_header("LOG", width);
+
+    let max_logs = 10usize;
     let start = state.recent_logs.len().saturating_sub(max_logs);
     for line in state.recent_logs.iter().skip(start) {
         println!(
             "{ANSI_GREEN}║{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
             log_color(line),
-            trim_fit(line, lower_w)
+            trim_fit(line, lower_w),
         );
     }
-    for _ in state.recent_logs.iter().skip(start).count()..max_logs {
-        println!("{ANSI_GREEN}║{ANSI_RESET} {} {ANSI_GREEN}║{ANSI_RESET}", " ".repeat(lower_w));
+    let rendered = state.recent_logs.len().saturating_sub(start);
+    for _ in rendered..max_logs {
+        println!(
+            "{ANSI_GREEN}║{ANSI_RESET} {:<lower_w$} {ANSI_GREEN}║{ANSI_RESET}",
+            "",
+        );
     }
 
+    // ── Hint + prompt ─────────────────────────────────────────────────────────
     println!("{ANSI_GREEN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
     println!(
         "{ANSI_GREEN}║{ANSI_RESET} {ANSI_DIM}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
-        trim_fit("Type command then Enter (help for list, history for recall)", lower_w)
+        trim_fit("Type command then Enter  (help · history · quit)", lower_w),
     );
     println!("{ANSI_GREEN}╚{}╝{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
     print!("{ANSI_BOLD}{ANSI_GREEN}> {ANSI_RESET}");
@@ -945,6 +1068,16 @@ fn main() -> Result<()> {
             "--force-tui" | "--froce-tui" => {
                 force_tui = true;
             }
+            "--width" => {
+                if i + 1 < args.len() {
+                    if let Ok(w) = args[i + 1].parse::<usize>() {
+                        if w >= 40 {
+                            std::env::set_var("THEGRID_WIDTH", w.to_string());
+                        }
+                    }
+                    i += 1;
+                }
+            }
             _ => {
                 log::warn!("Unknown argument: {}", args[i]);
             }
@@ -980,6 +1113,21 @@ fn main() -> Result<()> {
         emit(&ui_state, tui_mode, "ℹ", "BOOT", "TUI mode active");
     }
     emit(&ui_state, tui_mode, "✓", "BOOT", "Configuration loaded");
+
+    // Startup config validation — catch common misconfigurations early.
+    if config.api_key.is_empty() {
+        emit(&ui_state, tui_mode, "⚠", "CONFIG",
+            "api_key is empty — device discovery and Tailscale trust will fail. Set it in config.json");
+    } else if !config.api_key.starts_with("tskey-") {
+        emit(&ui_state, tui_mode, "⚠", "CONFIG",
+            format!("api_key prefix unexpected (got: {}) — verify config.json",
+                &config.api_key[..config.api_key.len().min(12)]));
+    }
+    if config.agent_port == 0 {
+        emit(&ui_state, tui_mode, "⚠", "CONFIG",
+            "agent_port is 0 — agent will pick a random port. Set it explicitly in config.json");
+    }
+
     if let Ok(v) = std::env::var(LAST_UPDATE_ENV) {
         if let Some((from, to)) = v.split_once(':') {
             emit(
@@ -1214,6 +1362,7 @@ fn main() -> Result<()> {
                     if manual {
                         if let Ok(mut s) = ui_state.lock() {
                             s.ping_ok += 1;
+                            s.node_status.insert(ip.clone(), true);
                         }
                         emit(&ui_state, tui_mode, "✓", "PING", format!("{} OK (auth={})", ip, response.authorized));
                     }
@@ -1222,6 +1371,7 @@ fn main() -> Result<()> {
                     if manual {
                         if let Ok(mut s) = ui_state.lock() {
                             s.ping_fail += 1;
+                            s.node_status.insert(ip.clone(), false);
                         }
                         emit(&ui_state, tui_mode, "⚠", "PING", format!("{} failed: {}", ip, error));
                     }

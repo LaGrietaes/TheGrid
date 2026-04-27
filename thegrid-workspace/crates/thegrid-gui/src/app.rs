@@ -193,6 +193,42 @@ pub enum NodeStatus {
     GridActive    // Agent is responding
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GridScanProgress {
+    pub machine_id: String,
+    pub step: String,
+    pub current_drive: String,
+    pub current_sector: String,
+    pub scanned: u64,
+    pub total: u64,
+    pub pending_sectors: u64,
+    pub updated_at: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CloudPipelineProgress {
+    pub stage: String,
+    pub step: String,
+    pub done: u64,
+    pub total: u64,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub target: String,
+    pub updated_at: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NodeCrosscheckSummary {
+    pub node_id: String,
+    pub groups: u64,
+    pub files: u64,
+    pub bytes: u64,
+    pub known_devices: u64,
+    pub updated_at: i64,
+}
+
 pub struct TheGridApp {
     // ── State machine ─────────────────────────────────────────────────────────
     screen: Screen,
@@ -230,6 +266,11 @@ pub struct TheGridApp {
 
     // ── Phase 2: File Manager ─────────────────────────────────────────────────
     file_manager: FileManagerState,
+    duplicate_groups: Vec<(String, u64, Vec<FileSearchResult>)>,
+    duplicate_last_scan: Option<i64>,
+    grid_scan_progress: HashMap<String, GridScanProgress>,
+    cloud_pipeline_progress: CloudPipelineProgress,
+    node_crosscheck: HashMap<String, NodeCrosscheckSummary>,
     
     // ── Phase 3: SQLite index state (UI only) ─────────────────────────────────
     index_stats: IndexStats,
@@ -255,6 +296,9 @@ pub struct TheGridApp {
     semantic_loading:   bool,
     embedding_progress: (usize, usize),
     hashing_progress:   (usize, usize),
+    hashing_eta_secs:   Option<u64>,
+    hashing_rate:       Option<f64>,
+    hashing_last_tick:  Option<std::time::Instant>,
 
     // ── Phase 3: Telemetry cache ──────────────────────────────────────────────
     // key = Tailscale device_id, value = latest NodeTelemetry snapshot
@@ -297,6 +341,16 @@ pub struct TheGridApp {
     idle_notified: bool,
     initial_scan_dispatched: bool,
     release_check_dispatched: bool,
+
+    // ── Phase 4: Device collaboration state ───────────────────────────────────
+    /// Derived GUI state per device_id — drives status dot color and label.
+    device_display_states: HashMap<String, DeviceDisplayState>,
+    /// In-flight compute borrow sessions — drives ComputeBorrowing state.
+    compute_sessions: Vec<ComputeSession>,
+
+    // ── Phase 6: Dedup review ─────────────────────────────────────────────────
+    rich_duplicate_groups: Vec<DuplicateGroup>,
+    dedup_review_state: crate::views::dedup_review::DedupReviewState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -324,6 +378,14 @@ pub struct FileManagerState {
     pub preview_texture: Option<egui::TextureHandle>,
     /// Active SmartRule ID for filtering the current view
     pub active_rule:     Option<String>,
+    pub duplicate_min_size_mb: u64,
+    pub duplicate_ext_filter: String,
+    pub duplicate_path_filter: String,
+    pub duplicate_max_groups: usize,
+    pub duplicate_expanded_groups: std::collections::HashSet<String>,
+    pub duplicate_selected_files: std::collections::HashSet<i64>,
+    pub drive_remote: String,
+    pub drive_last_manifest: Option<std::path::PathBuf>,
 }
 impl Default for FileManagerState {
     fn default() -> Self {
@@ -340,6 +402,14 @@ impl Default for FileManagerState {
             preview_content: None,
             preview_texture: None,
             active_rule:     None,
+            duplicate_min_size_mb: 0,
+            duplicate_ext_filter: String::new(),
+            duplicate_path_filter: String::new(),
+            duplicate_max_groups: 200,
+            duplicate_expanded_groups: std::collections::HashSet::new(),
+            duplicate_selected_files: std::collections::HashSet::new(),
+            drive_remote: "gdrive:THEGRID-BUFFER".to_string(),
+            drive_last_manifest: None,
         }
     }
 }
@@ -481,7 +551,7 @@ impl TheGridApp {
         Self {
             screen:      Screen::Boot,
             boot_start:  std::time::Instant::now(),
-            config,
+            config: config.clone(),
             setup,
             settings,
             devices: Vec::new(),
@@ -501,7 +571,18 @@ impl TheGridApp {
             transfer_log: Vec::new(),
             
             runtime,
-            file_manager: FileManagerState::default(),
+            file_manager: {
+                let mut fm = FileManagerState::default();
+                if let Some(remote) = config.drive_buffer_remote.clone() {
+                    fm.drive_remote = remote;
+                }
+                fm
+            },
+            duplicate_groups: Vec::new(),
+            duplicate_last_scan: None,
+            grid_scan_progress: HashMap::new(),
+            cloud_pipeline_progress: CloudPipelineProgress::default(),
+            node_crosscheck: HashMap::new(),
             index_stats:  IndexStats::default(),
             search:           SearchPanelState::default(),
             search_keystroke: None,
@@ -528,6 +609,9 @@ impl TheGridApp {
             semantic_loading:  true,
             embedding_progress: (0, 0),
             hashing_progress:   (0, 0),
+            hashing_eta_secs:   None,
+            hashing_rate:       None,
+            hashing_last_tick:  None,
             cluster_paths: HashMap::new(),
             cluster_files: HashMap::new(),
             local_hostname,
@@ -539,6 +623,10 @@ impl TheGridApp {
             idle_notified: false,
             initial_scan_dispatched: false,
             release_check_dispatched: false,
+            device_display_states: HashMap::new(),
+            compute_sessions: Vec::new(),
+            rich_duplicate_groups: Vec::new(),
+            dedup_review_state: crate::views::dedup_review::DedupReviewState::default(),
         }
     }
 
@@ -913,6 +1001,17 @@ impl TheGridApp {
     /// Kick off a full directory walk for a newly added watch path.
     fn spawn_index_directory(&mut self, path: PathBuf, device_id: String, device_name: String) {
         self.index_stats.reset_scan();
+        self.grid_scan_progress.insert(device_id.clone(), GridScanProgress {
+            machine_id: device_name.clone(),
+            step: "indexing".to_string(),
+            current_drive: path.to_string_lossy().to_string(),
+            current_sector: path.to_string_lossy().to_string(),
+            scanned: 0,
+            total: 0,
+            pending_sectors: 0,
+            updated_at: chrono::Utc::now().timestamp(),
+            last_error: None,
+        });
         self.runtime.spawn_index_directory(path, device_id, device_name);
     }
 
@@ -954,6 +1053,17 @@ impl TheGridApp {
             }
         }
         for (device_id, ip, hostname) in targets {
+            self.grid_scan_progress.insert(device_id.clone(), GridScanProgress {
+                machine_id: hostname.clone(),
+                step: "syncing".to_string(),
+                current_drive: "remote".to_string(),
+                current_sector: "pulling index delta".to_string(),
+                scanned: 0,
+                total: 0,
+                pending_sectors: 0,
+                updated_at: chrono::Utc::now().timestamp(),
+                last_error: None,
+            });
             self.spawn_sync_node_if_due(device_id, ip, hostname, 45);
         }
     }
@@ -1016,6 +1126,392 @@ impl TheGridApp {
         self.timeline.loading = true;
         let device_filter = self.timeline.device_filter.clone();
         self.runtime.spawn_load_timeline(device_filter);
+    }
+
+    fn enqueue_local_full_drive_index(&mut self) {
+        let local_id = self.config.device_name.clone();
+        let drives = self
+            .telemetry_cache
+            .get(&local_id)
+            .map(|t| t.capabilities.drives.clone())
+            .unwrap_or_default();
+        for drive in drives {
+            let root = PathBuf::from(&drive.name);
+            if !thegrid_core::should_skip_path(&root) {
+                self.grid_scan_progress.insert(local_id.clone(), GridScanProgress {
+                    machine_id: local_id.clone(),
+                    step: "queueing drives".to_string(),
+                    current_drive: root.to_string_lossy().to_string(),
+                    current_sector: "root".to_string(),
+                    scanned: 0,
+                    total: 0,
+                    pending_sectors: 0,
+                    updated_at: chrono::Utc::now().timestamp(),
+                    last_error: None,
+                });
+                self.runtime
+                    .spawn_index_directory(root, local_id.clone(), local_id.clone());
+            }
+        }
+    }
+
+    fn spawn_duplicate_scan(&self, filter: DuplicateScanFilter) {
+        self.runtime.spawn_duplicates_scan_filtered(filter);
+    }
+
+    fn spawn_rich_dedup_delete(&mut self, files: Vec<FileSearchResult>) {
+        let db        = Arc::clone(&self.runtime.db);
+        let tx        = self.event_tx.clone();
+        let local_dev = self.config.device_name.clone();
+        let session   = uuid::Uuid::new_v4().to_string();
+
+        std::thread::spawn(move || {
+            let mut deleted = 0usize;
+            let mut errors  = 0usize;
+
+            for f in &files {
+                let is_local = f.device_id == local_dev;
+
+                if is_local {
+                    if let Err(e) = std::fs::remove_file(&f.path) {
+                        log::warn!("[DedupDelete] remove_file {:?}: {}", f.path, e);
+                        errors += 1;
+                        continue;
+                    }
+                }
+
+                if let Ok(guard) = db.lock() {
+                    let _ = guard.log_deletion(
+                        &session,
+                        &f.path.to_string_lossy(),
+                        &f.device_id,
+                        f.hash.as_deref(),
+                        Some(f.size),
+                        if is_local { "local_remove" } else { "remote_remove_requested" },
+                        Some("dedup_review"),
+                    );
+                    let _ = guard.delete_file_by_id(f.id);
+                }
+                deleted += 1;
+            }
+
+            let msg = if errors > 0 {
+                format!("Dedup: deleted {}, {} error(s)", deleted, errors)
+            } else {
+                format!("Dedup: deleted {} duplicate(s)", deleted)
+            };
+            let _ = tx.send(AppEvent::Status(msg));
+        });
+    }
+
+    fn spawn_delete_duplicate_files(&mut self, files: Vec<(i64, std::path::PathBuf, String)>, filter: DuplicateScanFilter) {
+        let db = Arc::clone(&self.runtime.db);
+        let runtime = Arc::clone(&self.runtime);
+        let tx = self.event_tx.clone();
+        let local_device = self.config.device_name.clone();
+
+        for (id, _, _) in &files {
+            self.file_manager.duplicate_selected_files.remove(id);
+        }
+
+        std::thread::spawn(move || {
+            let mut deleted = 0usize;
+            let mut errors = 0usize;
+
+            for (id, path, device_id) in &files {
+                if device_id == &local_device {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        log::warn!("[Duplicates] Failed to remove {}: {}", path.display(), e);
+                        errors += 1;
+                        continue;
+                    }
+                }
+                if let Ok(guard) = db.lock() {
+                    if let Err(e) = guard.delete_file_by_id(*id) {
+                        log::warn!("[Duplicates] DB delete id={}: {}", id, e);
+                    }
+                }
+                deleted += 1;
+            }
+
+            let _ = tx.send(AppEvent::Status(
+                if errors > 0 {
+                    format!("Deleted {} duplicate(s), {} error(s)", deleted, errors)
+                } else {
+                    format!("Deleted {} duplicate(s)", deleted)
+                }
+            ));
+
+            runtime.spawn_duplicates_scan_filtered(filter);
+        });
+    }
+
+    fn classify_for_buffer(name: &str) -> String {
+        let ext = std::path::Path::new(name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "tif" | "tiff" | "svg" => "images".to_string(),
+            "mp4" | "mkv" | "mov" | "avi" | "webm" | "flv" | "mpeg" | "mpg" => "video".to_string(),
+            "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" => "audio".to_string(),
+            "pdf" | "doc" | "docx" | "txt" | "md" | "odt" => "documents".to_string(),
+            "zip" | "rar" | "7z" | "tar" | "gz" => "archives".to_string(),
+            _ => "other".to_string(),
+        }
+    }
+
+    fn spawn_export_drive_buffer(&self) {
+        let cfg = self.runtime.config.lock().ok().map(|c| c.clone()).unwrap_or_default();
+        let groups = self.duplicate_groups.clone();
+        let tx = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            let _ = tx.send(AppEvent::Status(format!(
+                "cloud_progress:export|prepare|0|{}|0|0|local-buffer",
+                groups.len()
+            )));
+            if !cfg.drive_buffer_enabled {
+                let _ = tx.send(AppEvent::Status("drive_buffer_error:Drive buffer is disabled in config".to_string()));
+                return;
+            }
+
+            if groups.is_empty() {
+                let _ = tx.send(AppEvent::Status("drive_buffer_error:No duplicate groups available. Run duplicate analysis first".to_string()));
+                return;
+            }
+
+            let now = chrono::Utc::now();
+            let session_id = now.format("%Y%m%d_%H%M%S").to_string();
+            let session_root = cfg.effective_drive_buffer_dir().join(&session_id);
+            let staged_root = session_root.join("staged");
+            if let Err(e) = std::fs::create_dir_all(&staged_root) {
+                let _ = tx.send(AppEvent::Status(format!("drive_buffer_error:Failed to create staging folder: {}", e)));
+                return;
+            }
+
+            let mut entries: Vec<DriveBufferEntry> = Vec::new();
+            let mut staged_total_bytes = 0u64;
+            let mut source_files = 0usize;
+            let mut exported_groups = 0u64;
+
+            for (hash, size, files) in &groups {
+                source_files += files.len();
+                let primary = files.iter().max_by_key(|f| (f.modified.unwrap_or(0), f.indexed_at));
+                let Some(primary) = primary else { continue; };
+                if !primary.path.exists() || !primary.path.is_file() {
+                    continue;
+                }
+
+                let category = Self::classify_for_buffer(&primary.name);
+                let hash_short_len = std::cmp::min(10, hash.len());
+                let hash_short = &hash[..hash_short_len];
+                let fallback_name = format!("{}_file", hash_short);
+                let base_name = if primary.name.trim().is_empty() { fallback_name } else { primary.name.clone() };
+                let mut staged_rel = std::path::PathBuf::from(&category)
+                    .join(&primary.device_id)
+                    .join(format!("{}_{}", hash_short, base_name));
+                let mut staged_abs = staged_root.join(&staged_rel);
+
+                if staged_abs.exists() {
+                    staged_rel = std::path::PathBuf::from(&category)
+                        .join(&primary.device_id)
+                        .join(format!("{}_{}_{}", hash_short, primary.indexed_at, base_name));
+                    staged_abs = staged_root.join(&staged_rel);
+                }
+
+                if let Some(parent) = staged_abs.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        let _ = tx.send(AppEvent::Status(format!(
+                            "drive_buffer_warn:Skip {} (mkdir failed: {})",
+                            primary.path.display(),
+                            e
+                        )));
+                        continue;
+                    }
+                }
+
+                if let Err(e) = std::fs::copy(&primary.path, &staged_abs) {
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "drive_buffer_warn:Skip {} (copy failed: {})",
+                        primary.path.display(),
+                        e
+                    )));
+                    continue;
+                }
+
+                let sidecar_name = staged_abs
+                    .file_name()
+                    .map(|n| format!("{}.thegrid.json", n.to_string_lossy()))
+                    .unwrap_or_else(|| "metadata.thegrid.json".to_string());
+                let sidecar_path = staged_abs.with_file_name(sidecar_name);
+                let sidecar = serde_json::json!({
+                    "source_path": primary.path,
+                    "device_id": primary.device_id,
+                    "device_name": primary.device_name,
+                    "hash": hash,
+                    "size": size,
+                    "duplicate_group_size": files.len(),
+                    "redundant_bytes": size.saturating_mul(files.len().saturating_sub(1) as u64),
+                    "category": category,
+                    "indexed_at": primary.indexed_at,
+                    "generated_at": now.timestamp(),
+                });
+                let _ = std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap_or_default());
+
+                entries.push(DriveBufferEntry {
+                    source_path: primary.path.clone(),
+                    staged_path: staged_rel,
+                    device_id: primary.device_id.clone(),
+                    category,
+                    hash: hash.clone(),
+                    size: *size,
+                    duplicate_group_size: files.len(),
+                    indexed_at: primary.indexed_at,
+                });
+                staged_total_bytes = staged_total_bytes.saturating_add(*size);
+                exported_groups += 1;
+                let _ = tx.send(AppEvent::Status(format!(
+                    "cloud_progress:export|copying|{}|{}|{}|0|{}",
+                    exported_groups,
+                    groups.len(),
+                    staged_total_bytes,
+                    session_root.display()
+                )));
+            }
+
+            let manifest = DriveBufferManifest {
+                generated_at: now.timestamp(),
+                session_id: session_id.clone(),
+                quota_tb: cfg.drive_buffer_quota_tb,
+                source_groups: groups.len(),
+                source_files,
+                staged_files: entries.len(),
+                staged_total_bytes,
+                root_folder: session_root.clone(),
+                entries,
+            };
+
+            let manifest_path = session_root.join("manifest.json");
+            match serde_json::to_vec_pretty(&manifest)
+                .ok()
+                .and_then(|bytes| std::fs::write(&manifest_path, bytes).ok())
+            {
+                Some(_) => {
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "cloud_progress:export|complete|{}|{}|{}|{}|{}",
+                        manifest.staged_files,
+                        manifest.source_groups,
+                        manifest.staged_total_bytes,
+                        manifest.staged_total_bytes,
+                        session_root.display()
+                    )));
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "drive_buffer_manifest:{}|{}|{}",
+                        manifest_path.display(),
+                        manifest.staged_files,
+                        manifest.staged_total_bytes
+                    )));
+                }
+                None => {
+                    let _ = tx.send(AppEvent::Status("drive_buffer_error:Failed to write buffer manifest".to_string()));
+                }
+            }
+        });
+    }
+
+    fn spawn_upload_drive_buffer(&self, remote_override: Option<String>) {
+        let manifest_path = self.file_manager.drive_last_manifest.clone();
+        let cfg = self.runtime.config.lock().ok().map(|c| c.clone()).unwrap_or_default();
+        let tx = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            let Some(manifest_path) = manifest_path else {
+                let _ = tx.send(AppEvent::Status("drive_upload_err:No manifest to upload. Export buffer first".to_string()));
+                return;
+            };
+
+            let session_root = manifest_path.parent().map(|p| p.to_path_buf());
+            let Some(session_root) = session_root else {
+                let _ = tx.send(AppEvent::Status("drive_upload_err:Invalid manifest location".to_string()));
+                return;
+            };
+
+            let remote = remote_override
+                .filter(|r| !r.trim().is_empty())
+                .or_else(|| cfg.drive_buffer_remote.clone())
+                .unwrap_or_else(|| "gdrive:THEGRID-BUFFER".to_string());
+
+            let _ = tx.send(AppEvent::Status(format!(
+                "cloud_progress:upload|prepare|0|0|0|0|{}",
+                remote
+            )));
+
+            let probe = if cfg!(target_os = "windows") {
+                std::process::Command::new("where").arg("rclone").output()
+            } else {
+                std::process::Command::new("which").arg("rclone").output()
+            };
+            match probe {
+                Ok(out) if out.status.success() => {}
+                _ => {
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "cloud_progress:upload|error|0|0|0|0|{}",
+                        remote
+                    )));
+                    let _ = tx.send(AppEvent::Status(
+                        "drive_upload_err:rclone not found. Install rclone and configure a Google Drive remote".to_string()
+                    ));
+                    return;
+                }
+            }
+
+            let output = std::process::Command::new("rclone")
+                .arg("copy")
+                .arg(&session_root)
+                .arg(&remote)
+                .arg("--create-empty-src-dirs")
+                .arg("--transfers")
+                .arg("8")
+                .output();
+
+            let _ = tx.send(AppEvent::Status(format!(
+                "cloud_progress:upload|running|0|0|0|0|{}",
+                remote
+            )));
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "cloud_progress:upload|complete|0|0|0|0|{}",
+                        remote
+                    )));
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "drive_upload_ok:{}|{}",
+                        session_root.display(),
+                        remote
+                    )));
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "cloud_progress:upload|error|0|0|0|0|{}",
+                        remote
+                    )));
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "drive_upload_err:{}",
+                        if err.is_empty() { "Upload failed" } else { &err }
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "cloud_progress:upload|error|0|0|0|0|{}",
+                        remote
+                    )));
+                    let _ = tx.send(AppEvent::Status(format!("drive_upload_err:{}", e)));
+                }
+            }
+        });
     }
 
     /// Update index_stats from the DB (cheap count query, safe to call often).
@@ -1215,7 +1711,8 @@ impl TheGridApp {
                             .find(|d| d.primary_ip() == Some(&ip))
                             .map(|d| d.id.clone())
                             .unwrap_or_else(|| response.device.clone());
-                            
+
+                        self.mark_device_online(&device_id.clone());
                         self.spawn_get_telemetry(ip, device_id);
                     } else {
                         if manual {
@@ -1224,12 +1721,19 @@ impl TheGridApp {
                         self.set_status("Authentication mismatch: please check your api_key");
                     }
                 }
-                AppEvent::AgentPingFailed { ip: _, error, manual } => {
+                AppEvent::AgentPingFailed { ip, error, manual } => {
                     self.is_tg_agent = false;
                     if manual {
                         self.push_toast(Toast::err(format!("Agent ping failed: {}", error)));
                     }
                     self.set_status(format!("Ping failed. Check port {} and firewall.", self.config.agent_port));
+                    // Mark the device offline in display state
+                    if let Some(device_id) = self.devices.iter()
+                        .find(|d| d.primary_ip() == Some(&ip))
+                        .map(|d| d.id.clone())
+                    {
+                        self.mark_device_offline(&device_id);
+                    }
                 }
 
                 // ── File transfer ─────────────────────────────────────────────
@@ -1352,11 +1856,40 @@ impl TheGridApp {
 
                 AppEvent::SyncComplete { device_id, files_added } => {
                     log::info!("Sync complete for {}: {} items", device_id, files_added);
+                    let now = chrono::Utc::now().timestamp();
+                    let entry = self.grid_scan_progress.entry(device_id.clone()).or_default();
+                    if entry.machine_id.is_empty() {
+                        entry.machine_id = device_id.clone();
+                    }
+                    entry.step = "sync complete".to_string();
+                    entry.current_drive = "remote".to_string();
+                    entry.current_sector = "delta applied".to_string();
+                    entry.scanned = files_added as u64;
+                    entry.total = files_added as u64;
+                    entry.pending_sectors = 0;
+                    entry.updated_at = now;
+                    entry.last_error = None;
                     self.refresh_index_stats();
                     self.index_stats.scanning = false;
                 }
                 AppEvent::SyncFailed { device_id, error } => {
                     log::debug!("Sync failed for {}: {}", device_id, error);
+                    let now = chrono::Utc::now().timestamp();
+                    let short_error = error
+                        .split(':')
+                        .last()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| error.clone());
+                    let entry = self.grid_scan_progress.entry(device_id.clone()).or_default();
+                    if entry.machine_id.is_empty() {
+                        entry.machine_id = device_id;
+                    }
+                    entry.step = "sync failed".to_string();
+                    entry.current_drive = "remote".to_string();
+                    entry.current_sector = "sync request failed".to_string();
+                    entry.updated_at = now;
+                    entry.last_error = Some(short_error);
                     self.index_stats.scanning = false;
                 }
 
@@ -1371,7 +1904,27 @@ impl TheGridApp {
                     self.embedding_progress = (indexed, total);
                 }
                 AppEvent::HashingProgress { hashed, total } => {
+                    let now = std::time::Instant::now();
+                    if let Some(last_tick) = self.hashing_last_tick {
+                        let dt = last_tick.elapsed().as_secs_f64().max(0.001);
+                        let d_hashed = hashed.saturating_sub(self.hashing_progress.0) as f64;
+                        if d_hashed > 0.0 {
+                            let instant_rate = d_hashed / dt;
+                            self.hashing_rate = Some(match self.hashing_rate {
+                                Some(prev) => prev * 0.75 + instant_rate * 0.25,
+                                None => instant_rate,
+                            });
+                        }
+                    }
+                    self.hashing_last_tick = Some(now);
                     self.hashing_progress = (hashed, total);
+                    if let Some(rate) = self.hashing_rate {
+                        if rate > 0.0 && total > hashed {
+                            self.hashing_eta_secs = Some(((total - hashed) as f64 / rate) as u64);
+                        } else {
+                            self.hashing_eta_secs = None;
+                        }
+                    }
                 }
 
                 AppEvent::SemanticFailed(err) => {
@@ -1431,7 +1984,7 @@ impl TheGridApp {
                     }
                 }
 
-                AppEvent::IndexComplete { device_id: _, files_added, duration_ms } => {
+                AppEvent::IndexComplete { device_id, files_added, duration_ms } => {
                     self.index_stats.scanning    = false;
                     self.index_stats.total_files += files_added;
                     self.index_stats.last_scanned = Some(
@@ -1449,6 +2002,18 @@ impl TheGridApp {
                     self.push_toast(Toast::ok(format!(
                         "Indexed {} files", files_added
                     )));
+                    let now = chrono::Utc::now().timestamp();
+                    let entry = self.grid_scan_progress.entry(device_id.clone()).or_default();
+                    if entry.machine_id.is_empty() {
+                        entry.machine_id = device_id;
+                    }
+                    entry.step = "index complete".to_string();
+                    entry.current_sector = "completed".to_string();
+                    entry.scanned = files_added;
+                    entry.total = files_added;
+                    entry.pending_sectors = 0;
+                    entry.updated_at = now;
+                    entry.last_error = None;
                     self.refresh_index_stats();
 
                     // Phase 4: Trigger embedding generation for the new files
@@ -1487,6 +2052,25 @@ impl TheGridApp {
                     // Generation-tagged results arrive via Status("search_gen:N")
                     // before SearchResults — handled below. Accept all results for now.
                     self.search.receive_results(self.search.query_gen, results);
+                }
+
+                AppEvent::DuplicatesFound(groups) => {
+                    self.duplicate_groups = groups;
+                    self.duplicate_last_scan = Some(chrono::Utc::now().timestamp());
+
+                    if self.duplicate_groups.is_empty() {
+                        self.push_toast(Toast::info("Duplicate scan completed: no groups found"));
+                    } else {
+                        let wasted: u64 = self.duplicate_groups
+                            .iter()
+                            .map(|(_, size, files)| size.saturating_mul(files.len().saturating_sub(1) as u64))
+                            .sum();
+                        self.push_toast(Toast::ok(format!(
+                            "Duplicate scan: {} groups, {:.2} GB recoverable",
+                            self.duplicate_groups.len(),
+                            wasted as f64 / 1_073_741_824.0
+                        )));
+                    }
                 }
 
                 // ── Phase 4: Remote AI Request Handling (for node side) ────────
@@ -1583,7 +2167,6 @@ impl TheGridApp {
 
                 // ── UI / misc ─────────────────────────────────────────────────
                 AppEvent::Status(msg) => {
-                    self.set_status(&msg);
                     // Special-cased status messages used as piggyback channels
                     if msg.starts_with("index_count:") {
                         if let Ok(n) = msg["index_count:".len()..].parse::<u64>() {
@@ -1641,6 +2224,141 @@ impl TheGridApp {
                             self.config = cfg;
                             self.runtime.refresh_ai_services();
                         }
+
+                    } else if msg.starts_with("grid_scan_drive_start:") {
+                        let payload = &msg["grid_scan_drive_start:".len()..];
+                        let mut parts = payload.splitn(2, '|');
+                        if let (Some(machine), Some(drive)) = (parts.next(), parts.next()) {
+                            let now = chrono::Utc::now().timestamp();
+                            let entry = self.grid_scan_progress.entry(machine.to_string()).or_default();
+                            if entry.machine_id.is_empty() {
+                                entry.machine_id = machine.to_string();
+                            }
+                            entry.step = "indexing".to_string();
+                            entry.current_drive = drive.to_string();
+                            entry.current_sector = "root".to_string();
+                            entry.updated_at = now;
+                            entry.last_error = None;
+                        }
+
+                    } else if msg.starts_with("grid_sync_start:") {
+                        let payload = &msg["grid_sync_start:".len()..];
+                        let parts: Vec<&str> = payload.split('|').collect();
+                        if parts.len() >= 2 {
+                            let machine = parts[0].to_string();
+                            let host = parts[1].to_string();
+                            let now = chrono::Utc::now().timestamp();
+                            let entry = self.grid_scan_progress.entry(machine.clone()).or_default();
+                            if entry.machine_id.is_empty() {
+                                entry.machine_id = host;
+                            }
+                            entry.step = "syncing".to_string();
+                            entry.current_drive = "remote".to_string();
+                            entry.current_sector = "requesting index sync".to_string();
+                            entry.updated_at = now;
+                            entry.last_error = None;
+                        }
+
+                    } else if msg.starts_with("grid_scan_progress:") {
+                        let payload = &msg["grid_scan_progress:".len()..];
+                        let parts: Vec<&str> = payload.split('|').collect();
+                        if parts.len() >= 6 {
+                            let machine = parts[0].to_string();
+                            let drive = parts[1].to_string();
+                            let sector = parts[2].to_string();
+                            let scanned = parts[3].parse::<u64>().unwrap_or(0);
+                            let total = parts[4].parse::<u64>().unwrap_or(0);
+                            let pending = parts[5].parse::<u64>().unwrap_or(0);
+                            let now = chrono::Utc::now().timestamp();
+
+                            let entry = self.grid_scan_progress.entry(machine.clone()).or_default();
+                            if entry.machine_id.is_empty() {
+                                entry.machine_id = machine;
+                            }
+                            entry.step = "indexing".to_string();
+                            entry.current_drive = drive;
+                            entry.current_sector = sector;
+                            entry.scanned = scanned;
+                            entry.total = total;
+                            entry.pending_sectors = pending;
+                            entry.updated_at = now;
+                            entry.last_error = None;
+                        }
+
+                    } else if msg.starts_with("grid_scan_complete:") {
+                        let payload = &msg["grid_scan_complete:".len()..];
+                        let parts: Vec<&str> = payload.split('|').collect();
+                        if parts.len() >= 3 {
+                            let machine = parts[0].to_string();
+                            let scanned = parts[1].parse::<u64>().unwrap_or(0);
+                            let now = chrono::Utc::now().timestamp();
+                            let entry = self.grid_scan_progress.entry(machine.clone()).or_default();
+                            if entry.machine_id.is_empty() {
+                                entry.machine_id = machine;
+                            }
+                            entry.step = "index complete".to_string();
+                            entry.current_sector = "completed".to_string();
+                            entry.scanned = scanned;
+                            entry.total = scanned;
+                            entry.pending_sectors = 0;
+                            entry.updated_at = now;
+                            entry.last_error = None;
+                        }
+
+                    } else if msg.starts_with("cloud_progress:") {
+                        let payload = &msg["cloud_progress:".len()..];
+                        let parts: Vec<&str> = payload.split('|').collect();
+                        if parts.len() >= 7 {
+                            self.cloud_pipeline_progress.stage = parts[0].to_string();
+                            self.cloud_pipeline_progress.step = parts[1].to_string();
+                            self.cloud_pipeline_progress.done = parts[2].parse::<u64>().unwrap_or(0);
+                            self.cloud_pipeline_progress.total = parts[3].parse::<u64>().unwrap_or(0);
+                            self.cloud_pipeline_progress.bytes_done = parts[4].parse::<u64>().unwrap_or(0);
+                            self.cloud_pipeline_progress.bytes_total = parts[5].parse::<u64>().unwrap_or(0);
+                            self.cloud_pipeline_progress.target = parts[6].to_string();
+                            self.cloud_pipeline_progress.updated_at = chrono::Utc::now().timestamp();
+                            if self.cloud_pipeline_progress.step.eq_ignore_ascii_case("error") {
+                                self.cloud_pipeline_progress.last_error = Some("cloud stage failed".to_string());
+                            } else {
+                                self.cloud_pipeline_progress.last_error = None;
+                            }
+                        }
+
+                    } else if msg.starts_with("crosscheck:") {
+                        let payload = &msg["crosscheck:".len()..];
+                        let parts: Vec<&str> = payload.split('|').collect();
+                        if parts.len() >= 5 {
+                            let node_id = parts[0].to_string();
+                            let groups = parts[1].parse::<u64>().unwrap_or(0);
+                            let files = parts[2].parse::<u64>().unwrap_or(0);
+                            let bytes = parts[3].parse::<u64>().unwrap_or(0);
+                            let known_devices = parts[4].parse::<u64>().unwrap_or(0);
+                            self.node_crosscheck.insert(node_id.clone(), NodeCrosscheckSummary {
+                                node_id,
+                                groups,
+                                files,
+                                bytes,
+                                known_devices,
+                                updated_at: chrono::Utc::now().timestamp(),
+                            });
+                        }
+
+                    } else if msg.starts_with("drive_buffer_manifest:") {
+                        let payload = &msg["drive_buffer_manifest:".len()..];
+                        let parts: Vec<&str> = payload.split('|').collect();
+                        if let Some(path) = parts.first() {
+                            self.file_manager.drive_last_manifest = Some(PathBuf::from(path));
+                        }
+                        self.push_toast(Toast::ok("Drive buffer exported with manifest"));
+                    } else if msg.starts_with("drive_buffer_error:") {
+                        self.push_toast(Toast::err(msg["drive_buffer_error:".len()..].to_string()));
+                    } else if msg.starts_with("drive_buffer_warn:") {
+                        self.push_toast(Toast::info(msg["drive_buffer_warn:".len()..].to_string()));
+                    } else if msg.starts_with("drive_upload_ok:") {
+                        let payload = &msg["drive_upload_ok:".len()..];
+                        self.push_toast(Toast::ok(format!("Drive upload complete: {}", payload)));
+                    } else if msg.starts_with("drive_upload_err:") {
+                        self.push_toast(Toast::err(msg["drive_upload_err:".len()..].to_string()));
 
                     } else if !msg.starts_with("search_gen:") {
                         // Regular status messages go to the status bar
@@ -1750,8 +2468,121 @@ impl TheGridApp {
                     self.viewport.content = content;
                     self.viewport.preview_kind = kind;
                 }
+
+                // ── Compute sharing ───────────────────────────────────────────
+                AppEvent::ComputeBorrowOk { task_id, provider_device_id, task_type } => {
+                    self.compute_sessions.push(ComputeSession {
+                        borrower_device_id: self.config.device_name.clone(),
+                        provider_device_id: provider_device_id.clone(),
+                        task_type,
+                        task_id,
+                        started_at: std::time::Instant::now(),
+                    });
+                    self.refresh_device_display_states();
+                    self.push_toast(Toast::info(format!("Compute delegated to {}", provider_device_id)));
+                }
+
+                AppEvent::ComputeBorrowFailed { task_id: _, reason } => {
+                    self.push_toast(Toast::err(format!("Compute delegation failed: {}", reason)));
+                }
+
+                AppEvent::ComputeTaskUpdate(progress) => {
+                    use thegrid_core::models::ComputeTaskState;
+                    if matches!(progress.state, ComputeTaskState::Done | ComputeTaskState::Failed | ComputeTaskState::Cancelled) {
+                        self.compute_sessions.retain(|s| s.task_id != progress.task_id);
+                        self.refresh_device_display_states();
+                    }
+                }
+
+                // ── Google Drive ──────────────────────────────────────────────
+                AppEvent::DriveAuthExpired => {
+                    self.push_toast(Toast::err("Google Drive token expired — re-authenticate in Settings"));
+                }
+                AppEvent::DriveIndexProgress { indexed, total } => {
+                    let total_str = total.map(|t| t.to_string()).unwrap_or_else(|| "?".to_string());
+                    self.set_status(format!("Drive: indexing {}/{}", indexed, total_str));
+                }
+                AppEvent::DriveIndexComplete { indexed } => {
+                    self.push_toast(Toast::ok(format!("Drive: indexed {} files", indexed)));
+                }
+                AppEvent::DriveIndexError(msg) => {
+                    self.push_toast(Toast::err(format!("Drive error: {}", msg)));
+                }
+
+                // ── Rich duplicate groups ─────────────────────────────────────
+                AppEvent::DuplicatesGrouped(groups) => {
+                    log::info!("DuplicatesGrouped: {} groups", groups.len());
+                    self.dedup_review_state.seed_from_groups(&groups);
+                    self.rich_duplicate_groups = groups;
+                    self.push_toast(Toast::info(format!("{} duplicate groups found", self.rich_duplicate_groups.len())));
+                }
+
                 _ => {}
             }
+        }
+    }
+
+    // ── Device display state derivation ───────────────────────────────────────
+
+    /// Rebuild `device_display_states` for all known devices from current app state.
+    fn refresh_device_display_states(&mut self) {
+        let devices: Vec<_> = self.devices.iter()
+            .map(|d| (d.id.clone(), d.hostname.clone()))
+            .collect();
+
+        for (device_id, hostname) in &devices {
+            let state = self.derive_display_state(device_id, hostname);
+            self.device_display_states.insert(device_id.clone(), state);
+        }
+    }
+
+    fn derive_display_state(&self, device_id: &str, _hostname: &str) -> DeviceDisplayState {
+        // Error: agent ping explicitly failed
+        // (We don't track per-device ping failures currently, so skip for now.)
+
+        // ComputeBorrowing: we have an active session delegated TO this device
+        if self.compute_sessions.iter().any(|s| s.provider_device_id == device_id) {
+            return DeviceDisplayState::ComputeBorrowing;
+        }
+
+        // ComputeProviding: a remote session is running ON THIS machine
+        // (would come from a separate field; placeholder)
+
+        // Indexing: the device is in an active index scan
+        if self.index_stats.scanning && device_id == self.config.device_name {
+            return DeviceDisplayState::Indexing;
+        }
+
+        // Syncing: a sync poll is in progress for this device
+        if self.sync_last_poll.contains_key(device_id) {
+            let elapsed = self.sync_last_poll[device_id].elapsed().as_secs();
+            if elapsed < 5 {
+                return DeviceDisplayState::Syncing;
+            }
+        }
+
+        // Online / Offline: based on last ping outcome
+        // (stored in device_display_states itself as a base, or derived from NodeStatus)
+        // Default: check existing state or fall back to Offline.
+        self.device_display_states
+            .get(device_id)
+            .cloned()
+            .unwrap_or(DeviceDisplayState::Offline)
+    }
+
+    /// Called when a ping succeeds — marks device Online (or keeps higher-precedence state).
+    fn mark_device_online(&mut self, device_id: &str) {
+        let current = self.device_display_states.get(device_id).cloned().unwrap_or(DeviceDisplayState::Offline);
+        if current.precedence() < DeviceDisplayState::Online.precedence() {
+            self.device_display_states.insert(device_id.to_string(), DeviceDisplayState::Online);
+        }
+    }
+
+    /// Called when a ping fails — marks device Offline only if no higher state is set.
+    fn mark_device_offline(&mut self, device_id: &str) {
+        let current = self.device_display_states.get(device_id).cloned().unwrap_or(DeviceDisplayState::Offline);
+        if current == DeviceDisplayState::Online {
+            self.device_display_states.insert(device_id.to_string(), DeviceDisplayState::Offline);
         }
     }
 
@@ -1810,8 +2641,23 @@ impl TheGridApp {
     // UI helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    fn fmt_eta(secs: u64) -> String {
+        if secs < 60 {
+            format!("{}s", secs)
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+        }
+    }
+
     fn render_footer_progress(&self, ctx: &egui::Context) {
-        if !self.index_stats.scanning && self.embedding_progress.0 == self.embedding_progress.1 && self.hashing_progress.0 == self.hashing_progress.1 {
+        let hashing_active = self.hashing_progress.1 > 0
+            && self.hashing_progress.0 < self.hashing_progress.1;
+        if !self.index_stats.scanning
+            && self.embedding_progress.0 == self.embedding_progress.1
+            && !hashing_active
+        {
             return;
         }
 
@@ -1819,27 +2665,28 @@ impl TheGridApp {
             .frame(egui::Frame::none().fill(Colors::BG_PANEL).inner_margin(egui::Margin::symmetric(10.0, 2.0)))
             .show(ctx, |ui| {
                 ui.add_space(2.0);
-                
+
                 let progress = if self.index_stats.scanning {
                     if self.index_stats.scan_total > 0 {
-                        self.index_stats.scan_progress as f32 / self.index_stats.scan_total as f32
+                        (self.index_stats.scan_progress as f32 / self.index_stats.scan_total as f32).clamp(0.0, 1.0)
                     } else {
                         0.0
                     }
-                } else if self.embedding_progress.1 > 0 {
-                    self.embedding_progress.0 as f32 / self.embedding_progress.1 as f32
+                } else if self.embedding_progress.1 > 0 && self.embedding_progress.0 < self.embedding_progress.1 {
+                    (self.embedding_progress.0 as f32 / self.embedding_progress.1 as f32).clamp(0.0, 1.0)
                 } else if self.hashing_progress.1 > 0 {
-                    self.hashing_progress.0 as f32 / self.hashing_progress.1 as f32
+                    (self.hashing_progress.0 as f32 / self.hashing_progress.1 as f32).clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
 
-                // Brutalist Progress Bar
+                // Brutalist Progress Bar — clamped so it never overflows past 100%
                 let rect = ui.available_rect_before_wrap();
                 let bar_rect = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 4.0));
                 ui.painter().rect_filled(bar_rect, 0.0, Color32::from_black_alpha(100));
-                
-                let fill_rect = egui::Rect::from_min_max(bar_rect.min, egui::pos2(bar_rect.min.x + bar_rect.width() * progress, bar_rect.max.y));
+
+                let fill_x = (bar_rect.min.x + bar_rect.width() * progress).min(bar_rect.max.x);
+                let fill_rect = egui::Rect::from_min_max(bar_rect.min, egui::pos2(fill_x, bar_rect.max.y));
                 ui.painter().rect_filled(fill_rect, 0.0, Colors::GREEN);
 
                 ui.add_space(6.0);
@@ -1849,17 +2696,36 @@ impl TheGridApp {
                     } else if self.embedding_progress.1 > 0 && self.embedding_progress.0 < self.embedding_progress.1 {
                         format!("⬡ EMBEDDING: {:.1}%", progress * 100.0)
                     } else {
-                        format!("⬡ HASHING: {:.1}%", progress * 100.0)
+                        format!(
+                            "⬡ HASHING: {}/{} ({:.1}%)",
+                            self.hashing_progress.0,
+                            self.hashing_progress.1,
+                            progress * 100.0
+                        )
                     };
 
                     ui.label(RichText::new(label).color(Colors::TEXT).size(10.0).monospace());
-                    
-                    if let Some(rate) = self.index_stats.smoothed_files_per_sec {
-                        ui.label(RichText::new(format!(" {:.1} f/s", rate)).color(Colors::TEXT_DIM).size(10.0).monospace());
+
+                    // Rate label — scanning uses index_stats, hashing uses its own rate
+                    if self.index_stats.scanning {
+                        if let Some(rate) = self.index_stats.smoothed_files_per_sec {
+                            ui.label(RichText::new(format!(" {:.1} f/s", rate)).color(Colors::TEXT_DIM).size(10.0).monospace());
+                        }
+                    } else if hashing_active {
+                        if let Some(rate) = self.hashing_rate {
+                            ui.label(RichText::new(format!(" {:.1} f/s", rate)).color(Colors::TEXT_DIM).size(10.0).monospace());
+                        }
                     }
 
-                    if let Some(eta) = self.index_stats.scan_eta_secs {
-                        ui.label(RichText::new(format!(" ETA: {}s", eta)).color(Colors::GREEN).size(10.0).monospace());
+                    // ETA — scanning or hashing
+                    if self.index_stats.scanning {
+                        if let Some(eta) = self.index_stats.scan_eta_secs {
+                            ui.label(RichText::new(format!(" ETA: {}", Self::fmt_eta(eta))).color(Colors::GREEN).size(10.0).monospace());
+                        }
+                    } else if hashing_active {
+                        if let Some(eta) = self.hashing_eta_secs {
+                            ui.label(RichText::new(format!(" ETA: {}", Self::fmt_eta(eta))).color(Colors::GREEN).size(10.0).monospace());
+                        }
                     }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2164,6 +3030,54 @@ impl TheGridApp {
             } else {
                 self.push_toast(Toast::info("Remote scan request sent (stub)"));
             }
+        }
+
+        if let Some(filter) = actions.run_duplicate_scan {
+            self.enqueue_local_full_drive_index();
+            self.sync_all_nodes();
+            self.set_status("Refreshing grid index and scanning duplicates across all drives/nodes...");
+            self.spawn_duplicate_scan(filter);
+        }
+
+        if let Some(files) = actions.delete_duplicate_files {
+            let filter = DuplicateScanFilter {
+                min_size_bytes: self.file_manager.duplicate_min_size_mb.saturating_mul(1_048_576),
+                include_extensions: self.file_manager.duplicate_ext_filter
+                    .split(',')
+                    .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                    .filter(|e| !e.is_empty())
+                    .collect(),
+                path_prefix: if self.file_manager.duplicate_path_filter.trim().is_empty() {
+                    None
+                } else {
+                    Some(self.file_manager.duplicate_path_filter.trim().to_string())
+                },
+                device_id: None,
+                exclude_system_paths: true,
+                max_groups: self.file_manager.duplicate_max_groups,
+            };
+            self.spawn_delete_duplicate_files(files, filter);
+        }
+
+        if let Some(files) = actions.dedup_delete_files {
+            self.spawn_rich_dedup_delete(files);
+        }
+
+        if actions.export_drive_buffer {
+            self.spawn_export_drive_buffer();
+        }
+
+        if actions.upload_drive_buffer {
+            let remote = if self.file_manager.drive_remote.trim().is_empty() {
+                None
+            } else {
+                Some(self.file_manager.drive_remote.trim().to_string())
+            };
+            self.spawn_upload_drive_buffer(remote);
+        }
+
+        if let Some(paths) = actions.fm_delete {
+            self.spawn_fm_delete(ip.to_string(), device_id.to_string(), paths);
         }
 
         if let Some(path) = actions.browse_remote {
@@ -2592,6 +3506,7 @@ impl eframe::App for TheGridApp {
                         device_clicked = crate::views::dashboard::render_device_panel(
                             ui,
                             &devices_with_status,
+                            &self.device_display_states,
                             &telemetry_snap,
                             self.selected_idx,
                             &mut self.selected_node_ids,
@@ -2683,6 +3598,7 @@ impl eframe::App for TheGridApp {
                             let log_snap     = self.transfer_log.clone();
                             let watch_snap   = self.runtime.config.lock().unwrap().watch_paths.clone();
                             let telem_snap   = telemetry_snap.get(&device.id).cloned();
+                            let drive_manifest_snap = self.file_manager.drive_last_manifest.clone();
                             let status = self.get_node_status(&device.id);
 
                             let rdp_user = self.rdp_usernames.entry(device.id.clone())
@@ -2711,6 +3627,16 @@ impl eframe::App for TheGridApp {
                                 terminal_view: self.terminal_sessions.get_mut(&device.id),
                                 local_device_name: &self.local_hostname,
                                 status,
+                                duplicate_groups: &self.duplicate_groups,
+                                duplicate_last_scan: self.duplicate_last_scan,
+                                hashing_progress: self.hashing_progress,
+                                drive_last_manifest: drive_manifest_snap.as_ref(),
+                                grid_scan_progress: &self.grid_scan_progress,
+                                cloud_pipeline_progress: &self.cloud_pipeline_progress,
+                                node_crosscheck: &self.node_crosscheck,
+                                rich_duplicate_groups: &self.rich_duplicate_groups,
+                                dedup_review_state: &mut self.dedup_review_state,
+                                local_device_id: &self.config.device_name,
                             };
 
                             // Pass timeline state into the render

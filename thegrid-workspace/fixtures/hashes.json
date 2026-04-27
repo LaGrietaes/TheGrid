@@ -1,0 +1,8 @@
+{
+  "_note": "Full BLAKE3 hashes computed at test time via cargo test --features test-support. This file serves as the lookup key structure; values are validated by the fixture_hashes_are_stable test.",
+  "fixtures/files/photo_a.txt": { "size": 22, "content": "PHOTO_CONTENT_ABC_123\n" },
+  "fixtures/files/photo_b.txt": { "size": 22, "content": "PHOTO_CONTENT_ABC_123\n", "duplicate_of": "photo_a.txt" },
+  "fixtures/files/photo_c.txt": { "size": 22, "content": "DIFFERENT_CONTENT_XYZ\n" },
+  "fixtures/files/doc.txt":     { "size": 23, "content": "DOCUMENT_CONTENT_HELLO\n" },
+  "fixtures/files/doc_moved.txt": { "size": 23, "content": "DOCUMENT_CONTENT_HELLO\n", "duplicate_of": "doc.txt" }
+}

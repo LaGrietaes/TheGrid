@@ -4779,6 +4779,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -4810,6 +4811,7 @@ dependencies = [
  "thegrid-core",
  "thegrid-net",
  "thegrid-runtime",
+ "uuid",
  "winres",
 ]
 
@@ -4820,6 +4822,7 @@ dependencies = [
  "anyhow",
  "ascii",
  "chrono",
+ "dirs",
  "get_if_addrs",
  "hostname 0.3.1",
  "log",
@@ -4833,6 +4836,7 @@ dependencies = [
  "thegrid-core",
  "thiserror 1.0.69",
  "tiny_http",
+ "urlencoding",
  "uuid",
 ]
 

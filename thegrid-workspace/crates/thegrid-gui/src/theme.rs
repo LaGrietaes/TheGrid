@@ -33,6 +33,16 @@ impl Colors {
     pub const AMBER:      Color32 = Color32::from_rgb(255, 214, 0);    // #ffd600
     pub const RED:        Color32 = Color32::from_rgb(255, 34,  68);   // #ff2244
 
+    // Device display-state tokens (Phase 4)
+    pub const STATE_ONLINE:            Color32 = Color32::from_rgb(0,   255, 65);   // green  — same as GREEN
+    pub const STATE_SYNCING:           Color32 = Color32::from_rgb(0,   180, 200);  // cyan
+    pub const STATE_INDEXING:          Color32 = Color32::from_rgb(255, 214, 0);    // amber
+    pub const STATE_COMPUTE_BORROW:    Color32 = Color32::from_rgb(120, 80,  255);  // violet — we are delegating out
+    pub const STATE_COMPUTE_PROVIDE:   Color32 = Color32::from_rgb(50,  140, 255);  // blue   — we are serving a peer
+    pub const STATE_BUSY:              Color32 = Color32::from_rgb(255, 130, 0);    // orange
+    pub const STATE_ERROR:             Color32 = Color32::from_rgb(255, 34,  68);   // red    — same as RED
+    pub const STATE_OFFLINE:           Color32 = Color32::from_rgb(51,  51,  51);   // muted
+
     // Text
     pub const TEXT:       Color32 = Color32::from_rgb(232, 232, 232);  // #e8e8e8
     pub const TEXT_DIM:   Color32 = Color32::from_rgb(102, 102, 102);  // #666
@@ -183,6 +193,19 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
     .fill(Color32::TRANSPARENT)
     .stroke(Stroke::new(1.0, Colors::BORDER2))
     .min_size(egui::vec2(0.0, 28.0));
+    ui.add(btn)
+}
+
+/// Danger action button — red border, red text (for destructive operations)
+pub fn danger_button(ui: &mut Ui, label: &str) -> Response {
+    let btn = egui::Button::new(
+        RichText::new(label)
+            .color(Colors::RED)
+            .size(10.0)
+    )
+    .fill(Color32::TRANSPARENT)
+    .stroke(Stroke::new(1.0, Colors::RED))
+    .min_size(egui::vec2(0.0, 26.0));
     ui.add(btn)
 }
 
@@ -466,6 +489,21 @@ pub fn status_badge(ui: &mut Ui, label: &str, icon: Option<IconType>, active: bo
                 ui.label(RichText::new(label).color(color).size(9.0).strong());
             });
         });
+}
+
+/// Map a DeviceDisplayState to its canonical theme color.
+pub fn device_state_color(state: &thegrid_core::models::DeviceDisplayState) -> Color32 {
+    use thegrid_core::models::DeviceDisplayState as DS;
+    match state {
+        DS::Online             => Colors::STATE_ONLINE,
+        DS::Syncing            => Colors::STATE_SYNCING,
+        DS::Indexing           => Colors::STATE_INDEXING,
+        DS::ComputeBorrowing   => Colors::STATE_COMPUTE_BORROW,
+        DS::ComputeProviding   => Colors::STATE_COMPUTE_PROVIDE,
+        DS::Busy               => Colors::STATE_BUSY,
+        DS::Error(_)           => Colors::STATE_ERROR,
+        DS::Offline            => Colors::STATE_OFFLINE,
+    }
 }
 
 /// Colored indicator dot

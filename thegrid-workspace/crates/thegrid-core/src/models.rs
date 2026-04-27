@@ -275,6 +275,70 @@ impl FileSearchResult {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateScanFilter {
+    #[serde(default)]
+    pub min_size_bytes: u64,
+    #[serde(default)]
+    pub include_extensions: Vec<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default = "DuplicateScanFilter::default_true")]
+    pub exclude_system_paths: bool,
+    #[serde(default = "DuplicateScanFilter::default_max_groups")]
+    pub max_groups: usize,
+}
+
+impl DuplicateScanFilter {
+    fn default_true() -> bool {
+        true
+    }
+
+    fn default_max_groups() -> usize {
+        200
+    }
+}
+
+impl Default for DuplicateScanFilter {
+    fn default() -> Self {
+        Self {
+            min_size_bytes: 0,
+            include_extensions: Vec::new(),
+            path_prefix: None,
+            device_id: None,
+            exclude_system_paths: true,
+            max_groups: Self::default_max_groups(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriveBufferEntry {
+    pub source_path: PathBuf,
+    pub staged_path: PathBuf,
+    pub device_id: String,
+    pub category: String,
+    pub hash: String,
+    pub size: u64,
+    pub duplicate_group_size: usize,
+    pub indexed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriveBufferManifest {
+    pub generated_at: i64,
+    pub session_id: String,
+    pub quota_tb: u32,
+    pub source_groups: usize,
+    pub source_files: usize,
+    pub staged_files: usize,
+    pub staged_total_bytes: u64,
+    pub root_folder: PathBuf,
+    pub entries: Vec<DriveBufferEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeTelemetry {
     pub device_type: String,
@@ -371,6 +435,8 @@ pub struct DeviceCapabilities {
     pub drives: Vec<DriveInfo>,
     pub has_rdp: bool,
     pub has_file_access: bool,
+    #[serde(default)]
+    pub compute: ComputeCapabilities,
 }
 
 impl NodeTelemetry {
@@ -518,3 +584,263 @@ pub struct SmartRule {
     pub name: String,
     pub filters: Vec<SmartFilterType>,
 }
+
+// ── Compute Sharing ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeTaskType {
+    TextEmbedding,
+    ImageEmbedding,
+    FullHash,
+    LocalLlm,
+}
+
+impl std::fmt::Display for ComputeTaskType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TextEmbedding  => write!(f, "TEXT EMBED"),
+            Self::ImageEmbedding => write!(f, "IMG EMBED"),
+            Self::FullHash       => write!(f, "HASH"),
+            Self::LocalLlm       => write!(f, "LLM"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ComputeCapabilities {
+    pub gpu_available: bool,
+    pub gpu_models: Vec<String>,
+    pub gpu_vram_mb: u64,
+    pub cpu_cores: u32,
+    pub ram_available_mb: u64,
+    pub max_parallel_tasks: u8,
+    pub supported_task_types: Vec<ComputeTaskType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ComputePayload {
+    TextEmbed { text: String },
+    ImageEmbed { file_url: String },
+    FullHash   { file_url: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeTaskRequest {
+    pub task_id: String,
+    pub task_type: ComputeTaskType,
+    pub requester_device_id: String,
+    pub requester_callback_url: String,
+    pub payload: ComputePayload,
+    pub priority: u8,
+    pub deadline_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeTaskReceipt {
+    pub task_id: String,
+    pub accepted: bool,
+    pub reason_if_rejected: Option<String>,
+    pub eta_secs: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeTaskState {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeTaskProgress {
+    pub task_id: String,
+    pub state: ComputeTaskState,
+    pub pct: u8,
+    pub result_uri: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComputeStatus {
+    pub available: bool,
+    pub active_tasks: u32,
+    pub queued_tasks: u32,
+    pub max_parallel_tasks: u8,
+    pub busy_until_estimate_secs: Option<u32>,
+}
+
+/// In-memory record of an active borrow relationship between two devices.
+#[derive(Debug, Clone)]
+pub struct ComputeSession {
+    pub borrower_device_id: String,
+    pub provider_device_id: String,
+    pub task_type: ComputeTaskType,
+    pub task_id: String,
+    pub started_at: std::time::Instant,
+}
+
+// ── DeviceDisplayState ────────────────────────────────────────────────────────
+
+/// Derived state for GUI device card rendering.
+/// Precedence (highest → lowest): Error > ComputeBorrowing > ComputeProviding >
+/// Indexing > Syncing > Busy > Online > Offline.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DeviceDisplayState {
+    #[default]
+    Offline,
+    Online,
+    Syncing,
+    Indexing,
+    ComputeBorrowing,
+    ComputeProviding,
+    Busy,
+    Error(String),
+}
+
+impl DeviceDisplayState {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Offline          => "offline",
+            Self::Online           => "online",
+            Self::Syncing          => "syncing",
+            Self::Indexing         => "indexing",
+            Self::ComputeBorrowing => "borrowing compute",
+            Self::ComputeProviding => "providing compute",
+            Self::Busy             => "busy",
+            Self::Error(_)         => "error",
+        }
+    }
+
+    pub fn precedence(&self) -> u8 {
+        match self {
+            Self::Error(_)         => 8,
+            Self::ComputeBorrowing => 7,
+            Self::ComputeProviding => 6,
+            Self::Indexing         => 5,
+            Self::Syncing          => 4,
+            Self::Busy             => 3,
+            Self::Online           => 2,
+            Self::Offline          => 1,
+        }
+    }
+}
+
+// ── Indexing Policy ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexingTier {
+    /// Never index: .git/objects/, node_modules/, target/, etc.
+    Tier0Exclude,
+    /// Metadata only: no full hash, no embedding.
+    Tier1Deprioritized,
+    /// Git working copy with a GitHub remote — recoverable, skipped from dedup.
+    GitHubBacked,
+    /// Index fully.
+    #[default]
+    FullIndex,
+}
+
+impl IndexingTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tier0Exclude       => "Tier0Exclude",
+            Self::Tier1Deprioritized => "Tier1Deprioritized",
+            Self::GitHubBacked       => "GitHubBacked",
+            Self::FullIndex          => "FullIndex",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverrideAction {
+    ForceInclude,
+    ForceExclude,
+    MetadataOnly,
+    DeprioritizeTier1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexingOverride {
+    pub path_pattern: String,
+    pub action: OverrideAction,
+}
+
+// ── Duplicate groups ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceType {
+    Local,
+    GoogleDrive,
+    Nas,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceSummary {
+    pub device_id: String,
+    pub device_name: String,
+    pub file_count: u32,
+    pub source_type: SourceType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateGroup {
+    pub hash: String,
+    pub size: u64,
+    pub file_count: u32,
+    pub source_count: u32,
+    pub sources: Vec<SourceSummary>,
+    pub files: Vec<FileSearchResult>,
+    /// device_id of the preferred anchor (keep candidate).
+    pub suggested_anchor: Option<String>,
+}
+
+// ── Deletion audit ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeletionRecord {
+    pub id: i64,
+    pub session_id: String,
+    pub file_path: String,
+    pub device_id: String,
+    pub file_hash: Option<String>,
+    pub file_size: Option<u64>,
+    pub action: String,
+    pub reason: Option<String>,
+    pub executed_at: i64,
+}
+
+// ── Extend DeviceCapabilities ─────────────────────────────────────────────────
+
+// DeviceCapabilities is defined above; we re-open the struct by adding the compute
+// field via the existing definition. Since Rust structs can't be reopened, we add the
+// field directly in the original definition instead — done via a separate alias here.
+// The actual extended struct replaces the original in models.rs during Phase 3.
+
+// ── Google Drive ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriveFileMetadata {
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub modified: Option<DateTime<Utc>>,
+    pub md5_checksum: Option<String>,
+    pub mime_type: String,
+    pub parents: Vec<String>,
+    pub is_shared_drive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DriveAbout {
+    pub email: String,
+    pub storage_used: u64,
+    pub storage_limit: Option<u64>,
+}
+

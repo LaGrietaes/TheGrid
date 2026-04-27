@@ -14,3 +14,4 @@ pub mod timeline;
 pub mod terminal;
 pub mod viewport;
 pub mod file_manager;
+pub mod dedup_review;

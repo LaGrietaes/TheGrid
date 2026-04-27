@@ -14,6 +14,8 @@ thiserror   = { workspace = true }
 log         = { workspace = true }
 chrono      = { workspace = true }
 uuid        = { version = "1.7", features = ["v4"] }
+dirs        = "5"
+urlencoding = "2.1"
 
 # HTTP client — blocking feature used in spawned threads (not in egui update loop)
 reqwest     = { workspace = true }

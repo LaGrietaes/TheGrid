@@ -16,6 +16,11 @@ pub mod events;
 pub mod models;
 pub mod watcher;
 pub mod utils;
+pub mod traits;
+pub mod indexing;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 // Re-export the most-used types so callers can `use thegrid_core::*`
 pub use config::Config;
@@ -23,4 +28,6 @@ pub use db::{Database, should_skip_dir, should_skip_path, unix_now};
 pub use events::AppEvent;
 pub use models::*;
 pub use watcher::FileWatcher;
-pub use utils::{fingerprint_file, hash_file, match_rules, quick_hash_file, scan_and_index_directory};
+pub use utils::{collect_files_in_directory, fingerprint_file, hash_file, match_rules, quick_hash_file, scan_and_index_directory};
+pub use traits::{Blake3Hasher, ContentHasher, FileScanner, RealFileScanner};
+pub use indexing::classify_directory;

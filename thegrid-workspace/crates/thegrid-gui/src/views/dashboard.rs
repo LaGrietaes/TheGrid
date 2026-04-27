@@ -39,6 +39,8 @@ pub enum DashTab {
     Terminal,
     /// New in Dashboard Optimization: Detailed Storage Breakdown
     Storage,
+    /// Phase 6: Cross-source duplicate review
+    DedupReview,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,6 +80,17 @@ pub struct DetailState<'a> {
     pub local_device_name:  &'a str,
     /// New in Connectivity Fixes: Agent status
     pub status:             crate::app::NodeStatus,
+    pub duplicate_groups:   &'a [(String, u64, Vec<FileSearchResult>)],
+    pub duplicate_last_scan: Option<i64>,
+    pub hashing_progress: (usize, usize),
+    pub drive_last_manifest: Option<&'a PathBuf>,
+    pub grid_scan_progress: &'a std::collections::HashMap<String, crate::app::GridScanProgress>,
+    pub cloud_pipeline_progress: &'a crate::app::CloudPipelineProgress,
+    pub node_crosscheck: &'a std::collections::HashMap<String, crate::app::NodeCrosscheckSummary>,
+    /// Phase 6: Rich cross-source duplicate groups
+    pub rich_duplicate_groups: &'a [thegrid_core::models::DuplicateGroup],
+    pub dedup_review_state: &'a mut crate::views::dedup_review::DedupReviewState,
+    pub local_device_id: &'a str,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,6 +130,12 @@ pub struct DetailActions {
     pub enable_rdp:           bool,
     pub launch_ssh:           bool,
     pub fm_delete:            Option<Vec<String>>,
+    pub run_duplicate_scan:   Option<DuplicateScanFilter>,
+    pub delete_duplicate_files: Option<Vec<(i64, std::path::PathBuf, String)>>,
+    /// Phase 6: Rich dedup delete action
+    pub dedup_delete_files: Option<Vec<thegrid_core::models::FileSearchResult>>,
+    pub export_drive_buffer:  bool,
+    pub upload_drive_buffer:  bool,
     #[allow(dead_code)]
     pub _fm_rename:            Option<(String, String)>,
     #[allow(dead_code)]
@@ -132,6 +151,7 @@ pub struct DetailActions {
 pub fn render_device_panel(
     ui: &mut Ui,
     devices_with_status: &[(TailscaleDevice, crate::app::NodeStatus)],
+    display_states: &std::collections::HashMap<String, thegrid_core::models::DeviceDisplayState>,
     telemetries: &std::collections::HashMap<String, thegrid_core::models::NodeTelemetry>,
     selected_idx: Option<usize>,
     selected_node_ids: &mut Vec<String>,
@@ -263,10 +283,15 @@ pub fn render_device_panel(
                          else if is_in_cluster { Color32::from_rgba_premultiplied(0, 150, 0, 30) }
                          else { Color32::TRANSPARENT };
                 
-                let status_color = match status {
-                    crate::app::NodeStatus::GridActive => Colors::GREEN,
-                    crate::app::NodeStatus::Reachable  => Colors::AMBER,
-                    crate::app::NodeStatus::Offline    => Colors::TEXT_MUTED,
+                // Prefer richer DeviceDisplayState color when available.
+                let status_color = if let Some(ds) = display_states.get(&device.id) {
+                    theme::device_state_color(ds)
+                } else {
+                    match status {
+                        crate::app::NodeStatus::GridActive => Colors::GREEN,
+                        crate::app::NodeStatus::Reachable  => Colors::AMBER,
+                        crate::app::NodeStatus::Offline    => Colors::TEXT_MUTED,
+                    }
                 };
 
                 let mut cluster_toggled = false;
@@ -2525,6 +2550,7 @@ pub fn render_detail_panel_with_timeline(
             ("TIMELINE",  DashTab::Timeline),
             ("TERMINAL",  DashTab::Terminal),
             ("STORAGE",   DashTab::Storage),
+            ("DEDUP",     DashTab::DedupReview),
         ] {
             if tab_variant == DashTab::Terminal && !s.is_tg_agent { continue; }
             let is_active = *s.active_tab == tab_variant;
@@ -2579,6 +2605,16 @@ pub fn render_detail_panel_with_timeline(
                             }
                         }
                         DashTab::Terminal  => render_terminal_tab(ui, s, &mut actions),
+                        DashTab::DedupReview => {
+                            if let Some(to_delete) = crate::views::dedup_review::render_dedup_review(
+                                ui,
+                                s.rich_duplicate_groups,
+                                s.dedup_review_state,
+                                s.local_device_id,
+                            ) {
+                                actions.dedup_delete_files = Some(to_delete);
+                            }
+                        }
                     }
                 });
             ui.add_space(16.0);
@@ -2784,7 +2820,419 @@ fn render_cluster_node_explorer(
     next_path
 }
 
-fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, _actions: &mut DetailActions) {
+fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
+    ui.label(RichText::new("DATA PIPELINE").color(Colors::GREEN).size(10.0).strong());
+    ui.add_space(10.0);
+
+    egui::Frame::none()
+        .fill(Colors::BG_WIDGET)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .show(ui, |ui| {
+            ui.label(RichText::new("GRID SCAN PROGRESS").color(Colors::TEXT_DIM).size(8.0).strong());
+            ui.add_space(6.0);
+
+            if s.grid_scan_progress.is_empty() {
+                ui.label(RichText::new("No active machine scan status yet.").color(Colors::TEXT_MUTED).size(8.0));
+            } else {
+                let mut rows: Vec<_> = s.grid_scan_progress.values().collect();
+                rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+                ScrollArea::vertical().id_source("storage_grid_scan_progress").max_height(140.0).show(ui, |ui| {
+                    for p in rows {
+                        let pct = if p.total > 0 {
+                            (p.scanned as f32 / p.total as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        let label = if p.machine_id.is_empty() { "unknown" } else { &p.machine_id };
+                        ui.label(
+                            RichText::new(format!(
+                                "{} | {} | drive={} | sector={} | {}/{} | pending={}",
+                                label,
+                                p.step,
+                                p.current_drive,
+                                p.current_sector,
+                                p.scanned,
+                                p.total,
+                                p.pending_sectors
+                            ))
+                            .color(Colors::TEXT)
+                            .size(8.0)
+                        );
+                        ui.add(egui::ProgressBar::new(pct).desired_width(ui.available_width() - 12.0));
+                        if let Some(err) = &p.last_error {
+                            ui.label(RichText::new(format!("warn: {}", err)).color(Colors::AMBER).size(8.0));
+                        }
+                        ui.add_space(4.0);
+                    }
+                });
+            }
+        });
+
+    ui.add_space(8.0);
+    egui::Frame::none()
+        .fill(Colors::BG_WIDGET)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .show(ui, |ui| {
+            ui.label(RichText::new("MESH CROSSCHECK (OFFLINE-CAPABLE)").color(Colors::TEXT_DIM).size(8.0).strong());
+            ui.add_space(6.0);
+            if s.node_crosscheck.is_empty() {
+                ui.label(RichText::new("No node vector crosscheck results yet. Results appear after sync. ").color(Colors::TEXT_MUTED).size(8.0));
+            } else {
+                let mut items: Vec<_> = s.node_crosscheck.values().collect();
+                items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                ScrollArea::vertical().id_source("storage_crosscheck_summary").max_height(120.0).show(ui, |ui| {
+                    for c in items {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} | groups={} | files={} | bytes={} | vectors={}",
+                                c.node_id,
+                                c.groups,
+                                c.files,
+                                crate::telemetry::fmt_bytes(c.bytes),
+                                c.known_devices
+                            ))
+                            .color(Colors::TEXT)
+                            .size(8.0)
+                        );
+                    }
+                });
+            }
+        });
+
+    ui.add_space(8.0);
+    egui::Frame::none()
+        .fill(Colors::BG_WIDGET)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .show(ui, |ui| {
+            ui.label(RichText::new("CLOUD PIPELINE PROGRESS").color(Colors::TEXT_DIM).size(8.0).strong());
+            ui.add_space(6.0);
+            let cp = s.cloud_pipeline_progress;
+            ui.label(
+                RichText::new(format!(
+                    "stage={} | step={} | target={}",
+                    cp.stage,
+                    cp.step,
+                    cp.target
+                ))
+                .color(Colors::TEXT)
+                .size(8.0)
+            );
+            if cp.total > 0 {
+                let pct = (cp.done as f32 / cp.total as f32).clamp(0.0, 1.0);
+                ui.label(RichText::new(format!("items: {}/{}", cp.done, cp.total)).color(Colors::TEXT_DIM).size(8.0));
+                ui.add(egui::ProgressBar::new(pct).desired_width(ui.available_width() - 12.0));
+            } else {
+                ui.label(RichText::new("items: tracking step state").color(Colors::TEXT_DIM).size(8.0));
+            }
+            if cp.bytes_total > 0 {
+                ui.label(RichText::new(format!(
+                    "bytes: {} / {}",
+                    crate::telemetry::fmt_bytes(cp.bytes_done),
+                    crate::telemetry::fmt_bytes(cp.bytes_total)
+                )).color(Colors::TEXT_DIM).size(8.0));
+            } else if cp.bytes_done > 0 {
+                ui.label(RichText::new(format!(
+                    "bytes processed: {}",
+                    crate::telemetry::fmt_bytes(cp.bytes_done)
+                )).color(Colors::TEXT_DIM).size(8.0));
+            }
+            if let Some(err) = &cp.last_error {
+                ui.label(RichText::new(format!("error: {}", err)).color(Colors::RED).size(8.0));
+            }
+        });
+
+    egui::Frame::none()
+        .fill(Colors::BG_WIDGET)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .show(ui, |ui| {
+            ui.label(RichText::new("DUPLICATE FINDER").color(Colors::GREEN).size(10.0).strong());
+            ui.add_space(4.0);
+
+            // Hashing status warning
+            let (hashed, hash_total) = s.hashing_progress;
+            if hash_total > 0 && hashed < hash_total {
+                let remaining = hash_total - hashed;
+                let pct = (hashed as f32 / hash_total as f32 * 100.0).min(100.0);
+                ui.label(
+                    RichText::new(format!(
+                        "⚠  Hashing in progress: {}/{} files ({:.1}%) — {} still pending. Scan now for partial results or wait for completion.",
+                        hashed, hash_total, pct, remaining
+                    ))
+                    .color(Colors::AMBER).size(8.0)
+                );
+                ui.add_space(4.0);
+            } else if hash_total == 0 {
+                ui.label(
+                    RichText::new("// No files indexed yet. Wait for initial scan to complete before running duplicate analysis.")
+                        .color(Colors::TEXT_MUTED).size(8.0).italics()
+                );
+                ui.add_space(4.0);
+            }
+
+            ui.label(RichText::new("Grid-wide scan: all indexed drives and synced nodes. OS/software/system paths are excluded automatically.").color(Colors::TEXT_MUTED).size(8.0));
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MIN MB").color(Colors::TEXT_DIM).size(8.0));
+                ui.add(egui::DragValue::new(&mut s.file_manager.duplicate_min_size_mb).clamp_range(0..=1024 * 16));
+                ui.add_space(10.0);
+                ui.label(RichText::new("MAX GROUPS").color(Colors::TEXT_DIM).size(8.0));
+                ui.add(egui::DragValue::new(&mut s.file_manager.duplicate_max_groups).clamp_range(10..=5000));
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("EXT").color(Colors::TEXT_DIM).size(8.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.file_manager.duplicate_ext_filter)
+                        .desired_width(180.0)
+                        .hint_text("optional: jpg,png,pdf,mov")
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new("PATH PREFIX").color(Colors::TEXT_DIM).size(8.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.file_manager.duplicate_path_filter)
+                        .desired_width(260.0)
+                        .hint_text("optional: C:/Users/me")
+                );
+            });
+
+            ui.add_space(8.0);
+            if theme::primary_button(ui, "RUN DUPLICATE ANALYSIS").clicked() {
+                let include_extensions = s.file_manager
+                    .duplicate_ext_filter
+                    .split(',')
+                    .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                    .filter(|e| !e.is_empty())
+                    .collect::<Vec<_>>();
+                actions.run_duplicate_scan = Some(DuplicateScanFilter {
+                    min_size_bytes: s.file_manager.duplicate_min_size_mb.saturating_mul(1_048_576),
+                    include_extensions,
+                    path_prefix: if s.file_manager.duplicate_path_filter.trim().is_empty() {
+                        None
+                    } else {
+                        Some(s.file_manager.duplicate_path_filter.trim().to_string())
+                    },
+                    device_id: None,
+                    exclude_system_paths: true,
+                    max_groups: s.file_manager.duplicate_max_groups,
+                });
+            }
+        });
+
+    ui.add_space(10.0);
+    let total_wasted: u64 = s.duplicate_groups
+        .iter()
+        .map(|(_, size, files)| size.saturating_mul(files.len().saturating_sub(1) as u64))
+        .sum();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!(
+            "GROUPS: {}  |  RECOVERABLE: {:.2} GB",
+            s.duplicate_groups.len(),
+            total_wasted as f64 / 1_073_741_824.0
+        )).color(Colors::TEXT).size(9.0));
+        if let Some(ts) = s.duplicate_last_scan {
+            ui.add_space(8.0);
+            let formatted = chrono::DateTime::from_timestamp(ts, 0)
+                .map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| ts.to_string());
+            ui.label(RichText::new(format!("LAST SCAN: {}", formatted)).color(Colors::TEXT_DIM).size(8.0));
+        }
+    });
+
+    egui::Frame::none()
+        .fill(Colors::BG_WIDGET)
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .show(ui, |ui| {
+        if s.duplicate_groups.is_empty() {
+            let msg = if s.duplicate_last_scan.is_none() {
+                "No scan run yet. Set filters above and click RUN DUPLICATE ANALYSIS.".to_string()
+            } else {
+                let (hashed, total) = s.hashing_progress;
+                if total > 0 && hashed < total {
+                    format!(
+                        "No duplicates found in last scan. Note: {}/{} files still unhashed — more duplicates may appear once hashing is complete.",
+                        total - hashed, total
+                    )
+                } else {
+                    "No duplicates found in last scan. All hashed files are unique.".to_string()
+                }
+            };
+            ui.label(RichText::new("DUPLICATE GROUPS").color(Colors::TEXT_DIM).size(8.0).strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new(msg).color(Colors::TEXT_MUTED).size(8.0).italics());
+        } else {
+            ui.label(RichText::new("DUPLICATE GROUPS — SELECT FILES TO DELETE").color(Colors::TEXT_DIM).size(8.0).strong());
+                ui.add_space(6.0);
+
+                // Snapshot display data so closures below don't borrow s
+                let groups: &[(String, u64, Vec<FileSearchResult>)] = s.duplicate_groups;
+                let max_show = s.file_manager.duplicate_max_groups.min(groups.len());
+
+                struct DupFileRow {
+                    id: i64,
+                    path: std::path::PathBuf,
+                    device_id: String,
+                    label: String,
+                    selected: bool,
+                }
+                struct DupGroupRow {
+                    hash: String,
+                    hash_short: String,
+                    size: u64,
+                    wasted: u64,
+                    file_count: usize,
+                    expanded: bool,
+                    files: Vec<DupFileRow>,
+                    selected_count: usize,
+                }
+
+                let display: Vec<DupGroupRow> = groups.iter().take(max_show).map(|(hash, size, files)| {
+                    let expanded = s.file_manager.duplicate_expanded_groups.contains(hash.as_str());
+                    let file_rows: Vec<DupFileRow> = files.iter().map(|f| {
+                        let selected = s.file_manager.duplicate_selected_files.contains(&f.id);
+                        DupFileRow {
+                            id: f.id,
+                            path: f.path.clone(),
+                            device_id: f.device_id.clone(),
+                            label: format!("[{}]  {}", f.device_name, f.path.display()),
+                            selected,
+                        }
+                    }).collect();
+                    let selected_count = file_rows.iter().filter(|f| f.selected).count();
+                    DupGroupRow {
+                        hash: hash.clone(),
+                        hash_short: hash[..std::cmp::min(8, hash.len())].to_string(),
+                        size: *size,
+                        wasted: size.saturating_mul(files.len().saturating_sub(1) as u64),
+                        file_count: files.len(),
+                        expanded,
+                        files: file_rows,
+                        selected_count,
+                    }
+                }).collect();
+
+                // Accumulate at most one state change per frame (single click per frame)
+                let mut toggle_hash: Option<String> = None;
+                let mut toggle_file: Option<(i64, bool)> = None;
+                let mut delete_files: Vec<(i64, std::path::PathBuf, String)> = Vec::new();
+
+                ScrollArea::vertical().id_source("storage_dup_groups").max_height(360.0).show(ui, |ui| {
+                    for g in &display {
+                        // Header row: expand arrow + summary
+                        let arrow_clicked = ui.horizontal(|ui| {
+                            let arrow = if g.expanded { "▼" } else { "▶" };
+                            let clicked = theme::micro_button(ui, arrow).clicked();
+                            let header = format!(
+                                "[{}]  {} copies  |  {} each  |  wasted {:.1} MB",
+                                g.hash_short, g.file_count,
+                                crate::telemetry::fmt_bytes(g.size),
+                                g.wasted as f64 / 1_048_576.0
+                            );
+                            ui.label(RichText::new(&header).color(Colors::TEXT).size(8.0));
+                            clicked
+                        }).inner;
+
+                        if arrow_clicked {
+                            toggle_hash = Some(g.hash.clone());
+                        }
+
+                        // Per-file rows with checkboxes (shown when expanded)
+                        if g.expanded {
+                            for file in &g.files {
+                                let (fid, new_state) = ui.horizontal(|ui| {
+                                    ui.add_space(18.0);
+                                    let mut checked = file.selected;
+                                    let changed = ui.checkbox(&mut checked, RichText::new(&file.label).size(7.5).color(Colors::TEXT_DIM)).changed();
+                                    (file.id, if changed { Some(checked) } else { None })
+                                }).inner;
+                                if let Some(state) = new_state {
+                                    toggle_file = Some((fid, state));
+                                }
+                            }
+
+                            if g.selected_count > 0 {
+                                ui.add_space(3.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(18.0);
+                                    let del_label = format!("DELETE {} SELECTED", g.selected_count);
+                                    if theme::danger_button(ui, &del_label).clicked() {
+                                        delete_files.extend(
+                                            g.files.iter().filter(|f| f.selected)
+                                                .map(|f| (f.id, f.path.clone(), f.device_id.clone()))
+                                        );
+                                    }
+                                });
+                                ui.add_space(3.0);
+                            }
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+
+                // Apply mutations after rendering (borrow checker: s is fully free here)
+                if let Some(hash) = toggle_hash {
+                    if s.file_manager.duplicate_expanded_groups.contains(&hash) {
+                        s.file_manager.duplicate_expanded_groups.remove(&hash);
+                    } else {
+                        s.file_manager.duplicate_expanded_groups.insert(hash);
+                    }
+                }
+                if let Some((id, sel)) = toggle_file {
+                    if sel {
+                        s.file_manager.duplicate_selected_files.insert(id);
+                    } else {
+                        s.file_manager.duplicate_selected_files.remove(&id);
+                    }
+                }
+                if !delete_files.is_empty() {
+                    actions.delete_duplicate_files = Some(delete_files);
+                }
+        } // else
+    }); // Frame
+
+    ui.add_space(12.0);
+    egui::Frame::none()
+        .fill(Colors::BG_WIDGET)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .show(ui, |ui| {
+            ui.label(RichText::new("GOOGLE DRIVE BUFFER PIPELINE").color(Colors::TEXT_DIM).size(8.0).strong());
+            ui.add_space(6.0);
+            ui.label(RichText::new(
+                "Exports one canonical original per duplicate group into a structured staging tree with metadata sidecars."
+            ).color(Colors::TEXT_MUTED).size(8.0));
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("REMOTE").color(Colors::TEXT_DIM).size(8.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut s.file_manager.drive_remote)
+                        .desired_width(260.0)
+                        .hint_text("gdrive:THEGRID-BUFFER")
+                );
+            });
+
+            if let Some(path) = s.drive_last_manifest {
+                ui.add_space(4.0);
+                ui.label(RichText::new(format!("MANIFEST: {}", path.display())).color(Colors::GREEN).size(8.0));
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if theme::secondary_button(ui, "EXPORT CANONICALS TO BUFFER").clicked() {
+                    actions.export_drive_buffer = true;
+                }
+                if theme::primary_button(ui, "UPLOAD BUFFER TO DRIVE").clicked() {
+                    actions.upload_drive_buffer = true;
+                }
+            });
+        });
+
     if let Some(telem) = s.telemetry {
         ui.label(RichText::new("STORAGE SNAPSHOT").color(Colors::GREEN).size(10.0).strong());
         ui.add_space(12.0);
@@ -2822,7 +3270,7 @@ fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, _actions: &mut DetailAct
 
                             ui.add_space(8.0);
                             if theme::secondary_button(ui, "⬡ SCAN DRIVE").clicked() {
-                                _actions.scan_remote = true;
+                                actions.scan_remote = true;
                             }
                         });
                     });

@@ -24,6 +24,32 @@ struct TerminalSession {
     output_buffer: Arc<Mutex<VecDeque<u8>>>,
 }
 
+/// In-memory state for the compute-sharing protocol on this node.
+struct ComputeState {
+    active_tasks: HashMap<String, thegrid_core::models::ComputeTaskProgress>,
+    max_parallel: u8,
+}
+
+impl ComputeState {
+    fn new(max_parallel: u8) -> Self {
+        Self { active_tasks: HashMap::new(), max_parallel }
+    }
+
+    fn is_available(&self) -> bool {
+        self.active_tasks.len() < self.max_parallel as usize
+    }
+
+    fn status(&self) -> thegrid_core::models::ComputeStatus {
+        thegrid_core::models::ComputeStatus {
+            available: self.is_available(),
+            active_tasks: self.active_tasks.len() as u32,
+            queued_tasks: 0,
+            max_parallel_tasks: self.max_parallel,
+            busy_until_estimate_secs: None,
+        }
+    }
+}
+
 pub struct AgentServer {
     port: u16,
     api_key: String,
@@ -32,6 +58,7 @@ pub struct AgentServer {
     ts_client: Option<Arc<TailscaleClient>>,
     config: Arc<Mutex<Config>>,
     terminal_sessions: Mutex<HashMap<String, TerminalSession>>,
+    compute_state: Mutex<ComputeState>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -43,14 +70,17 @@ impl AgentServer {
         event_tx: mpsc::Sender<AppEvent>,
         config: Arc<Mutex<Config>>,
     ) -> Self {
-        Self { 
-            port, 
-            api_key, 
-            transfers_dir, 
+        Self {
+            port,
+            api_key,
+            transfers_dir,
             event_tx,
             ts_client: None,
-            config,
+            config: config.clone(),
             terminal_sessions: Mutex::new(HashMap::new()),
+            compute_state: Mutex::new(ComputeState::new(
+                config.lock().map(|c| c.max_parallel_compute_tasks).unwrap_or(2)
+            )),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -903,6 +933,125 @@ impl AgentServer {
             return Ok(());
         }
 
+        // ── Compute sharing ────────────────────────────────────────────────
+        // GET /v1/compute/status
+        if method == "GET" && url == "/v1/compute/status" {
+            let status = self.compute_state.lock()
+                .map(|cs| cs.status())
+                .unwrap_or_else(|_| thegrid_core::models::ComputeStatus {
+                    available: false,
+                    active_tasks: 0,
+                    queued_tasks: 0,
+                    max_parallel_tasks: 0,
+                    busy_until_estimate_secs: None,
+                });
+            let body = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+            req.respond(Response::from_string(body)
+                .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()))?;
+            return Ok(());
+        }
+
+        // POST /v1/compute/request
+        if method == "POST" && url == "/v1/compute/request" {
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body)?;
+            let task_req: Result<thegrid_core::models::ComputeTaskRequest, _> = serde_json::from_str(&body);
+            match task_req {
+                Err(e) => {
+                    req.respond(Response::from_string(format!(r#"{{"ok":false,"error":"bad request: {e}"}}"#))
+                        .with_status_code(400)
+                        .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()))?;
+                }
+                Ok(task) => {
+                    let mut cs = self.compute_state.lock().unwrap();
+                    let receipt = if cs.is_available() {
+                        let progress = thegrid_core::models::ComputeTaskProgress {
+                            task_id: task.task_id.clone(),
+                            state: thegrid_core::models::ComputeTaskState::Queued,
+                            pct: 0,
+                            result_uri: None,
+                            error: None,
+                        };
+                        cs.active_tasks.insert(task.task_id.clone(), progress);
+                        // Emit event so runtime can execute the task
+                        let _ = self.event_tx.send(AppEvent::ComputeTaskUpdate(
+                            thegrid_core::models::ComputeTaskProgress {
+                                task_id: task.task_id.clone(),
+                                state: thegrid_core::models::ComputeTaskState::Queued,
+                                pct: 0,
+                                result_uri: None,
+                                error: None,
+                            }
+                        ));
+                        thegrid_core::models::ComputeTaskReceipt {
+                            task_id: task.task_id,
+                            accepted: true,
+                            reason_if_rejected: None,
+                            eta_secs: Some(5),
+                        }
+                    } else {
+                        thegrid_core::models::ComputeTaskReceipt {
+                            task_id: task.task_id,
+                            accepted: false,
+                            reason_if_rejected: Some("max_tasks_reached".to_string()),
+                            eta_secs: None,
+                        }
+                    };
+                    let body = serde_json::to_string(&receipt).unwrap_or_else(|_| "{}".to_string());
+                    req.respond(Response::from_string(body)
+                        .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()))?;
+                }
+            }
+            return Ok(());
+        }
+
+        // GET /v1/compute/progress/<task_id>
+        if method == "GET" && url.starts_with("/v1/compute/progress/") {
+            let task_id = url.trim_start_matches("/v1/compute/progress/").to_string();
+            let progress = self.compute_state.lock().ok()
+                .and_then(|cs| cs.active_tasks.get(&task_id).cloned());
+            match progress {
+                Some(p) => {
+                    let body = serde_json::to_string(&p).unwrap_or_else(|_| "{}".to_string());
+                    req.respond(Response::from_string(body)
+                        .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()))?;
+                }
+                None => {
+                    req.respond(Response::from_string(r#"{"error":"task not found"}"#)
+                        .with_status_code(404)
+                        .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()))?;
+                }
+            }
+            return Ok(());
+        }
+
+        // DELETE /v1/compute/cancel/<task_id>
+        if method == "DELETE" && url.starts_with("/v1/compute/cancel/") {
+            let task_id = url.trim_start_matches("/v1/compute/cancel/").to_string();
+            let removed = self.compute_state.lock()
+                .map(|mut cs| cs.active_tasks.remove(&task_id).is_some())
+                .unwrap_or(false);
+            let body = if removed {
+                r#"{"ok":true}"#
+            } else {
+                r#"{"ok":false,"error":"task not found"}"#
+            };
+            req.respond(Response::from_string(body)
+                .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()))?;
+            return Ok(());
+        }
+
+        // POST /v1/compute/result_ack/<task_id>
+        if method == "POST" && url.starts_with("/v1/compute/result_ack/") {
+            let task_id = url.trim_start_matches("/v1/compute/result_ack/").to_string();
+            if let Ok(mut cs) = self.compute_state.lock() {
+                cs.active_tasks.remove(&task_id);
+            }
+            req.respond(Response::from_string(r#"{"ok":true}"#)
+                .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()))?;
+            return Ok(());
+        }
+
         req.respond(Response::from_string("Not found").with_status_code(404))?;
         Ok(())
     }
@@ -1257,6 +1406,72 @@ impl AgentClient {
         resp.json().context("Parsing remote search response")
     }
 
+    /// GET /v1/compute/status
+    pub fn get_compute_status(&self) -> Result<thegrid_core::models::ComputeStatus> {
+        let endpoint = format!("{}/v1/compute/status", self.base_url);
+        let resp = self.http.get(&endpoint)
+            .header("X-Grid-Key", &self.api_key)
+            .send()
+            .context("GET /v1/compute/status")?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(resp.json()?)
+    }
+
+    /// POST /v1/compute/request
+    pub fn post_compute_request(&self, req: &thegrid_core::models::ComputeTaskRequest) -> Result<thegrid_core::models::ComputeTaskReceipt> {
+        let endpoint = format!("{}/v1/compute/request", self.base_url);
+        let resp = self.http.post(&endpoint)
+            .header("X-Grid-Key", &self.api_key)
+            .json(req)
+            .send()
+            .context("POST /v1/compute/request")?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(resp.json()?)
+    }
+
+    /// GET /v1/compute/progress/{task_id}
+    pub fn get_compute_progress(&self, task_id: &str) -> Result<thegrid_core::models::ComputeTaskProgress> {
+        let endpoint = format!("{}/v1/compute/progress/{}", self.base_url, task_id);
+        let resp = self.http.get(&endpoint)
+            .header("X-Grid-Key", &self.api_key)
+            .send()
+            .context("GET /v1/compute/progress")?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(resp.json()?)
+    }
+
+    /// POST /v1/compute/result_ack/{task_id}
+    pub fn ack_compute_result(&self, task_id: &str) -> Result<()> {
+        let endpoint = format!("{}/v1/compute/result_ack/{}", self.base_url, task_id);
+        let resp = self.http.post(&endpoint)
+            .header("X-Grid-Key", &self.api_key)
+            .send()
+            .context("POST /v1/compute/result_ack")?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(())
+    }
+
+    /// DELETE /v1/compute/cancel/{task_id}
+    pub fn cancel_compute_task(&self, task_id: &str) -> Result<()> {
+        let endpoint = format!("{}/v1/compute/cancel/{}", self.base_url, task_id);
+        let resp = self.http.delete(&endpoint)
+            .header("X-Grid-Key", &self.api_key)
+            .send()
+            .context("DELETE /v1/compute/cancel")?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(())
+    }
+
     pub fn update_config(&self, device_type: Option<String>, model: Option<String>, url: Option<String>) -> Result<()> {
         let endpoint = format!("{}/v1/config", self.base_url);
         let body = serde_json::json!({
@@ -1386,12 +1601,13 @@ fn collect_telemetry(config: &Config) -> NodeTelemetry {
 
     let capabilities = DeviceCapabilities {
         ai_models,
-        has_camera: true,        // Stubbed for now as agreed
-        has_microphone: true,    // Stubbed for now as agreed
-        has_speakers: true,      // Stubbed for now as agreed
+        has_camera: true,
+        has_microphone: true,
+        has_speakers: true,
         drives: drive_infos,
         has_rdp: crate::win_sys::is_rdp_enabled(),
         has_file_access: config.enable_file_access,
+        compute: Default::default(),
     };
 
     // GPU info (Windows CIM/PowerShell best-effort with WMIC fallback)
@@ -1865,7 +2081,7 @@ mod tests {
     fn test_agent_ping_auth_logic() {
         use mpsc::channel;
         let (tx, _rx) = channel();
-        let config = Config::default();
+        let config = std::sync::Arc::new(std::sync::Mutex::new(Config::default()));
         let api_key = "test_key".to_string();
         let server = AgentServer::new(0, api_key.clone(), PathBuf::from("."), tx, config.clone());
         

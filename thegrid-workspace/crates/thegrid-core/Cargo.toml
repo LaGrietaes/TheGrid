@@ -4,6 +4,9 @@ version     = "0.1.0"
 edition     = "2021"
 description = "Shared models, config persistence, and SQLite index layer for THE GRID"
 
+[features]
+test-support = []
+
 [dependencies]
 serde       = { workspace = true }
 serde_json  = { workspace = true }
@@ -26,5 +29,8 @@ dirs        = "5"
 # 'debouncer-mini' wraps raw events to deduplicate rapid bursts (e.g. save storms)
 notify              = "6"
 notify-debouncer-mini = { version = "0.4", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
 
 # Phase 2: Hashing

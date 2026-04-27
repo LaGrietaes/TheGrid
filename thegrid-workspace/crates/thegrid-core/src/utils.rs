@@ -97,17 +97,16 @@ pub struct ScannedFile {
 }
 
 /// Recursively scan a directory and collect file information.
-/// Skips common build/cache/vcs directories and hidden files.
+/// Uses classify_directory() to skip or deprioritize ineligible paths.
 fn scan_directory_recursive(
     root: &Path,
     current: &Path,
     collected: &mut Vec<ScannedFile>,
     scanned_count: &mut u64,
 ) -> Result<()> {
-    // Read directory entries
     let entries = match std::fs::read_dir(current) {
         Ok(e) => e,
-        Err(_) => return Ok(()), // Skip inaccessible directories
+        Err(_) => return Ok(()),
     };
 
     for entry in entries.flatten() {
@@ -115,16 +114,18 @@ fn scan_directory_recursive(
         let file_name = entry.file_name();
         let name_str = file_name.to_string_lossy();
 
-        // Skip common build/cache directories and hidden files
         if crate::db::should_skip_dir(&name_str) {
             continue;
         }
 
         if path.is_dir() {
-            // Recurse into subdirectories
-            let _ = scan_directory_recursive(root, &path, collected, scanned_count);
+            // Classify the sub-directory before recursing
+            let (tier, _reason) = crate::indexing::classify_directory(&path, &[]);
+            match tier {
+                crate::models::IndexingTier::Tier0Exclude => continue,
+                _ => { let _ = scan_directory_recursive(root, &path, collected, scanned_count); }
+            }
         } else if path.is_file() {
-            // Fingerprint the file
             if let Ok(fingerprint) = fingerprint_file(&path) {
                 collected.push(ScannedFile { path, fingerprint });
                 *scanned_count += 1;
@@ -133,6 +134,15 @@ fn scan_directory_recursive(
     }
 
     Ok(())
+}
+
+/// Pure scan: collect all files under `root` without touching the database.
+/// Used by the FileScanner trait and integration tests.
+pub fn collect_files_in_directory(root: &Path) -> Result<Vec<ScannedFile>> {
+    let mut collected = Vec::new();
+    let mut count = 0u64;
+    scan_directory_recursive(root, root, &mut collected, &mut count)?;
+    Ok(collected)
 }
 
 /// Scan a directory and batch-insert files into the database.

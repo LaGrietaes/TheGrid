@@ -250,4 +250,38 @@ pub enum AppEvent {
     // Phase 4: Persistence & Idle
     UserIdle(bool), // true if idle > 10m
     RequestIdleWork,
+
+    // ── Compute sharing ────────────────────────────────────────────────────
+    /// This device successfully delegated a task to a remote peer.
+    ComputeBorrowOk {
+        task_id: String,
+        provider_device_id: String,
+        task_type: crate::models::ComputeTaskType,
+    },
+
+    /// Compute borrow attempt failed (peer rejected or timed out).
+    ComputeBorrowFailed {
+        task_id: String,
+        reason: String,
+    },
+
+    /// Progress update for an in-flight compute task (local or borrowed).
+    ComputeTaskUpdate(crate::models::ComputeTaskProgress),
+
+    // ── Google Drive ───────────────────────────────────────────────────────
+    /// Drive OAuth token expired or missing — user must re-authenticate.
+    DriveAuthExpired,
+
+    /// Drive metadata indexing progress.
+    DriveIndexProgress { indexed: u64, total: Option<u64> },
+
+    /// Drive metadata indexing complete.
+    DriveIndexComplete { indexed: u64 },
+
+    /// Drive indexing encountered a non-fatal error.
+    DriveIndexError(String),
+
+    // ── Duplicate groups (rich cross-source format) ────────────────────────
+    /// Rich duplicate groups ready for review UI.
+    DuplicatesGrouped(Vec<crate::models::DuplicateGroup>),
 }

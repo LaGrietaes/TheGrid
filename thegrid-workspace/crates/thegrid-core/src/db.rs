@@ -167,9 +167,54 @@ impl Database {
                 device_name TEXT NOT NULL,
                 last_seen   INTEGER NOT NULL
             );
+
+            -- ── Hashing checkpoint (KV store for resumable hashing sessions) ──
+            CREATE TABLE IF NOT EXISTS hashing_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            -- ── Embedding priority queue ──────────────────────────────────────
+            CREATE TABLE IF NOT EXISTS embedding_queue (
+                file_id    INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                priority   INTEGER NOT NULL DEFAULT 3,
+                queued_at  INTEGER NOT NULL,
+                attempts   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_emb_queue_priority ON embedding_queue(priority ASC, queued_at ASC);
+
+            -- ── Indexing audit log (classification decisions) ─────────────────
+            CREATE TABLE IF NOT EXISTS indexing_log (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                path      TEXT    NOT NULL,
+                tier      TEXT    NOT NULL,
+                reason    TEXT    NOT NULL,
+                logged_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_indexing_log_logged_at ON indexing_log(logged_at DESC);
+
+            -- ── Deletion audit (immutable safety record) ─────────────────────
+            CREATE TABLE IF NOT EXISTS deletion_audit (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT    NOT NULL,
+                file_path   TEXT    NOT NULL,
+                device_id   TEXT    NOT NULL,
+                file_hash   TEXT,
+                file_size   INTEGER,
+                action      TEXT    NOT NULL,
+                reason      TEXT,
+                executed_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_deletion_audit_session ON deletion_audit(session_id);
         "#).context("Initializing database schema")?;
+
+        // Migrate existing DBs: add new columns if missing
         self.add_column_if_missing("ALTER TABLE files ADD COLUMN quick_hash TEXT")?;
         self.add_column_if_missing("ALTER TABLE files ADD COLUMN detected_by TEXT NOT NULL DEFAULT 'full_scan'")?;
+        self.add_column_if_missing("ALTER TABLE files ADD COLUMN source_type TEXT NOT NULL DEFAULT 'Local'")?;
+        self.add_column_if_missing("ALTER TABLE files ADD COLUMN github_backed INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_missing("ALTER TABLE files ADD COLUMN indexing_tier TEXT NOT NULL DEFAULT 'FullIndex'")?;
+        self.add_column_if_missing("ALTER TABLE files ADD COLUMN md5_hash TEXT")?;
         log::info!("[DB] Schema ready");
         Ok(())
     }
@@ -331,6 +376,45 @@ impl Database {
             results.push((hash, size, file_list));
         }
         Ok(results)
+    }
+
+    /// Cross-device duplicate stats for a specific machine vector.
+    /// Uses cached mesh index data, so peers do not need to be online.
+    pub fn crosscheck_duplicates_for_device(&self, target_device_id: &str) -> Result<(u64, u64, u64, u64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hash, size,
+                    COUNT(*) AS total_files,
+                    SUM(CASE WHEN device_id = ?1 THEN 1 ELSE 0 END) AS target_files,
+                    COUNT(DISTINCT device_id) AS distinct_devices
+             FROM files
+             WHERE hash IS NOT NULL AND hash != '' AND hash NOT LIKE 'ERR_%'
+             GROUP BY hash, size
+             HAVING target_files > 0 AND distinct_devices > 1 AND total_files > 1"
+        )?;
+
+        let rows = stmt.query_map(params![target_device_id], |row| {
+            let size: i64 = row.get(1)?;
+            let target_files: i64 = row.get(3)?;
+            Ok((size as u64, target_files as u64))
+        })?;
+
+        let mut groups = 0u64;
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        for row in rows {
+            let (size, target_files) = row?;
+            groups += 1;
+            files = files.saturating_add(target_files);
+            bytes = bytes.saturating_add(size.saturating_mul(target_files));
+        }
+
+        let known_devices = self.conn.query_row(
+            "SELECT COUNT(DISTINCT device_id) FROM files",
+            [],
+            |r| r.get::<_, i64>(0),
+        ).unwrap_or(0);
+
+        Ok((groups, files, bytes, known_devices.max(0) as u64))
     }
 
     pub fn delete_file_by_id(&self, id: i64) -> Result<()> {
@@ -558,6 +642,15 @@ impl Database {
             |row| row.get(0)
         )?;
         Ok(n)
+    }
+
+    pub fn count_files_needing_hash(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE (hash IS NULL OR hash = '') AND path IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
     }
 
     pub fn get_files_needing_hash(&self, limit: usize) -> Result<Vec<(i64, PathBuf)>> {
@@ -1295,6 +1388,309 @@ impl Database {
         ).map_err(Into::into)
     }
 
+    // ── SKIP_UNIQUE quick-hash pre-filter ─────────────────────────────────
+
+    /// Returns true if any *other* file (different id) shares (quick_hash, size).
+    /// Used by the hashing worker to skip full-hash on files with no plausible duplicates.
+    pub fn has_quick_hash_peer(&self, file_id: i64, quick_hash: &str, size: u64) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files
+             WHERE quick_hash = ?1 AND size = ?2 AND id != ?3",
+            params![quick_hash, size as i64, file_id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Mark a file as unique (no quick_hash peer found); skips full hashing.
+    pub fn mark_file_skip_unique(&self, file_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET hash = 'SKIP_UNIQUE' WHERE id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// When a new file is indexed that matches (quick_hash, size) of a SKIP_UNIQUE file,
+    /// reset the SKIP_UNIQUE so it gets re-hashed next cycle.
+    pub fn reset_skip_unique_peers(&self, quick_hash: &str, size: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE files SET hash = NULL WHERE quick_hash = ?1 AND size = ?2 AND hash = 'SKIP_UNIQUE'",
+            params![quick_hash, size as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Count files still needing a hash (excludes SKIP_UNIQUE and ERR_ markers).
+    pub fn count_files_needing_hash_v2(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files
+             WHERE (hash IS NULL OR hash = '') AND path IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    // ── Hashing checkpoint ────────────────────────────────────────────────
+
+    pub fn get_hashing_checkpoint(&self) -> Result<Option<i64>> {
+        let val: Option<String> = self.conn.query_row(
+            "SELECT value FROM hashing_state WHERE key = 'last_processed_id'",
+            [],
+            |r| r.get(0),
+        ).optional()?;
+        Ok(val.and_then(|v| v.parse::<i64>().ok()))
+    }
+
+    pub fn set_hashing_checkpoint(&self, last_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO hashing_state (key, value) VALUES ('last_processed_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![last_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    // ── Embedding queue ───────────────────────────────────────────────────
+
+    pub fn queue_embedding_for_file(&self, file_id: i64, priority: u8) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO embedding_queue (file_id, priority, queued_at, attempts)
+             VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(file_id) DO UPDATE SET
+               priority  = MIN(priority, excluded.priority)",
+            params![file_id, priority as i64, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    /// Return the next batch from the embedding queue ordered by priority then queued_at.
+    /// Returns (file_id, text_for_embedding).
+    pub fn get_embedding_queue_batch(&self, limit: usize) -> Result<Vec<(i64, String, u8)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT q.file_id, f.name || ' ' || COALESCE(f.ext, ''), q.priority
+             FROM embedding_queue q
+             JOIN files f ON f.id = q.file_id
+             ORDER BY q.priority ASC, q.queued_at ASC
+             LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? as u8))
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    pub fn dequeue_embedding(&self, file_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM embedding_queue WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn increment_embedding_attempts(&self, file_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE embedding_queue SET attempts = attempts + 1 WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn count_embedding_queue(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM embedding_queue", [], |r| r.get(0)
+        )?;
+        Ok(n.max(0) as usize)
+    }
+
+    // ── Indexing audit log ────────────────────────────────────────────────
+
+    pub fn log_indexing_decision(&self, path: &str, tier: &str, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO indexing_log (path, tier, reason, logged_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![path, tier, reason, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_indexing_log(&self, limit: usize) -> Result<Vec<(String, String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, tier, reason, logged_at FROM indexing_log
+             ORDER BY logged_at DESC LIMIT ?1"
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    // ── Deletion audit ────────────────────────────────────────────────────
+
+    pub fn log_deletion(
+        &self,
+        session_id: &str,
+        file_path: &str,
+        device_id: &str,
+        file_hash: Option<&str>,
+        file_size: Option<u64>,
+        action: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO deletion_audit
+               (session_id, file_path, device_id, file_hash, file_size, action, reason, executed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                session_id,
+                file_path,
+                device_id,
+                file_hash,
+                file_size.map(|s| s as i64),
+                action,
+                reason,
+                unix_now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_deletion_audit(&self, session_id: &str) -> Result<Vec<crate::models::DeletionRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, file_path, device_id, file_hash, file_size, action, reason, executed_at
+             FROM deletion_audit
+             WHERE session_id = ?1
+             ORDER BY id ASC"
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(crate::models::DeletionRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                file_path: row.get(2)?,
+                device_id: row.get(3)?,
+                file_hash: row.get(4)?,
+                file_size: row.get::<_, Option<i64>>(5)?.map(|s| s as u64),
+                action: row.get(6)?,
+                reason: row.get(7)?,
+                executed_at: row.get(8)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    // ── Cross-source duplicate groups ─────────────────────────────────────
+
+    /// Returns rich duplicate groups with per-source breakdowns.
+    /// Excludes SKIP_UNIQUE and ERR_ sentinels. Respects github_backed filter.
+    pub fn get_cross_source_duplicate_groups(
+        &self,
+        filter: &crate::models::DuplicateScanFilter,
+        include_github_backed: bool,
+    ) -> Result<Vec<crate::models::DuplicateGroup>> {
+        let github_filter = if include_github_backed { "" } else { "AND github_backed = 0" };
+
+        let sql = format!(
+            "SELECT hash, size, COUNT(*) as cnt, COUNT(DISTINCT device_id) as srcs
+             FROM files
+             WHERE hash IS NOT NULL
+               AND hash != ''
+               AND hash NOT LIKE 'ERR_%'
+               AND hash != 'SKIP_UNIQUE'
+               {}
+             GROUP BY hash, size
+             HAVING cnt > 1",
+            github_filter
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let candidates: Vec<(String, u64, u64, u64)> = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        let mut groups = Vec::new();
+        for (hash, size, file_count, source_count) in candidates {
+            if filter.min_size_bytes > 0 && size < filter.min_size_bytes {
+                continue;
+            }
+            if groups.len() >= filter.max_groups {
+                break;
+            }
+
+            let mut file_stmt = self.conn.prepare(
+                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
+                 FROM files WHERE hash = ?1 AND size = ?2"
+            )?;
+            let files: Vec<crate::models::FileSearchResult> = file_stmt
+                .query_map(params![hash, size as i64], |r| self.map_search_result(r))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            if !filter.include_extensions.is_empty() {
+                let any_match = files.iter().any(|f| {
+                    f.ext.as_ref().map_or(false, |e| {
+                        filter.include_extensions.iter().any(|fe| fe.eq_ignore_ascii_case(e))
+                    })
+                });
+                if !any_match { continue; }
+            }
+
+            // Build per-source summaries
+            let mut source_map: std::collections::HashMap<String, (String, u32)> =
+                std::collections::HashMap::new();
+            for f in &files {
+                let e = source_map.entry(f.device_id.clone())
+                    .or_insert_with(|| (f.device_name.clone(), 0));
+                e.1 += 1;
+            }
+
+            let sources: Vec<crate::models::SourceSummary> = source_map
+                .into_iter()
+                .map(|(device_id, (device_name, cnt))| {
+                    let source_type = if device_id.starts_with("gdrive:") {
+                        crate::models::SourceType::GoogleDrive
+                    } else if device_id.starts_with("nas:") {
+                        crate::models::SourceType::Nas
+                    } else {
+                        crate::models::SourceType::Local
+                    };
+                    crate::models::SourceSummary { device_id, device_name, file_count: cnt, source_type }
+                })
+                .collect();
+
+            // Suggest anchor: prefer Local source with most files
+            let suggested_anchor = sources.iter()
+                .filter(|s| s.source_type == crate::models::SourceType::Local)
+                .max_by_key(|s| s.file_count)
+                .map(|s| s.device_id.clone());
+
+            groups.push(crate::models::DuplicateGroup {
+                hash: hash.clone(),
+                size,
+                file_count: file_count as u32,
+                source_count: source_count as u32,
+                sources,
+                files,
+                suggested_anchor,
+            });
+        }
+
+        Ok(groups)
+    }
+
     fn rename_path_tree(
         &self,
         device_id: &str,
@@ -1654,5 +2050,137 @@ mod tests {
             .expect("apply stale tombstone replay");
         assert!(!applied, "stale tombstone replay must be ignored");
         assert_eq!(db.file_count(Some("dev-a")).expect("final count"), 1);
+    }
+
+    // ── New testability / fixture tests ───────────────────────────────────────
+
+    #[test]
+    fn dedup_query_finds_same_hash_files() {
+        let db = Database::open(":memory:").expect("open db");
+
+        // Two files on same device with same hash → one duplicate group
+        db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/photo.jpg"), 1000, None, None, Some("abc123"), DetectionSource::FullScan, 100).unwrap();
+        db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/b/photo.jpg"), 1000, None, None, Some("abc123"), DetectionSource::FullScan, 100).unwrap();
+        // Unique file
+        db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/c/unique.jpg"), 500, None, None, Some("xyz999"), DetectionSource::FullScan, 100).unwrap();
+
+        let groups = db.get_duplicate_groups().expect("dedup query");
+        assert_eq!(groups.len(), 1, "expected exactly one duplicate group");
+        assert_eq!(groups[0].0, "abc123");
+        assert_eq!(groups[0].2.len(), 2);
+    }
+
+    #[test]
+    fn dedup_query_excludes_skip_unique_sentinel() {
+        let db = Database::open(":memory:").expect("open db");
+
+        let id1 = db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/file.txt"), 100, None, Some("qh1"), None, DetectionSource::FullScan, 100).unwrap();
+        db.mark_file_skip_unique(id1).unwrap();
+
+        // SKIP_UNIQUE files must never appear in a duplicate group
+        let groups = db.get_duplicate_groups().expect("dedup query");
+        assert!(groups.is_empty(), "SKIP_UNIQUE files must not appear in dedup groups");
+    }
+
+    #[test]
+    fn cross_device_dedup_detected() {
+        let db = Database::open(":memory:").expect("open db");
+
+        // Same file on two different devices
+        db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/photo.jpg"), 2000, None, None, Some("shared_hash"), DetectionSource::FullScan, 100).unwrap();
+        db.index_file_with_source("dev-b", "B", &PathBuf::from("D:/b/photo.jpg"), 2000, None, None, Some("shared_hash"), DetectionSource::Sync, 100).unwrap();
+
+        let (groups, files, bytes, devices) = db.crosscheck_duplicates_for_device("dev-a").unwrap();
+        assert_eq!(groups, 1, "one cross-device duplicate group");
+        assert_eq!(files, 1, "one file from dev-a in the group");
+        assert!(bytes > 0);
+        assert!(devices >= 2);
+    }
+
+    #[test]
+    fn embedding_queue_enqueue_dequeue_cycle() {
+        let db = Database::open(":memory:").expect("open db");
+
+        let id = db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/doc.txt"), 100, None, None, None, DetectionSource::FullScan, 100).unwrap();
+        db.queue_embedding_for_file(id, 2).unwrap();
+
+        let batch = db.get_embedding_queue_batch(10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, id);
+        assert_eq!(batch[0].2, 2); // priority
+
+        db.dequeue_embedding(id).unwrap();
+        let after = db.get_embedding_queue_batch(10).unwrap();
+        assert!(after.is_empty(), "queue should be empty after dequeue");
+    }
+
+    #[test]
+    fn embedding_queue_priority_order() {
+        let db = Database::open(":memory:").expect("open db");
+
+        let id1 = db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/low.txt"), 10, None, None, None, DetectionSource::FullScan, 100).unwrap();
+        let id2 = db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/high.txt"), 10, None, None, None, DetectionSource::FullScan, 100).unwrap();
+        db.queue_embedding_for_file(id1, 3).unwrap(); // low priority
+        db.queue_embedding_for_file(id2, 1).unwrap(); // high priority
+
+        let batch = db.get_embedding_queue_batch(10).unwrap();
+        assert_eq!(batch[0].0, id2, "high priority item should come first");
+    }
+
+    #[test]
+    fn has_quick_hash_peer_detects_same_file_pair() {
+        let db = Database::open(":memory:").expect("open db");
+
+        let id1 = db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/a.bin"), 500, None, Some("qhXYZ"), None, DetectionSource::FullScan, 100).unwrap();
+        let _id2 = db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/b.bin"), 500, None, Some("qhXYZ"), None, DetectionSource::FullScan, 100).unwrap();
+
+        let has_peer = db.has_quick_hash_peer(id1, "qhXYZ", 500).unwrap();
+        assert!(has_peer, "should detect the peer file with same quick_hash+size");
+    }
+
+    #[test]
+    fn has_quick_hash_peer_returns_false_for_unique_file() {
+        let db = Database::open(":memory:").expect("open db");
+        let id = db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/alone.bin"), 500, None, Some("qhUNIQ"), None, DetectionSource::FullScan, 100).unwrap();
+
+        let has_peer = db.has_quick_hash_peer(id, "qhUNIQ", 500).unwrap();
+        assert!(!has_peer, "lone file should have no quick_hash peer");
+    }
+
+    #[test]
+    fn hashing_checkpoint_roundtrip() {
+        let db = Database::open(":memory:").expect("open db");
+        assert!(db.get_hashing_checkpoint().unwrap().is_none());
+        db.set_hashing_checkpoint(42).unwrap();
+        assert_eq!(db.get_hashing_checkpoint().unwrap(), Some(42));
+        db.set_hashing_checkpoint(100).unwrap();
+        assert_eq!(db.get_hashing_checkpoint().unwrap(), Some(100));
+    }
+
+    #[test]
+    fn deletion_audit_records_are_persisted() {
+        let db = Database::open(":memory:").expect("open db");
+        db.log_deletion("sess-1", "C:/a/file.jpg", "dev-a", Some("hashX"), Some(1024), "deleted", Some("duplicate")).unwrap();
+        db.log_deletion("sess-1", "C:/b/file.jpg", "dev-b", None, None, "skipped", None).unwrap();
+
+        let records = db.get_deletion_audit("sess-1").unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].action, "deleted");
+        assert_eq!(records[1].action, "skipped");
+    }
+
+    #[test]
+    fn cross_source_dedup_groups_produced() {
+        let db = Database::open(":memory:").expect("open db");
+
+        db.index_file_with_source("dev-a", "A", &PathBuf::from("C:/a/pic.jpg"), 4096, None, None, Some("h1"), DetectionSource::FullScan, 100).unwrap();
+        db.index_file_with_source("gdrive:user@gmail.com", "Drive", &PathBuf::from("drive:/photos/pic.jpg"), 4096, None, None, Some("h1"), DetectionSource::Sync, 100).unwrap();
+
+        let filter = crate::models::DuplicateScanFilter::default();
+        let groups = db.get_cross_source_duplicate_groups(&filter, true).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].source_count, 2);
+        let has_drive = groups[0].sources.iter().any(|s| s.source_type == crate::models::SourceType::GoogleDrive);
+        assert!(has_drive, "should detect Drive as a separate source type");
     }
 }

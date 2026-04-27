@@ -3,6 +3,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::collections::HashSet;
 use anyhow::Result;
 use rusqlite::params;
 
@@ -526,6 +527,11 @@ impl AppRuntime {
                 if let Ok(guard) = db.lock() {
                     if guard.enqueue_index_root(&root).is_ok() {
                         accepted_roots += 1;
+                        let _ = tx.send(AppEvent::Status(format!(
+                            "grid_scan_drive_start:{}|{}",
+                            device_id,
+                            root.to_string_lossy()
+                        )));
                     }
                 }
             }
@@ -718,6 +724,15 @@ impl AppRuntime {
                         ext:     None,
                         estimated_total: total_hint == 0,
                     });
+                    let _ = tx.send(AppEvent::Status(format!(
+                        "grid_scan_progress:{}|{}|{}|{}|{}|{}",
+                        device_id,
+                        root,
+                        dir_path.to_string_lossy(),
+                        progress_scanned,
+                        stable_total,
+                        pending_dirs
+                    )));
                 }
                 local_scanned
             }));
@@ -735,6 +750,12 @@ impl AppRuntime {
             files_added: scanned_count,
             duration_ms: start.elapsed().as_millis() as u64,
         });
+        let _ = tx.send(AppEvent::Status(format!(
+            "grid_scan_complete:{}|{}|{}",
+            device_name,
+            scanned_count,
+            start.elapsed().as_millis() as u64
+        )));
 
         // Background worker triggers could go here
     }
@@ -742,6 +763,11 @@ impl AppRuntime {
     /// Scan the local index for exact-duplicate files (same hash + size).
     /// Emits `AppEvent::DuplicatesFound` with groups ready for UI or CLI display.
     pub fn spawn_duplicates_scan(&self) {
+        self.spawn_duplicates_scan_filtered(thegrid_core::models::DuplicateScanFilter::default());
+    }
+
+    /// Scan duplicates with GUI-provided filters to keep large indexes manageable.
+    pub fn spawn_duplicates_scan_filtered(&self, filter: thegrid_core::models::DuplicateScanFilter) {
         let db = Arc::clone(&self.db);
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
@@ -749,8 +775,70 @@ impl AppRuntime {
             let result = db.lock().map(|guard| guard.get_duplicate_groups());
             match result {
                 Ok(Ok(groups)) => {
-                    log::info!("[Runtime] Duplicate scan found {} group(s)", groups.len());
-                    let _ = tx.send(AppEvent::DuplicatesFound(groups));
+                    let raw_group_count = groups.len();
+                    let ext_filter: HashSet<String> = filter
+                        .include_extensions
+                        .iter()
+                        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                        .filter(|e| !e.is_empty())
+                        .collect();
+                    let path_prefix = filter.path_prefix
+                        .as_deref()
+                        .map(|p| p.to_lowercase())
+                        .filter(|p| !p.is_empty());
+
+                    let mut filtered_groups: Vec<(String, u64, Vec<thegrid_core::models::FileSearchResult>)> = Vec::new();
+                    for (hash, size, files) in groups {
+                        if size < filter.min_size_bytes {
+                            continue;
+                        }
+                        let mut keep = Vec::new();
+                        for file in files {
+                            if filter.exclude_system_paths && thegrid_core::should_skip_path(&file.path) {
+                                continue;
+                            }
+                            if let Some(device_id) = filter.device_id.as_deref() {
+                                if !device_id.is_empty() && file.device_id != device_id {
+                                    continue;
+                                }
+                            }
+                            if !ext_filter.is_empty() {
+                                let file_ext = file.ext.clone().unwrap_or_default().to_lowercase();
+                                if !ext_filter.contains(&file_ext) {
+                                    continue;
+                                }
+                            }
+                            if let Some(prefix) = path_prefix.as_deref() {
+                                let fp = file.path.to_string_lossy().to_lowercase();
+                                if !fp.starts_with(prefix) {
+                                    continue;
+                                }
+                            }
+                            keep.push(file);
+                        }
+
+                        if keep.len() > 1 {
+                            filtered_groups.push((hash, size, keep));
+                        }
+                    }
+
+                    filtered_groups.sort_by(|a, b| {
+                        let aw = a.1.saturating_mul(a.2.len().saturating_sub(1) as u64);
+                        let bw = b.1.saturating_mul(b.2.len().saturating_sub(1) as u64);
+                        bw.cmp(&aw)
+                    });
+
+                    let max_groups = filter.max_groups.max(1);
+                    if filtered_groups.len() > max_groups {
+                        filtered_groups.truncate(max_groups);
+                    }
+
+                    log::info!(
+                        "[Runtime] Duplicate scan found {} raw group(s), {} filtered group(s)",
+                        raw_group_count,
+                        filtered_groups.len()
+                    );
+                    let _ = tx.send(AppEvent::DuplicatesFound(filtered_groups));
                 }
                 Ok(Err(e)) => log::error!("[Runtime] Duplicate scan DB error: {}", e),
                 Err(_) => log::error!("[Runtime] Duplicate scan: DB lock poisoned"),
@@ -842,6 +930,11 @@ impl AppRuntime {
         };
 
         std::thread::spawn(move || {
+            let _ = event_tx.send(AppEvent::Status(format!(
+                "grid_sync_start:{}|{}",
+                device_id,
+                hostname
+            )));
             let last_ts = match db.lock() {
                 Ok(guard) => guard.get_node_sync_ts(&device_id).unwrap_or(0),
                 Err(_)    => 0,
@@ -915,9 +1008,20 @@ impl AppRuntime {
                 });
             }
 
-            if count > 0 {
-                let _ = event_tx.send(AppEvent::SyncComplete { device_id, files_added: count });
+            if let Ok(guard) = db.lock() {
+                if let Ok((groups, files, bytes, known_devices)) = guard.crosscheck_duplicates_for_device(&device_id) {
+                    let _ = event_tx.send(AppEvent::Status(format!(
+                        "crosscheck:{}|{}|{}|{}|{}",
+                        device_id,
+                        groups,
+                        files,
+                        bytes,
+                        known_devices
+                    )));
+                }
             }
+
+            let _ = event_tx.send(AppEvent::SyncComplete { device_id, files_added: count });
         });
     }
 
@@ -1154,10 +1258,21 @@ impl AppRuntime {
                     last_termux_heartbeat = std::time::Instant::now();
                 }
 
-                let batch = match db.lock() {
+                // Pull from priority queue first; fall back to unqueued files.
+                let batch: Vec<(i64, String)> = match db.lock() {
                     Ok(guard) => {
                         let target_batch = (20usize).saturating_mul(max_parallel_requests).min(200);
-                        guard.get_files_needing_embedding(target_batch).unwrap_or_default()
+                        let queued = guard.get_embedding_queue_batch(target_batch).unwrap_or_default();
+                        if queued.is_empty() {
+                            // Queue is drained; re-seed from files without embeddings
+                            let unqueued = guard.get_files_needing_embedding(target_batch).unwrap_or_default();
+                            for (fid, _text) in &unqueued {
+                                let _ = guard.queue_embedding_for_file(*fid, 3);
+                            }
+                            unqueued
+                        } else {
+                            queued.into_iter().map(|(fid, text, _priority)| (fid, text)).collect()
+                        }
                     }
                     Err(_) => break,
                 };
@@ -1274,11 +1389,16 @@ impl AppRuntime {
                     if !vector.is_empty() {
                         if let Ok(db_lock) = db.lock() {
                             let _ = db_lock.save_embedding(fid, &source, &vector);
+                            let _ = db_lock.dequeue_embedding(fid);
                         }
 
                         let mut lock = semantic.lock().expect("semantic lock");
                         if let Some(search) = &mut *lock {
                             let _ = search.add_vector(fid, &vector);
+                        }
+                    } else {
+                        if let Ok(db_lock) = db.lock() {
+                            let _ = db_lock.increment_embedding_attempts(fid);
                         }
                     }
 
@@ -1304,9 +1424,27 @@ impl AppRuntime {
         std::thread::spawn(move || {
             log::info!("[Runtime] Starting background hashing worker...");
             let batch_size = 50;
-            let mut hashed_count = 0;
+            let mut hashed_this_session = 0usize;
+            // total = files already hashed before this session + still-remaining
+            // We track remaining so we can compute a stable total even as new files arrive.
+            let mut total_to_hash: usize = db.lock()
+                .map(|g| g.count_files_needing_hash().unwrap_or(0))
+                .unwrap_or(0);
+            // hashed_this_session starts at 0; total displayed = hashed_this_session + remaining
+            // Emit initial state so the UI can display the bar immediately.
+            let _ = event_tx.send(AppEvent::HashingProgress {
+                hashed: 0,
+                total: total_to_hash,
+            });
 
             loop {
+                // Re-count remaining each batch to account for newly-indexed files.
+                let remaining = db.lock()
+                    .map(|g| g.count_files_needing_hash().unwrap_or(0))
+                    .unwrap_or(0);
+                // Stable total: at least as large as already hashed + still remaining.
+                total_to_hash = total_to_hash.max(hashed_this_session + remaining);
+
                 // 1. Get files needing hashing
                 let batch = match db.lock() {
                     Ok(guard) => match guard.get_files_needing_hash(batch_size) {
@@ -1320,55 +1458,94 @@ impl AppRuntime {
                 };
 
                 if batch.is_empty() {
-                    // Nothing to hash right now, wait and check again later (or exit if not needed anymore)
-                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    // Nothing left; emit 100% and wait for new files.
+                    let _ = event_tx.send(AppEvent::HashingProgress {
+                        hashed: total_to_hash,
+                        total:  total_to_hash,
+                    });
+                    std::thread::sleep(std::time::Duration::from_secs(30));
                     continue;
                 }
 
                 for (fid, path) in batch {
                     if path.exists() && path.is_file() {
-                        match thegrid_core::hash_file(&path) {
-                            Ok(h) => {
-                                if let Ok(guard) = db.lock() {
-                                    let _ = guard.update_file_hash(fid, &h);
-                                    if let Ok(cfg) = config.lock() {
-                                        if let Ok(meta) = path.metadata() {
-                                            let modified = meta.modified().ok()
-                                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                                .map(|d| d.as_secs() as i64);
-                                            apply_automation_rules_for_file(
-                                                &guard,
-                                                &cfg,
-                                                fid,
-                                                &path,
-                                                meta.len(),
-                                                modified,
-                                            );
+                        // Quick-hash pre-filter: if no other file shares (quick_hash, size),
+                        // skip the full read and mark as SKIP_UNIQUE to save I/O.
+                        let should_skip = path.metadata().ok().and_then(|meta| {
+                            let size = meta.len();
+                            thegrid_core::quick_hash_file(&path).ok().map(|qh| (qh, size))
+                        }).and_then(|(qh, size)| {
+                            db.lock().ok().and_then(|guard| {
+                                guard.has_quick_hash_peer(fid, &qh, size).ok().map(|has_peer| !has_peer)
+                            })
+                        }).unwrap_or(false);
+
+                        if should_skip {
+                            if let Ok(guard) = db.lock() {
+                                let _ = guard.mark_file_skip_unique(fid);
+                            }
+                            hashed_this_session += 1;
+                        } else {
+                            match thegrid_core::hash_file(&path) {
+                                Ok(h) => {
+                                    if let Ok(guard) = db.lock() {
+                                        let _ = guard.update_file_hash(fid, &h);
+                                        if let Ok(cfg) = config.lock() {
+                                            if let Ok(meta) = path.metadata() {
+                                                let modified = meta.modified().ok()
+                                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                                    .map(|d| d.as_secs() as i64);
+                                                apply_automation_rules_for_file(
+                                                    &guard,
+                                                    &cfg,
+                                                    fid,
+                                                    &path,
+                                                    meta.len(),
+                                                    modified,
+                                                );
+                                            }
                                         }
                                     }
-                                    hashed_count += 1;
+                                    hashed_this_session += 1;
                                 }
-                            }
-                            Err(e) => {
-                                log::warn!("[Runtime] Failed to hash {:?}: {}", path, e);
-                                // Mark as failed in DB so we don't retry forever
-                                if let Ok(guard) = db.lock() {
-                                    let _ = guard.update_file_hash(fid, &format!("ERR_{}", e));
+                                Err(e) => {
+                                    log::warn!("[Runtime] Failed to hash {:?}: {}", path, e);
+                                    if let Ok(guard) = db.lock() {
+                                        let _ = guard.update_file_hash(fid, &format!("ERR_{}", e));
+                                    }
+                                    hashed_this_session += 1;
                                 }
                             }
                         }
                     } else {
-                        // File gone, remove from DB or mark as missing
                         if let Ok(guard) = db.lock() {
                             let _ = guard.delete_file_by_id(fid);
                         }
+                        hashed_this_session += 1;
                     }
-                    
-                    if hashed_count % 10 == 0 {
-                        let _ = event_tx.send(AppEvent::Status(format!("Hashed {} files", hashed_count)));
+
+                    // Emit progress every 5 files for responsive UI.
+                    if hashed_this_session % 5 == 0 {
+                        let _ = event_tx.send(AppEvent::HashingProgress {
+                            hashed: hashed_this_session.min(total_to_hash),
+                            total:  total_to_hash,
+                        });
                     }
                 }
-                
+
+                // Emit at the end of every batch.
+                let _ = event_tx.send(AppEvent::HashingProgress {
+                    hashed: hashed_this_session.min(total_to_hash),
+                    total:  total_to_hash,
+                });
+
+                // Persist progress checkpoint for observability (resume not yet implemented).
+                if hashed_this_session % 200 == 0 {
+                    if let Ok(guard) = db.lock() {
+                        let _ = guard.set_hashing_checkpoint(hashed_this_session as i64);
+                    }
+                }
+
                 // Yield to other threads
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
