@@ -134,6 +134,8 @@ pub struct DetailActions {
     pub delete_duplicate_files: Option<Vec<(i64, std::path::PathBuf, String)>>,
     /// Phase 6: Rich dedup delete action
     pub dedup_delete_files: Option<Vec<thegrid_core::models::FileSearchResult>>,
+    /// Phase 6: trigger cross-source dedup scan
+    pub run_cross_source_scan: bool,
     pub export_drive_buffer:  bool,
     pub upload_drive_buffer:  bool,
     #[allow(dead_code)]
@@ -1041,6 +1043,12 @@ pub struct SettingsState {
     pub ai_model:     String,
     pub device_type:  String,
     pub open:         bool,
+    pub google_client_id:     String,
+    pub google_client_secret: String,
+    /// Set to true for one frame when user clicks "Connect Drive"
+    pub connect_drive: bool,
+    /// Set to true for one frame when user clicks "Index Drive"
+    pub index_drive: bool,
 }
 
 impl SettingsState {
@@ -1054,6 +1062,10 @@ impl SettingsState {
             ai_model:     cfg.ai_model.clone().unwrap_or_default(),
             device_type:  cfg.device_type.clone(),
             open:         false,
+            google_client_id:     cfg.google_client_id.clone().unwrap_or_default(),
+            google_client_secret: cfg.google_client_secret.clone().unwrap_or_default(),
+            connect_drive: false,
+            index_drive:   false,
         }
     }
 }
@@ -1150,6 +1162,26 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
                             }
                         });
 
+                    ui.add_space(14.0);
+                    ui.add(egui::Separator::default().spacing(0.0));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("GOOGLE DRIVE").color(Colors::TEXT_DIM).size(9.0).strong());
+                    ui.add_space(6.0);
+                    modal_field(ui, "OAUTH CLIENT ID",     &mut s.google_client_id,     false, "paste from Google Cloud Console");
+                    ui.add_space(8.0);
+                    modal_field(ui, "OAUTH CLIENT SECRET", &mut s.google_client_secret, true,  "paste from Google Cloud Console");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "CONNECT DRIVE").clicked() {
+                            s.connect_drive = true;
+                        }
+                        ui.add_space(8.0);
+                        if theme::micro_button(ui, "INDEX DRIVE").clicked() {
+                            s.index_drive = true;
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.add(egui::Separator::default().spacing(0.0));
                     ui.add_space(14.0);
                     ui.label(RichText::new("WATCHED DIRECTORIES").color(Colors::TEXT_DIM).size(9.0).strong());
                     ui.add_space(4.0);
@@ -2606,13 +2638,18 @@ pub fn render_detail_panel_with_timeline(
                         }
                         DashTab::Terminal  => render_terminal_tab(ui, s, &mut actions),
                         DashTab::DedupReview => {
+                            let mut scan_req = false;
                             if let Some(to_delete) = crate::views::dedup_review::render_dedup_review(
                                 ui,
                                 s.rich_duplicate_groups,
                                 s.dedup_review_state,
                                 s.local_device_id,
+                                &mut scan_req,
                             ) {
                                 actions.dedup_delete_files = Some(to_delete);
+                            }
+                            if scan_req {
+                                actions.run_cross_source_scan = true;
                             }
                         }
                     }

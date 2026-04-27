@@ -1667,6 +1667,9 @@ impl TheGridApp {
                     // Share peer list with runtime so the compute router can use them
                     self.runtime.update_tailscale_peers(self.devices.clone());
 
+                    // Seed display state colors immediately so cards show color before first ping
+                    self.refresh_device_display_states();
+
                     // Start local telemetry collection immediately after first load
                     if let Some(local_device_id) = self
                         .devices
@@ -2515,6 +2518,7 @@ impl TheGridApp {
                 // ── Rich duplicate groups ─────────────────────────────────────
                 AppEvent::DuplicatesGrouped(groups) => {
                     log::info!("DuplicatesGrouped: {} groups", groups.len());
+                    self.dedup_review_state.scanning = false;
                     self.dedup_review_state.seed_from_groups(&groups);
                     self.rich_duplicate_groups = groups;
                     self.push_toast(Toast::info(format!("{} duplicate groups found", self.rich_duplicate_groups.len())));
@@ -3064,6 +3068,11 @@ impl TheGridApp {
 
         if let Some(files) = actions.dedup_delete_files {
             self.spawn_rich_dedup_delete(files);
+        }
+
+        if actions.run_cross_source_scan {
+            self.dedup_review_state.scanning = true;
+            self.runtime.spawn_cross_source_dedup_scan();
         }
 
         if actions.export_drive_buffer {
@@ -3675,6 +3684,8 @@ impl eframe::App for TheGridApp {
                     new_config.watch_paths  = self.settings.watch_paths.iter()
                         .map(|s| PathBuf::from(s))
                         .collect();
+                    new_config.google_client_id     = if self.settings.google_client_id.trim().is_empty() { None } else { Some(self.settings.google_client_id.trim().to_string()) };
+                    new_config.google_client_secret = if self.settings.google_client_secret.trim().is_empty() { None } else { Some(self.settings.google_client_secret.trim().to_string()) };
 
                     match new_config.save() {
                         Ok(_) => {
@@ -3711,6 +3722,30 @@ impl eframe::App for TheGridApp {
                             self.spawn_load_devices();
                         }
                         Err(e) => self.push_toast(Toast::err(format!("Save failed: {}", e))),
+                    }
+                }
+
+                // Drive connect / index triggered from the settings modal (one-shot flags)
+                if self.settings.connect_drive {
+                    self.settings.connect_drive = false;
+                    let id     = self.config.google_client_id.clone().unwrap_or_default();
+                    let secret = self.config.google_client_secret.clone().unwrap_or_default();
+                    if id.is_empty() || secret.is_empty() {
+                        self.push_toast(Toast::err("Enter OAuth Client ID and Secret first"));
+                    } else {
+                        self.push_toast(Toast::info("Opening Google Drive authorization…"));
+                        self.runtime.spawn_drive_authorize(id, secret);
+                    }
+                }
+                if self.settings.index_drive {
+                    self.settings.index_drive = false;
+                    let id     = self.config.google_client_id.clone().unwrap_or_default();
+                    let secret = self.config.google_client_secret.clone().unwrap_or_default();
+                    if id.is_empty() || secret.is_empty() {
+                        self.push_toast(Toast::err("Enter OAuth Client ID and Secret first"));
+                    } else {
+                        self.push_toast(Toast::info("Indexing Google Drive…"));
+                        self.runtime.spawn_drive_index(id, secret);
                     }
                 }
 

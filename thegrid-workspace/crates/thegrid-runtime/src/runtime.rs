@@ -12,7 +12,7 @@ use thegrid_core::{
     DetectionSourceDistribution, FileChange, FileWatcher, SyncHealthMetrics, TailscaleDevice,
     models::ComputeTaskType,
 };
-use thegrid_net::{AgentClient, AgentServer, TailscaleClient, TermuxAgent, WolSentry};
+use thegrid_net::{AgentClient, AgentServer, DriveClient, TailscaleClient, TermuxAgent, WolSentry};
 use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
 use crate::ComputeRouter;
 
@@ -1852,6 +1852,68 @@ impl AppRuntime {
                 if let Ok(hits) = engine.search(&query, k) {
                     let _ = response_tx.send(hits);
                 }
+            }
+        });
+    }
+
+    /// Scan the DB for cross-source duplicate groups and emit `DuplicatesGrouped`.
+    pub fn spawn_cross_source_dedup_scan(&self) {
+        let db = Arc::clone(&self.db);
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting cross-source dedup scan...");
+            let filter = thegrid_core::models::DuplicateScanFilter::default();
+            match db.lock().map(|g| g.get_cross_source_duplicate_groups(&filter, true)) {
+                Ok(Ok(groups)) => {
+                    log::info!("[Runtime] Cross-source scan: {} group(s) found", groups.len());
+                    let _ = tx.send(AppEvent::DuplicatesGrouped(groups));
+                }
+                Ok(Err(e)) => log::error!("[Runtime] Cross-source dedup scan error: {}", e),
+                Err(_)     => log::error!("[Runtime] Cross-source dedup scan: DB lock poisoned"),
+            }
+        });
+    }
+
+    /// Run the Google Drive OAuth2 flow in a background thread.
+    /// Emits `Status("drive_authorized")` on success or `DriveIndexError` on failure.
+    pub fn spawn_drive_authorize(&self, client_id: String, client_secret: String) {
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting Google Drive authorization...");
+            let mut client = DriveClient::new(client_id, client_secret);
+            match client.authorize() {
+                Ok(()) => {
+                    log::info!("[Runtime] Google Drive authorized");
+                    let _ = tx.send(AppEvent::Status("drive_authorized".to_string()));
+                }
+                Err(e) => {
+                    log::error!("[Runtime] Drive authorization failed: {}", e);
+                    let _ = tx.send(AppEvent::DriveIndexError(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// Index Google Drive metadata in a background thread.
+    /// Emits `DriveIndexProgress` / `DriveIndexComplete` / `DriveIndexError`.
+    pub fn spawn_drive_index(&self, client_id: String, client_secret: String) {
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            log::info!("[Runtime] Starting Google Drive index...");
+            let mut client = DriveClient::new(client_id, client_secret);
+            if !client.is_authorized() {
+                match client.authorize() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log::error!("[Runtime] Drive auth before index failed: {}", e);
+                        let _ = tx.send(AppEvent::DriveIndexError(format!("Auth failed: {}", e)));
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = client.index_all_files(&tx) {
+                log::error!("[Runtime] Drive index error: {}", e);
+                let _ = tx.send(AppEvent::DriveIndexError(e.to_string()));
             }
         });
     }

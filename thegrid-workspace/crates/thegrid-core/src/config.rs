@@ -116,6 +116,14 @@ pub struct Config {
     /// Max number of compute tasks this device will handle simultaneously.
     #[serde(default = "Config::default_max_parallel_compute")]
     pub max_parallel_compute_tasks: u8,
+
+    /// OAuth2 client ID for Google Drive integration.
+    #[serde(default)]
+    pub google_client_id: Option<String>,
+
+    /// OAuth2 client secret for Google Drive integration.
+    #[serde(default)]
+    pub google_client_secret: Option<String>,
 }
 
 impl Default for Config {
@@ -155,6 +163,8 @@ impl Default for Config {
             indexing_overrides: Vec::new(),
             allow_compute_borrowing: true,
             max_parallel_compute_tasks: Self::default_max_parallel_compute(),
+            google_client_id: None,
+            google_client_secret: None,
         }
     }
 }

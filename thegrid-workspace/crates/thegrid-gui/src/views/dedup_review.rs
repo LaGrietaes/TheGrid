@@ -74,11 +74,13 @@ impl DedupReviewState {
 // ── Render ─────────────────────────────────────────────────────────────────────
 
 /// Returns `Some(files_to_delete)` when the user clicks Execute.
+/// Sets `*scan_requested = true` when the user clicks SCAN.
 pub fn render_dedup_review(
-    ui:       &mut Ui,
-    groups:   &[DuplicateGroup],
-    state:    &mut DedupReviewState,
-    local_device: &str,
+    ui:            &mut Ui,
+    groups:        &[DuplicateGroup],
+    state:         &mut DedupReviewState,
+    local_device:  &str,
+    scan_requested: &mut bool,
 ) -> Option<Vec<FileSearchResult>> {
     let mut execute_result: Option<Vec<FileSearchResult>> = None;
 
@@ -107,6 +109,11 @@ pub fn render_dedup_review(
                     }
                     if micro_button(ui, "COLLAPSE").clicked() {
                         state.expanded.clear();
+                    }
+                    let scan_label = if state.scanning { "SCANNING…" } else { "SCAN" };
+                    if micro_button(ui, scan_label).clicked() && !state.scanning {
+                        state.scanning = true;
+                        *scan_requested = true;
                     }
                     ui.label(
                         RichText::new(format!("{} groups", groups.len()))
