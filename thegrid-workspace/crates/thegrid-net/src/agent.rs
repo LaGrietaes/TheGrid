@@ -1671,13 +1671,55 @@ fn collect_telemetry(config: &Config) -> NodeTelemetry {
         }
     };
     
+    // Virtual/pseudo filesystem types to exclude from drive list.
+    // On Android/Linux sysinfo returns every tmpfs, proc, sysfs, devpts,
+    // loop, overlay, cgroup, etc.  Keep only real user-accessible storage.
+    const VIRTUAL_FS: &[&str] = &[
+        "tmpfs", "devtmpfs", "proc", "sysfs", "devpts", "cgroup", "cgroup2",
+        "pstore", "securityfs", "debugfs", "tracefs", "configfs", "bpf",
+        "overlay", "none", "rootfs", "ramfs", "hugetlbfs", "mqueue",
+        "fusectl", "efivarfs", "autofs", "nsfs", "sockfs", "pipefs",
+        "anon_inodefs", "binfmt_misc",
+    ];
+    const VIRTUAL_MOUNT_PREFIXES: &[&str] = &[
+        "/proc", "/sys", "/dev", "/run", "/snap", "/tmp",
+        "/apex",     // Android
+        "/linkerconfig", "/acct", "/debug_ramdisk",
+    ];
+    // Seen (total, used) pairs — used to deduplicate Android's
+    // /sdcard and /storage/emulated/0 which map to the same physical storage.
+    let mut seen_sizes: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+
     for disk in &disks {
-        let used = disk.total_space() - disk.available_space();
         let total = disk.total_space();
-        disk_used += used;
+        let used  = total.saturating_sub(disk.available_space());
+
+        // Skip zero-size entries (pseudo filesystems)
+        if total == 0 { continue; }
+
+        // Skip virtual filesystem types
+        let fs_type = disk.file_system().to_string_lossy().to_ascii_lowercase();
+        if VIRTUAL_FS.iter().any(|&vfs| fs_type == vfs) { continue; }
+
+        // Skip virtual mount points
+        let mount = disk.mount_point().to_string_lossy();
+        if VIRTUAL_MOUNT_PREFIXES.iter().any(|&p| mount.starts_with(p)) { continue; }
+
+        // Deduplicate by (total, used) — collapses /sdcard ↔ /storage/emulated/0
+        if !seen_sizes.insert((total, used)) { continue; }
+
+        disk_used  += used;
         disk_total += total;
+
+        // Prefer the mount point as the drive name on non-Windows (more useful than "/dev/sda1")
+        let name = if cfg!(windows) {
+            disk.name().to_string_lossy().into_owned()
+        } else {
+            mount.into_owned()
+        };
+
         drive_infos.push(DriveInfo {
-            name: disk.name().to_string_lossy().into_owned(),
+            name,
             used,
             total,
             kind: storage_kind_hint.clone(),

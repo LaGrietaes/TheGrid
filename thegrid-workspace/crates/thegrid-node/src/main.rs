@@ -1356,9 +1356,14 @@ fn main() -> Result<()> {
                             .iter()
                             .filter_map(|d| {
                                 if let Some(ip) = d.primary_ip() {
-                                    Some((d.display_name().to_string(), ip.to_string()))
+                                    // Use only the short hostname before the first '.'
+                                    let full = d.display_name();
+                                    let short = full.split('.').next().unwrap_or(full);
+                                    Some((short.to_string(), ip.to_string()))
                                 } else {
-                                    no_ip.push(d.display_name().to_string());
+                                    let full = d.display_name();
+                                    let short = full.split('.').next().unwrap_or(full);
+                                    no_ip.push(short.to_string());
                                     None
                                 }
                             })
