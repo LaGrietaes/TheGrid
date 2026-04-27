@@ -2280,8 +2280,12 @@ fn render_identity_section(
         ui.add_space(8.0);
         ui.vertical(|ui| {
             ui.horizontal_wrapped(|ui| {
+                let short_name = s.device.display_name()
+                    .split('.')
+                    .next()
+                    .unwrap_or(s.device.display_name());
                 ui.label(
-                    RichText::new(s.device.display_name().to_uppercase())
+                    RichText::new(short_name.to_uppercase())
                         .color(Colors::TEXT).size(14.0).strong()
                 );
                 if is_local_node {
