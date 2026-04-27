@@ -138,6 +138,26 @@ impl ProjectStatus {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ───────────────────────────────────────────────────────────────────────────────
+// AI panel state — local Ollama model list + agent control
+// ───────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct AiPanelState {
+    /// Models detected from the local Ollama /api/tags endpoint.
+    pub detected_models:  Vec<String>,
+    /// Currently selected / active model (index into detected_models).
+    pub selected_model:   Option<usize>,
+    /// When we last probed Ollama (None = never).
+    pub last_probe:       Option<std::time::Instant>,
+    /// A probe is currently in flight.
+    pub probing:          bool,
+    /// Whether the local AI agent worker is running.
+    pub agent_running:    bool,
+    /// Status message for the last operation.
+    pub status_msg:       String,
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
 // Add-project popup state
 // ───────────────────────────────────────────────────────────────────────────────
 
@@ -543,6 +563,8 @@ pub struct TheGridApp {
     planner_add:       PlannerAddState,
     // ── Add-project popup ────────────────────────────────────────────────────
     project_add:       ProjectAddState,
+    // ── Local AI panel (Ollama) ───────────────────────────────────────────────
+    ai_panel:          AiPanelState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -840,6 +862,7 @@ impl TheGridApp {
             planner_edit_idx:    None,
             planner_add:         PlannerAddState::default(),
             project_add:         ProjectAddState::default(),
+            ai_panel:            AiPanelState::default(),
         }
     }
 
@@ -2785,6 +2808,46 @@ impl TheGridApp {
                     self.set_status(format!("{} duplicate groups restored", self.rich_duplicate_groups.len()));
                 }
 
+                AppEvent::OllamaModelsDetected(models) => {
+                    self.ai_panel.probing = false;
+                    let prev_sel = self.ai_panel.selected_model
+                        .and_then(|i| self.ai_panel.detected_models.get(i).cloned());
+                    self.ai_panel.detected_models = models;
+                    // Restore selection by name if still present
+                    self.ai_panel.selected_model = prev_sel
+                        .and_then(|name| self.ai_panel.detected_models.iter().position(|m| *m == name));
+                    if self.ai_panel.selected_model.is_none() && !self.ai_panel.detected_models.is_empty() {
+                        self.ai_panel.selected_model = Some(0);
+                    }
+                }
+
+                AppEvent::OllamaLoadModel(model_name) => {
+                    let tx = self.event_tx.clone();
+                    let name = model_name.clone();
+                    std::thread::spawn(move || {
+                        let client = reqwest::blocking::Client::builder()
+                            .timeout(std::time::Duration::from_secs(120))
+                            .build().unwrap_or_default();
+                        // POST /api/pull — Ollama will stream download; we just fire-and-forget
+                        let body = format!(r#"{{"name":"{}","stream":false}}"#, name);
+                        match client.post("http://127.0.0.1:11434/api/pull")
+                            .header("Content-Type", "application/json")
+                            .body(body)
+                            .send()
+                        {
+                            Ok(_)  => { let _ = tx.send(AppEvent::Status(format!("model_loaded:{}", name))); }
+                            Err(e) => { let _ = tx.send(AppEvent::Status(format!("model_load_failed:{}", e))); }
+                        }
+                    });
+                    self.ai_panel.status_msg = format!("Pulling {}…", model_name);
+                }
+
+                AppEvent::OllamaStartAgent { model } => {
+                    self.ai_panel.agent_running = true;
+                    self.ai_panel.status_msg = format!("Agent started: {}", model);
+                    log::info!("[AI] Agent worker activated with model={}", model);
+                }
+
                 _ => {}
             }
         }
@@ -3936,6 +3999,7 @@ impl eframe::App for TheGridApp {
                             &self.planner_tasks,
                             self.planner_selected.as_deref(),
                             &mut self.planner_add.open,
+                            &mut self.ai_panel,
                         );
                         device_clicked = result.clicked_device;
                         if let Some(nav) = result.navigate_to {
@@ -3946,6 +4010,12 @@ impl eframe::App for TheGridApp {
                         }
                         if result.open_project_add {
                             self.project_add.open = true;
+                        }
+                        if let Some(m) = result.ai_load_model {
+                            let _ = self.event_tx.send(AppEvent::OllamaLoadModel(m));
+                        }
+                        if let Some(m) = result.ai_start_agent {
+                            let _ = self.event_tx.send(AppEvent::OllamaStartAgent { model: m });
                         }
                     });
 
@@ -4234,6 +4304,34 @@ impl eframe::App for TheGridApp {
                     self.mesh_sync_last_at = std::time::Instant::now();
                     self.sync_all_nodes();
                 }
+
+                // ── Periodic Ollama model probe (every 30 s) ─────────────────
+                let need_probe = self.ai_panel.last_probe
+                    .map(|t| t.elapsed().as_secs() > 30)
+                    .unwrap_or(true);
+                if need_probe && !self.ai_panel.probing {
+                    self.ai_panel.probing    = true;
+                    self.ai_panel.last_probe = Some(std::time::Instant::now());
+                    let tx = self.event_tx.clone();
+                    std::thread::spawn(move || {
+                        let client = reqwest::blocking::Client::builder()
+                            .timeout(std::time::Duration::from_secs(5))
+                            .build().unwrap_or_default();
+                        let models = if let Ok(resp) = client
+                            .get("http://127.0.0.1:11434/api/tags")
+                            .send()
+                        {
+                            if let Ok(j) = resp.json::<serde_json::Value>() {
+                                j["models"].as_array()
+                                    .map(|arr| arr.iter()
+                                        .filter_map(|m| m["name"].as_str().map(|s| s.to_string()))
+                                        .collect::<Vec<_>>())
+                                    .unwrap_or_default()
+                            } else { vec![] }
+                        } else { vec![] };
+                        let _ = tx.send(AppEvent::OllamaModelsDetected(models));
+                    });
+                }
             }
 
             // ── Projects Dashboard ────────────────────────────────────────────
@@ -4283,11 +4381,14 @@ impl eframe::App for TheGridApp {
                             &self.planner_tasks,
                             self.planner_selected.as_deref(),
                             &mut self.planner_add.open,
+                            &mut self.ai_panel,
                         );
                         _device_clicked = result.clicked_device;
                         if let Some(nav) = result.navigate_to { self.screen = nav; }
                         if result.open_planner_add { self.planner_add.open = true; }
                         if result.open_project_add { self.project_add.open = true; }
+                        if let Some(m) = result.ai_load_model { let _ = self.event_tx.send(AppEvent::OllamaLoadModel(m)); }
+                        if let Some(m) = result.ai_start_agent { let _ = self.event_tx.send(AppEvent::OllamaStartAgent { model: m }); }
                     });
                 if needs_refresh { self.spawn_load_devices(); }
 
@@ -4372,11 +4473,14 @@ impl eframe::App for TheGridApp {
                             &self.planner_tasks,
                             self.planner_selected.as_deref(),
                             &mut self.planner_add.open,
+                            &mut self.ai_panel,
                         );
                         _device_clicked = result.clicked_device;
                         if let Some(nav) = result.navigate_to { self.screen = nav; }
                         if result.open_planner_add { self.planner_add.open = true; }
                         if result.open_project_add { self.project_add.open = true; }
+                        if let Some(m) = result.ai_load_model { let _ = self.event_tx.send(AppEvent::OllamaLoadModel(m)); }
+                        if let Some(m) = result.ai_start_agent { let _ = self.event_tx.send(AppEvent::OllamaStartAgent { model: m }); }
                     });
                 if needs_refresh { self.spawn_load_devices(); }
 

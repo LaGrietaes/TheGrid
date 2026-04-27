@@ -288,4 +288,14 @@ pub enum AppEvent {
     /// Persisted duplicate groups restored from the DB on startup or explicit reload.
     /// Second field is the stored per-file review decisions: file_id → action string.
     DuplicateGroupsRestored(Vec<crate::models::DuplicateGroup>, std::collections::HashMap<i64, String>),
+
+    // ── Local AI / Ollama ──────────────────────────────────────────────────
+    /// Background probe returned list of locally available Ollama model names.
+    OllamaModelsDetected(Vec<String>),
+
+    /// User clicked "Load Model" — pull a model into Ollama.
+    OllamaLoadModel(String),
+
+    /// User clicked "Start Agent" — spawn/resume the local AI agent worker.
+    OllamaStartAgent { model: String },
 }

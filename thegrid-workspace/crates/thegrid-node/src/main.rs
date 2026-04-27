@@ -35,8 +35,8 @@ const LAST_UPDATE_ENV: &str = "THEGRID_LAST_UPDATE";
 const ANSI_RESET: &str = "\x1B[0m";
 const ANSI_BOLD: &str = "\x1B[1m";
 const ANSI_DIM: &str = "\x1B[2m";
-const ANSI_GREEN_BRIGHT: &str = "\x1B[92m"; // live-node indicator (◉ LIVE)
-const ANSI_CYAN: &str = "\x1B[36m";
+const ANSI_GREEN: &str = "\x1B[32m";         // border / banner accent
+const ANSI_GREEN_BRIGHT: &str = "\x1B[92m";  // live-node indicator (◉ LIVE)
 const ANSI_WHITE: &str = "\x1B[37m";
 
 // S2-C1: command registry metadata used by help output and TUI hints.
@@ -292,29 +292,29 @@ fn restart_current_node_process(updated_from_to: Option<(&str, &str)>) -> Result
 }
 
 fn ts() -> String {
-    Local::now().format("%H:%M:%S").to_string()
+    Local::now().format("%d/%m/%y %H:%M:%S").to_string()
 }
 
 fn print_banner(device_name: &str, port: u16) {
     // ASCII art derived from The Grid icon (hexagonal mesh / circuit motif)
-    println!("{}{}{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
-    println!("{}{}  ╔══╗  ┌─────────────────────────────────────────────────╗{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
-    println!("{}{}  ║  ║  │  ████████╗██╗  ██╗███████╗                     │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
-    println!("{}{}  ╠══╣  │     ██╔══╝██║  ██║██╔════╝                     │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
-    println!("{}{}  ║  ╠══╣     ██║   ███████║█████╗   GRID                 │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
-    println!("{}{}  ╠══╣  │     ██║   ██╔══██║██╔══╝                       │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
-    println!("{}{}  ║  ║  │     ██║   ██║  ██║███████╗                     │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
-    println!("{}{}  ╚══╝  │     ╚═╝   ╚═╝  ╚═╝╚══════╝  HEADLESS NODE      │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
-    println!("{}{}        └─────────────────────────────────────────────────┘{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ╔══╗  ┌─────────────────────────────────────────────────╗{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ║  ║  │  ████████╗██╗  ██╗███████╗                     │{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ╠══╣  │     ██╔══╝██║  ██║██╔════╝                     │{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ║  ╠══╣     ██║   ███████║█████╗   GRID                 │{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ╠══╣  │     ██║   ██╔══██║██╔══╝                       │{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ║  ║  │     ██║   ██║  ██║███████╗                     │{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ╚══╝  │     ╚═╝   ╚═╝  ╚═╝╚══════╝  HEADLESS NODE      │{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}        └─────────────────────────────────────────────────┘{}", ANSI_GREEN, ANSI_BOLD, ANSI_RESET);
     println!();
     let vb = "\u{2551}"; // ║
-    println!("{}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2557}{}", ANSI_CYAN, ANSI_RESET);
-    println!("{}{} {} THE GRID HEADLESS NODE v{:<35} {}{}{}", ANSI_CYAN, vb, ANSI_BOLD, env!("CARGO_PKG_VERSION"), ANSI_RESET, vb, ANSI_RESET);
-    println!("{}{} {} {:<61} {}{}{}", ANSI_CYAN, vb, ANSI_DIM, SIGNATURE_LINE, ANSI_RESET, vb, ANSI_RESET);
-    println!("{}\u{2560}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2563}{}", ANSI_CYAN, ANSI_RESET);
-    println!("{}{} {} Device:     {}{:<51}{}{}{}", ANSI_CYAN, vb, ANSI_RESET, ANSI_GREEN_BRIGHT, device_name, ANSI_RESET, vb, ANSI_RESET);
-    println!("{}{} {} Agent Port: {}{:<51}{}{}{}", ANSI_CYAN, vb, ANSI_RESET, ANSI_WHITE, port, ANSI_RESET, vb, ANSI_RESET);
-    println!("{}\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}{}", ANSI_CYAN, ANSI_RESET);
+    println!("{}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2557}{}", ANSI_GREEN, ANSI_RESET);
+    println!("{}{} {} THE GRID HEADLESS NODE v{:<35} {}{}{}", ANSI_GREEN, vb, ANSI_BOLD, env!("CARGO_PKG_VERSION"), ANSI_RESET, vb, ANSI_RESET);
+    println!("{}{} {} {:<61} {}{}{}", ANSI_GREEN, vb, ANSI_DIM, SIGNATURE_LINE, ANSI_RESET, vb, ANSI_RESET);
+    println!("{}\u{2560}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2563}{}", ANSI_GREEN, ANSI_RESET);
+    println!("{}{} {} Device:     {}{:<51}{}{}{}", ANSI_GREEN, vb, ANSI_RESET, ANSI_GREEN_BRIGHT, device_name, ANSI_RESET, vb, ANSI_RESET);
+    println!("{}{} {} Agent Port: {}{:<51}{}{}{}", ANSI_GREEN, vb, ANSI_RESET, ANSI_WHITE, port, ANSI_RESET, vb, ANSI_RESET);
+    println!("{}\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}{}", ANSI_GREEN, ANSI_RESET);
 }
 
 fn event_line(icon: &str, label: &str, message: impl AsRef<str>) {
@@ -407,7 +407,7 @@ fn log_style(line: &str) -> Style {
     } else if line.contains(" \u{26A0} ") || line.contains(" ! ") {
         Style::default().fg(Color::Yellow)
     } else if line.contains(" \u{21C4} ") || line.contains(" \u{0394} ") {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(Color::Green)
     } else if line.contains(" \u{00B7} ") || line.contains(" \u{2139} ") {
         Style::default().fg(Color::DarkGray)
     } else {
@@ -456,10 +456,10 @@ fn draw_left_panel(
     let pulse = pulse_char(elapsed);
 
     let dim = Style::default().fg(Color::DarkGray);
-    let cyan = Style::default().fg(Color::Cyan);
+    let cyan = Style::default().fg(Color::Green);
     let white = Style::default().fg(Color::White);
     let green_bold = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
-    let cyan_bold = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let cyan_bold = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
 
     // Grid logo using unicode escapes to avoid encoding issues
     let top_row    = "\u{2554}\u{2550}\u{2550}\u{2550}\u{256A}\u{2550}\u{2550}\u{2550}\u{256A}\u{2550}\u{2550}\u{2550}\u{2557}";
@@ -525,7 +525,7 @@ fn draw_left_panel(
 }
 
 fn draw_commands_panel(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-    let cyan = Style::default().fg(Color::Cyan);
+    let cyan = Style::default().fg(Color::Green);
     let cyan_bold = cyan.add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
     let white = Style::default().fg(Color::White);
@@ -551,7 +551,7 @@ fn draw_devices_panel(
     area: ratatui::layout::Rect,
     state: &TuiState,
 ) {
-    let cyan = Style::default().fg(Color::Cyan);
+    let cyan = Style::default().fg(Color::Green);
     let cyan_bold = cyan.add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
     let green_bright = Style::default().fg(Color::LightGreen);
@@ -618,7 +618,7 @@ fn draw_mesh_panel(
     area: ratatui::layout::Rect,
     state: &TuiState,
 ) {
-    let cyan = Style::default().fg(Color::Cyan);
+    let cyan = Style::default().fg(Color::Green);
     let cyan_bold = cyan.add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
     let green_bright = Style::default().fg(Color::LightGreen);
@@ -642,7 +642,7 @@ fn draw_mesh_panel(
             };
             Row::new(vec![
                 Cell::from(Span::styled(format!(" {} ", dot), dot_style)),
-                Cell::from(Span::styled(id.as_str().to_string(), cyan)),
+                Cell::from(Span::styled(id.as_str().to_string(), Style::default().fg(Color::Green))),
                 Cell::from(Span::styled(format!("age {}", age), dim)),
                 Cell::from(Span::styled(format!("tombs {:>3}", h.tombstone_count), dim)),
                 Cell::from(Span::styled(format!("fail {:>2}", h.sync_failures), dim)),
@@ -707,7 +707,7 @@ fn draw_log_panel(
     area: ratatui::layout::Rect,
     state: &TuiState,
 ) {
-    let cyan = Style::default().fg(Color::Cyan);
+    let cyan = Style::default().fg(Color::Green);
     let cyan_bold = cyan.add_modifier(Modifier::BOLD);
 
     let lines: Vec<TuiLine> = state
@@ -744,7 +744,7 @@ fn draw_input_bar(
     area: ratatui::layout::Rect,
     state: &TuiState,
 ) {
-    let cyan = Style::default().fg(Color::Cyan);
+    let cyan = Style::default().fg(Color::Green);
     let cyan_bold = cyan.add_modifier(Modifier::BOLD);
     let green_bold = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
 
@@ -1452,8 +1452,6 @@ fn main() -> Result<()> {
     }
 
     let mut last_render = Instant::now();
-    // Refresh device list automatically every 60 s in TUI mode.
-    let mut last_device_refresh = Instant::now();
 
     // Main event loop
     while running.load(Ordering::Relaxed) {
@@ -1562,12 +1560,6 @@ fn main() -> Result<()> {
                     execute_command(&effective_cmd, &runtime, &ui_state, tui_mode, &running);
                 }
             }
-        }
-
-        // Periodic silent device refresh (TUI mode only, every 60 s).
-        if tui_mode && last_device_refresh.elapsed() >= Duration::from_secs(60) {
-            runtime.spawn_load_devices();
-            last_device_refresh = Instant::now();
         }
 
         // Drain events
@@ -1726,14 +1718,9 @@ fn main() -> Result<()> {
                     }
                 }
                 AppEvent::SyncHealthUpdated { device_id, metrics } => {
-                    let age_str = metrics.sync_age_secs
-                        .map(|a| format!("{}s ago", a))
-                        .unwrap_or_else(|| "never".to_string());
-                    emit(&ui_state, tui_mode, "⇄", "SYNC",
-                        format!("{}: age={} tombs={} fails={}",
-                            device_id, age_str, metrics.tombstone_count, metrics.sync_failures));
                     if let Ok(mut s) = ui_state.lock() {
                         s.sync_health.insert(device_id, metrics);
+                        s.dirty = true;
                     }
                 }
                 AppEvent::IndexProgress { scanned, total, current, .. } => {

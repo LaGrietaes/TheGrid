@@ -517,3 +517,247 @@ pub fn status_dot(ui: &mut Ui, color: Color32) {
 pub fn separator(ui: &mut Ui) {
     ui.add(egui::Separator::default().spacing(0.0));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fx — Sci-fi visual effects painter utilities
+//
+// These helpers paint raw geometry for the HUD aesthetic:
+//   • Glow halos (layered alpha circles / stroked rects)
+//   • Gradient fill via vertex-colored mesh
+//   • Clipped-corner (chamfered) border polygon
+//   • Ghost-number watermark background
+//   • Raised-panel depth illusion (top highlight, bottom shadow)
+//   • Scan-line overlay
+// ═══════════════════════════════════════════════════════════════════════════════
+
+use egui::epaint::Mesh;
+use egui::pos2;
+
+pub struct Fx;
+
+impl Fx {
+    /// Draw a rectangular glow halo around `rect`.
+    /// `color` is the inner glow color; alpha falls off over `layers` concentric
+    /// strokes of increasing width.
+    pub fn glow_rect(painter: &egui::Painter, rect: egui::Rect, color: Color32, layers: u8) {
+        for i in 1..=layers {
+            let t = i as f32 / layers as f32;
+            let alpha = ((1.0 - t) * 120.0) as u8;
+            let expand = i as f32 * 1.5;
+            let r = rect.expand(expand);
+            painter.rect_stroke(
+                r,
+                Rounding::ZERO,
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(
+                    color.r(), color.g(), color.b(), alpha,
+                )),
+            );
+        }
+    }
+
+    /// Draw a pulsing glow around `rect`. Call every frame from `update()` to animate.
+    /// `time` is `ctx.input(|i| i.time)`.
+    pub fn pulse_glow_rect(painter: &egui::Painter, rect: egui::Rect, color: Color32, time: f64) {
+        let pulse = ((time * 2.5).sin() as f32 * 0.4 + 0.6).clamp(0.2, 1.0);
+        let color_pulsed = Color32::from_rgba_unmultiplied(
+            color.r(), color.g(), color.b(),
+            (pulse * 180.0) as u8,
+        );
+        Self::glow_rect(painter, rect, color_pulsed, 5);
+    }
+
+    /// Gradient fill for a rect: `top_color` at the top edge, `bot_color` at the bottom.
+    pub fn gradient_rect(painter: &egui::Painter, rect: egui::Rect, top_color: Color32, bot_color: Color32) {
+        let mut mesh = Mesh::default();
+        // 4 vertices: TL, TR, BR, BL
+        let tl = rect.left_top();
+        let tr = rect.right_top();
+        let br = rect.right_bottom();
+        let bl = rect.left_bottom();
+        mesh.colored_vertex(tl, top_color);  // 0
+        mesh.colored_vertex(tr, top_color);  // 1
+        mesh.colored_vertex(br, bot_color);  // 2
+        mesh.colored_vertex(bl, bot_color);  // 3
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Raised panel illusion: thin bright line on top edge, dim line on bottom edge.
+    /// Gives the impression of a physical panel lit from above.
+    pub fn raised_panel_border(painter: &egui::Painter, rect: egui::Rect, accent: Color32) {
+        let highlight = Color32::from_rgba_unmultiplied(
+            (accent.r() / 2).saturating_add(80),
+            (accent.g() / 2).saturating_add(80),
+            (accent.b() / 2).saturating_add(80),
+            90,
+        );
+        let shadow = Color32::from_rgba_unmultiplied(0, 0, 0, 160);
+
+        // Top-left and top-right corners → top highlight
+        painter.line_segment(
+            [rect.left_top(), rect.right_top()],
+            Stroke::new(1.0, highlight),
+        );
+        painter.line_segment(
+            [rect.left_top(), rect.left_bottom()],
+            Stroke::new(1.0, highlight),
+        );
+        // Bottom and right → shadow
+        painter.line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            Stroke::new(1.0, shadow),
+        );
+        painter.line_segment(
+            [rect.right_top(), rect.right_bottom()],
+            Stroke::new(1.0, shadow),
+        );
+    }
+
+    /// Chamfered (clipped-corner) border: cuts the 4 corners by `clip` pixels.
+    /// Draws a single-pixel stroke polygon.
+    pub fn chamfered_border(painter: &egui::Painter, rect: egui::Rect, clip: f32, color: Color32, width: f32) {
+        let l = rect.left();
+        let r = rect.right();
+        let t = rect.top();
+        let b = rect.bottom();
+        let c = clip;
+        let points: Vec<egui::Pos2> = vec![
+            pos2(l + c, t),
+            pos2(r - c, t),
+            pos2(r,     t + c),
+            pos2(r,     b - c),
+            pos2(r - c, b),
+            pos2(l + c, b),
+            pos2(l,     b - c),
+            pos2(l,     t + c),
+        ];
+        painter.add(egui::Shape::closed_line(points, Stroke::new(width, color)));
+    }
+
+    /// Ghost-number watermark: draws a very large, low-alpha number string
+    /// centred in `rect`. Good for node count, status codes, etc.
+    pub fn ghost_number(painter: &egui::Painter, rect: egui::Rect, text: &str, color: Color32, size: f32) {
+        let ghost = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18);
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            text,
+            egui::FontId::new(size, egui::FontFamily::Monospace),
+            ghost,
+        );
+    }
+
+    /// Horizontal scan-line overlay over `rect`. `time` drives a slow drift.
+    /// Draws only every Nth pixel row as a semi-transparent stripe.
+    pub fn scanlines(painter: &egui::Painter, rect: egui::Rect, time: f64) {
+        let drift = ((time * 8.0) as f32).rem_euclid(8.0);
+        let stripe_color = Color32::from_rgba_unmultiplied(0, 0, 0, 28);
+        let mut y = rect.top() + drift;
+        while y < rect.bottom() {
+            let p0 = pos2(rect.left(), y);
+            let p1 = pos2(rect.right(), y);
+            painter.line_segment([p0, p1], Stroke::new(1.0, stripe_color));
+            y += 8.0;
+        }
+    }
+
+    /// Inner glow fill: semi-transparent `color` gradient fading from center
+    /// to edges, useful for making a panel appear lit from within.
+    pub fn inner_glow(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
+        let c = rect.center();
+        let max_r = rect.width().min(rect.height()) * 0.6;
+        for i in 0..6u8 {
+            let t = i as f32 / 6.0;
+            let alpha = ((1.0 - t) * 40.0) as u8;
+            let r_px = max_r * t;
+            painter.circle_filled(
+                c,
+                r_px,
+                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha),
+            );
+        }
+    }
+
+    /// Sci-fi action pad — full replacement for the flat `action_card` frame.
+    /// Draws the background, chamfered border, depth lines, inner glow (on hover),
+    /// and returns the interaction rect. The caller still allocates space via egui.
+    pub fn action_pad(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        accent: Color32,
+        hovered: bool,
+        time: f64,
+    ) {
+        let bg = Color32::from_rgb(10, 16, 12);
+        // Base fill with subtle top-lit gradient
+        Self::gradient_rect(painter, rect, Color32::from_rgb(22, 28, 22), bg);
+
+        // Chamfered outer border
+        let border_color = if hovered {
+            accent
+        } else {
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 70)
+        };
+        Self::chamfered_border(painter, rect, 5.0, border_color, if hovered { 1.5 } else { 1.0 });
+
+        // Inner dim chamfered border (double-line effect)
+        let inner = rect.shrink(3.0);
+        Self::chamfered_border(painter, inner, 3.0,
+            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 25), 1.0);
+
+        // Raised panel depth
+        Self::raised_panel_border(painter, rect, accent);
+
+        // Glow on hover
+        if hovered {
+            let pulse = ((time * 3.0).sin() as f32 * 0.2 + 0.8).clamp(0.5, 1.0);
+            let glow = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), (pulse * 60.0) as u8);
+            Self::glow_rect(painter, rect, glow, 4);
+        }
+    }
+
+    /// Quick-launch slot — smaller variant of action_pad with slot index ghost
+    pub fn quick_slot(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        accent: Color32,
+        slot_label: &str,
+        filled: bool,
+        hovered: bool,
+        time: f64,
+    ) {
+        let bg_top = if filled { Color32::from_rgb(12, 24, 14) } else { Color32::from_rgb(10, 12, 10) };
+        let bg_bot = Color32::from_rgb(6, 8, 6);
+        Self::gradient_rect(painter, rect, bg_top, bg_bot);
+
+        let border_color = if filled {
+            if hovered {
+                accent
+            } else {
+                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90)
+            }
+        } else {
+            Color32::from_rgba_unmultiplied(40, 40, 40, 180)
+        };
+
+        Self::chamfered_border(painter, rect, 4.0, border_color, 1.0);
+
+        if !filled {
+            Self::ghost_number(painter, rect, slot_label, accent, rect.height() * 1.2);
+        }
+
+        if hovered {
+            Self::glow_rect(painter, rect, accent, 3);
+        }
+
+        if filled {
+            Self::raised_panel_border(painter, rect, accent);
+            if hovered {
+                let pulse = ((time * 2.5).sin() as f32 * 0.3 + 0.7).clamp(0.4, 1.0);
+                let _ = pulse;
+                Self::inner_glow(painter, rect, accent);
+            }
+        }
+    }
+}

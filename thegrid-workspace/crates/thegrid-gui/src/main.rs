@@ -78,6 +78,8 @@ fn main() -> eframe::Result<()> {
         "THE GRID",
         native_opts,
         Box::new(|cc| {
+            // Install PNG/JPEG/SVG image loaders so egui::Image works
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             // Apply brutalist theme before the first frame renders
             theme::apply(&cc.egui_ctx);
             // Global readability bump for high-resolution displays
