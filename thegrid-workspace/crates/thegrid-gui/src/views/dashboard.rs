@@ -204,8 +204,16 @@ pub fn render_device_panel(
             ui.vertical_centered(|ui| {
                 ui.add(
                     egui::Image::new(egui::include_image!("../../assets/TheGridLogo.svg"))
-                        .fit_to_exact_size(egui::vec2(140.0, 140.0))
+                        .fit_to_exact_size(egui::vec2(72.0, 72.0))
                         .maintain_aspect_ratio(true),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new("THE GRID")
+                        .color(Colors::GREEN)
+                        .size(10.0)
+                        .strong()
+                        .family(egui::FontFamily::Monospace),
                 );
             });
         });
