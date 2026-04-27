@@ -25,4 +25,7 @@ hostname   = "0.4"
 dirs       = "5"
 ctrlc      = "3"
 semver     = "1"
-terminal_size = "0.3"
+
+# TUI — ratatui for the interactive dashboard, crossterm as the backend
+ratatui    = "0.28"
+crossterm  = "0.28"

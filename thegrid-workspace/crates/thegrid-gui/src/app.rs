@@ -60,7 +60,178 @@ use std::sync::mpsc;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Screen { Boot, Setup, Dashboard }
+pub enum Screen { Boot, Setup, Dashboard, Projects, Planner }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Left nav project tab
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ProjectNavTab {
+    #[default] Brand,
+    Web,
+    Media,
+    Design,
+}
+
+impl ProjectNavTab {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Brand  => "BRAND",
+            Self::Web    => "WEB",
+            Self::Media  => "MEDIA",
+            Self::Design => "DESIGN",
+        }
+    }
+    pub fn all() -> [ProjectNavTab; 4] {
+        [Self::Brand, Self::Web, Self::Media, Self::Design]
+    }
+    pub fn keywords(&self) -> &'static [&'static str] {
+        match self {
+            Self::Brand  => &["brand", "logo", "identity"],
+            Self::Web    => &["web", "frontend", "backend", "api", "html"],
+            Self::Media  => &["media", "video", "audio", "podcast", "photo"],
+            Self::Design => &["design", "ui", "ux", "figma", "prototype"],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Quick-view project slots (up to 4 pinned project IDs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct QuickViewState {
+    pub slots:          [Option<String>; 4],
+    pub swap_open:      bool,
+    pub swap_slot_idx:  Option<usize>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Projects dashboard
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ProjectsSort { #[default] Name, Status, Progress }
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum ProjectStatus { #[default] Planned, Active, OnHold, Complete }
+
+impl ProjectStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Planned  => "PLANNED",
+            Self::Active   => "ACTIVE",
+            Self::OnHold   => "ON HOLD",
+            Self::Complete => "COMPLETE",
+        }
+    }
+    pub fn color(&self) -> egui::Color32 {
+        match self {
+            Self::Planned  => Colors::TEXT_DIM,
+            Self::Active   => Colors::GREEN,
+            Self::OnHold   => Colors::AMBER,
+            Self::Complete => Color32::from_rgb(50, 140, 255),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────────────────
+// Add-project popup state
+// ───────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct ProjectAddState {
+    pub open:     bool,
+    pub name:     String,
+    pub slot:     usize,   // 0–3: which quick-view slot to pin into
+}
+
+// Planner add-task popup state
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum PlannerAddType { #[default] Human, Ai }
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum PlannerAddPriority { Low, #[default] Med, High }
+
+impl PlannerAddPriority {
+    pub fn label(&self) -> &'static str {
+        match self { Self::Low => "LOW", Self::Med => "MED", Self::High => "HIGH" }
+    }
+    pub fn color(&self) -> egui::Color32 {
+        match self {
+            Self::Low  => Colors::TEXT_MUTED,
+            Self::Med  => Colors::AMBER,
+            Self::High => Colors::RED,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlannerAddState {
+    pub open:         bool,
+    pub project_id:   String,
+    pub task_title:   String,
+    pub task_type:    PlannerAddType,
+    pub priority:     PlannerAddPriority,
+    pub description:  String,
+    pub sub_tasks:    Vec<(String, bool)>,
+    pub new_sub_task: String,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Planner
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum PlannerTaskStatus { #[default] Todo, InProgress, Done, Blocked }
+
+impl PlannerTaskStatus {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Todo       => "TODO",
+            Self::InProgress => "IN PROGRESS",
+            Self::Done       => "DONE",
+            Self::Blocked    => "BLOCKED",
+        }
+    }
+    pub fn color(&self) -> egui::Color32 {
+        match self {
+            Self::Todo       => Colors::TEXT_DIM,
+            Self::InProgress => Colors::AMBER,
+            Self::Done       => Colors::GREEN,
+            Self::Blocked    => Colors::RED,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PlannerTask {
+    pub id:           String,
+    pub title:        String,
+    pub status:       PlannerTaskStatus,
+    /// "AI", "HUMAN", or a person's name
+    pub assignee:     String,
+    pub ai_suggested: bool,
+    pub notes:        String,
+    pub depends_on:   Vec<String>,
+}
+
+impl PlannerTask {
+    pub fn human(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self { id: id.into(), title: title.into(), status: PlannerTaskStatus::Todo,
+               assignee: "HUMAN".into(), ai_suggested: false,
+               notes: String::new(), depends_on: Vec::new() }
+    }
+    pub fn ai(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self { id: id.into(), title: title.into(), status: PlannerTaskStatus::Todo,
+               assignee: "AI".into(), ai_suggested: true,
+               notes: String::new(), depends_on: Vec::new() }
+    }
+}
 
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
 
@@ -351,6 +522,27 @@ pub struct TheGridApp {
     // ── Phase 6: Dedup review ─────────────────────────────────────────────────
     rich_duplicate_groups: Vec<DuplicateGroup>,
     dedup_review_state: crate::views::dedup_review::DedupReviewState,
+
+    // ── Left nav navigation state ─────────────────────────────────────────────
+    project_nav_tab:     ProjectNavTab,
+    nav_nodes_collapsed: bool,
+    quick_view:          QuickViewState,
+
+    // ── Projects dashboard ────────────────────────────────────────────────────
+    projects_filter:   String,
+    projects_sort:     ProjectsSort,
+    project_statuses:  HashMap<String, ProjectStatus>,
+
+    // ── AI Planner ────────────────────────────────────────────────────────────
+    planner_selected:  Option<String>,
+    planner_tasks:     HashMap<String, Vec<PlannerTask>>,
+    planner_new_task:  String,
+    planner_edit_idx:  Option<(String, usize)>,  // (project_id, task_index)
+
+    // ── Add-task popup ───────────────────────────────────────────────────────
+    planner_add:       PlannerAddState,
+    // ── Add-project popup ────────────────────────────────────────────────────
+    project_add:       ProjectAddState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -635,6 +827,19 @@ impl TheGridApp {
             compute_sessions: Vec::new(),
             rich_duplicate_groups: Vec::new(),
             dedup_review_state: crate::views::dedup_review::DedupReviewState::default(),
+
+            project_nav_tab:     ProjectNavTab::default(),
+            nav_nodes_collapsed: false,
+            quick_view:          QuickViewState::default(),
+            projects_filter:     String::new(),
+            projects_sort:       ProjectsSort::default(),
+            project_statuses:    HashMap::new(),
+            planner_selected:    None,
+            planner_tasks:       HashMap::new(),
+            planner_new_task:    String::new(),
+            planner_edit_idx:    None,
+            planner_add:         PlannerAddState::default(),
+            project_add:         ProjectAddState::default(),
         }
     }
 
@@ -2676,6 +2881,85 @@ impl TheGridApp {
         });
     }
 
+    /// Render the nav tab strip below the title bar (Nodes / Projects / Planner).
+    fn render_navtabs(&mut self, ctx: &egui::Context) {
+        let current = self.screen.clone();
+        let mut next: Option<Screen> = None;
+
+        egui::TopBottomPanel::top("navtabs")
+            .exact_height(32.0)
+            .frame(egui::Frame::none()
+                .fill(Colors::BG_PANEL)
+                .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add_space(8.0);
+                    for (tab_screen, label, hotkey_n) in [
+                        (Screen::Dashboard, "NODES",    "1"),
+                        (Screen::Projects,  "PROJECTS", "2"),
+                        (Screen::Planner,   "PLANNER",  "3"),
+                    ] {
+                        let active = current == tab_screen;
+                        let color  = if active { Colors::GREEN } else { Colors::TEXT_DIM };
+                        let fill   = if active { Color32::from_rgb(0, 24, 8) } else { Color32::TRANSPARENT };
+                        let border = if active { Colors::GREEN_DIM } else { Color32::from_rgb(30, 30, 30) };
+
+                        // Compose label with superscript-style hotkey number
+                        let rich = egui::WidgetText::LayoutJob({
+                            let mut job = egui::text::LayoutJob::default();
+                            job.append(
+                                label,
+                                0.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::new(9.5, egui::FontFamily::Monospace),
+                                    color,
+                                    ..Default::default()
+                                },
+                            );
+                            job.append(
+                                hotkey_n,
+                                3.0,
+                                egui::TextFormat {
+                                    font_id: egui::FontId::new(7.0, egui::FontFamily::Monospace),
+                                    color: if active { Colors::GREEN_DIM } else { Color32::from_rgb(50, 50, 50) },
+                                    valign: egui::Align::Min,
+                                    ..Default::default()
+                                },
+                            );
+                            job
+                        });
+
+                        let resp = ui.add(
+                            egui::Button::new(rich)
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.0, border))
+                                .min_size(egui::vec2(76.0, 22.0))
+                        );
+
+                        // Active tab: draw 2px bottom accent line
+                        if active {
+                            let r = resp.rect;
+                            ui.painter().line_segment(
+                                [egui::pos2(r.min.x + 2.0, r.max.y - 1.0),
+                                 egui::pos2(r.max.x - 2.0, r.max.y - 1.0)],
+                                egui::Stroke::new(2.0, Colors::GREEN),
+                            );
+                        }
+
+                        if resp.on_hover_text(format!("F{hotkey_n}")).clicked() {
+                            next = Some(tab_screen);
+                        }
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+
+        if let Some(s) = next {
+            self.screen = s;
+        }
+    }
+
     fn render_viewport_panel(&mut self, ctx: &egui::Context) {
 
 
@@ -3448,6 +3732,13 @@ impl eframe::App for TheGridApp {
         let ctrl_f       = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F));
         let ctrl_comma   = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Num0)); // placeholder
         let _ctrl_r      = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::R));
+        let f1_press     = ctx.input(|i| i.key_pressed(egui::Key::F1));
+        let f2_press     = ctx.input(|i| i.key_pressed(egui::Key::F2));
+        let f3_press     = ctx.input(|i| i.key_pressed(egui::Key::F3));
+
+        if f1_press { self.screen = Screen::Dashboard; }
+        if f2_press { self.screen = Screen::Projects; }
+        if f3_press { self.screen = Screen::Planner; }
 
         if ctrl_f && self.screen == Screen::Dashboard {
             self.search.open = !self.search.open;
@@ -3598,6 +3889,7 @@ impl eframe::App for TheGridApp {
                 self.start_initial_watch_scans();
                 self.start_release_check();
                 self.render_titlebar(ctx);
+                self.render_navtabs(ctx);
                 self.render_statusbar(ctx);
                 self.render_footer_progress(ctx);
 
@@ -3611,7 +3903,7 @@ impl eframe::App for TheGridApp {
                     self.telemetry_cache.clone();
 
                 egui::SidePanel::left("devices_panel")
-                    .exact_width(280.0)
+                    .exact_width(240.0)
                     .resizable(false)
                     .frame(egui::Frame::none()
                         .fill(Colors::BG_PANEL)
@@ -3622,7 +3914,7 @@ impl eframe::App for TheGridApp {
                             (d.clone(), self.get_node_status(&d.id))
                         }).collect();
 
-                        device_clicked = crate::views::dashboard::render_device_panel(
+                        let result = crate::views::dashboard::render_device_panel(
                             ui,
                             &devices_with_status,
                             &self.device_display_states,
@@ -3636,7 +3928,25 @@ impl eframe::App for TheGridApp {
                             &mut self.device_filter,
                             &mut needs_refresh,
                             &self.local_hostname,
+                            &mut self.project_nav_tab,
+                            &mut self.nav_nodes_collapsed,
+                            &mut self.quick_view,
+                            &self.project_statuses,
+                            Screen::Dashboard,
+                            &self.planner_tasks,
+                            self.planner_selected.as_deref(),
+                            &mut self.planner_add.open,
                         );
+                        device_clicked = result.clicked_device;
+                        if let Some(nav) = result.navigate_to {
+                            self.screen = nav;
+                        }
+                        if result.open_planner_add {
+                            self.planner_add.open = true;
+                        }
+                        if result.open_project_add {
+                            self.project_add.open = true;
+                        }
                     });
 
                 if needs_refresh { self.spawn_load_devices(); }
@@ -3925,6 +4235,480 @@ impl eframe::App for TheGridApp {
                     self.sync_all_nodes();
                 }
             }
+
+            // ── Projects Dashboard ────────────────────────────────────────────
+            Screen::Projects => {
+                self.start_initial_watch_scans();
+                self.start_release_check();
+                self.render_titlebar(ctx);
+                self.render_navtabs(ctx);
+                self.render_statusbar(ctx);
+
+                let telemetry_snap: HashMap<String, NodeTelemetry> =
+                    self.telemetry_cache.clone();
+
+                // Reuse left nav panel for consistency
+                let mut _device_clicked: Option<usize> = None;
+                let mut needs_refresh = false;
+                egui::SidePanel::left("devices_panel_proj")
+                    .exact_width(240.0)
+                    .resizable(false)
+                    .frame(egui::Frame::none()
+                        .fill(Colors::BG_PANEL)
+                        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+                    )
+                    .show(ctx, |ui| {
+                        let devices_with_status: Vec<_> = self.devices.iter().map(|d| {
+                            (d.clone(), self.get_node_status(&d.id))
+                        }).collect();
+                        let result = crate::views::dashboard::render_device_panel(
+                            ui,
+                            &devices_with_status,
+                            &self.device_display_states,
+                            &telemetry_snap,
+                            self.selected_idx,
+                            &mut self.selected_node_ids,
+                            &self.config.projects,
+                            &self.config.categories,
+                            &self.config.smart_rules,
+                            &mut self.file_manager.active_rule,
+                            &mut self.device_filter,
+                            &mut needs_refresh,
+                            &self.local_hostname,
+                            &mut self.project_nav_tab,
+                            &mut self.nav_nodes_collapsed,
+                            &mut self.quick_view,
+                            &self.project_statuses,
+                            Screen::Projects,
+                            &self.planner_tasks,
+                            self.planner_selected.as_deref(),
+                            &mut self.planner_add.open,
+                        );
+                        _device_clicked = result.clicked_device;
+                        if let Some(nav) = result.navigate_to { self.screen = nav; }
+                        if result.open_planner_add { self.planner_add.open = true; }
+                        if result.open_project_add { self.project_add.open = true; }
+                    });
+                if needs_refresh { self.spawn_load_devices(); }
+
+                // Projects central view
+                let mut goto_planner: Option<String> = None;
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(Colors::BG))
+                    .show(ctx, |ui| {
+                        let action = crate::views::project_dashboard::render(
+                            ui,
+                            &self.config.projects,
+                            &mut self.projects_filter,
+                            &mut self.projects_sort,
+                            &mut self.project_statuses,
+                            &self.planner_tasks,
+                        );
+                        if let Some(proj_id) = action.open_planner {
+                            goto_planner = Some(proj_id);
+                        }
+                        if let Some((id, status)) = action.set_status {
+                            self.project_statuses.insert(id, status);
+                        }
+                        if let Some(slot_idx) = action.pin_to_slot {
+                            if let Some(proj_id) = action.pin_project_id {
+                                if slot_idx < 4 {
+                                    self.quick_view.slots[slot_idx] = Some(proj_id);
+                                }
+                            }
+                        }
+                    });
+
+                if let Some(proj_id) = goto_planner {
+                    self.planner_selected = Some(proj_id);
+                    self.screen = Screen::Planner;
+                }
+                self.render_toasts(ctx);
+            }
+
+            // ── AI Planner ────────────────────────────────────────────────────
+            Screen::Planner => {
+                self.start_initial_watch_scans();
+                self.start_release_check();
+                self.render_titlebar(ctx);
+                self.render_navtabs(ctx);
+                self.render_statusbar(ctx);
+
+                let telemetry_snap: HashMap<String, NodeTelemetry> =
+                    self.telemetry_cache.clone();
+
+                let mut _device_clicked: Option<usize> = None;
+                let mut needs_refresh = false;
+                egui::SidePanel::left("devices_panel_plan")
+                    .exact_width(240.0)
+                    .resizable(false)
+                    .frame(egui::Frame::none()
+                        .fill(Colors::BG_PANEL)
+                        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+                    )
+                    .show(ctx, |ui| {
+                        let devices_with_status: Vec<_> = self.devices.iter().map(|d| {
+                            (d.clone(), self.get_node_status(&d.id))
+                        }).collect();
+                        let result = crate::views::dashboard::render_device_panel(
+                            ui,
+                            &devices_with_status,
+                            &self.device_display_states,
+                            &telemetry_snap,
+                            self.selected_idx,
+                            &mut self.selected_node_ids,
+                            &self.config.projects,
+                            &self.config.categories,
+                            &self.config.smart_rules,
+                            &mut self.file_manager.active_rule,
+                            &mut self.device_filter,
+                            &mut needs_refresh,
+                            &self.local_hostname,
+                            &mut self.project_nav_tab,
+                            &mut self.nav_nodes_collapsed,
+                            &mut self.quick_view,
+                            &self.project_statuses,
+                            Screen::Planner,
+                            &self.planner_tasks,
+                            self.planner_selected.as_deref(),
+                            &mut self.planner_add.open,
+                        );
+                        _device_clicked = result.clicked_device;
+                        if let Some(nav) = result.navigate_to { self.screen = nav; }
+                        if result.open_planner_add { self.planner_add.open = true; }
+                        if result.open_project_add { self.project_add.open = true; }
+                    });
+                if needs_refresh { self.spawn_load_devices(); }
+
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(Colors::BG))
+                    .show(ctx, |ui| {
+                        crate::views::planner::render(
+                            ui,
+                            &self.config.projects,
+                            &mut self.planner_selected,
+                            &mut self.planner_tasks,
+                            &mut self.planner_new_task,
+                            &mut self.planner_edit_idx,
+                            &self.project_statuses,
+                        );
+                    });
+
+                self.render_toasts(ctx);
+            }
+        }
+
+        // ── Planner Add-Task popup (global, shown on top of any screen) ──────
+        self.render_planner_add_popup(ctx);
+        // ── Add-Project popup (global) ────────────────────────────────────────
+        self.render_project_add_popup(ctx);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Auxiliary methods not part of eframe::App
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl TheGridApp {
+    /// Floating modal for adding a new task from anywhere in the nav
+    fn render_planner_add_popup(&mut self, ctx: &egui::Context) {
+        if !self.planner_add.open { return; }
+
+        let mut close = false;
+        let mut confirm = false;
+
+        egui::Window::new("ADD TASK")
+            .id(egui::Id::new("planner_add_popup"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .fixed_size(egui::vec2(340.0, 0.0))
+            .frame(egui::Frame::none()
+                .fill(Colors::BG_PANEL)
+                .stroke(egui::Stroke::new(1.5, Colors::GREEN_DIM))
+                .inner_margin(egui::Margin::same(16.0))
+            )
+            .show(ctx, |ui| {
+                // Title bar
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("// NEW TASK").color(Colors::GREEN).size(10.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add(
+                            egui::Button::new(RichText::new("✕").color(Colors::TEXT_MUTED).size(9.0))
+                                .fill(Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
+                        ).clicked() { close = true; }
+                    });
+                });
+                ui.add(egui::Separator::default().spacing(6.0));
+                ui.add_space(4.0);
+
+                // Project selector
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("PROJECT").color(Colors::TEXT_MUTED).size(8.5));
+                    ui.add_space(8.0);
+                    egui::ComboBox::from_id_source("add_task_project")
+                        .selected_text(
+                            RichText::new(
+                                self.config.projects.iter()
+                                    .find(|p| p.id == self.planner_add.project_id)
+                                    .map(|p| p.name.to_uppercase())
+                                    .unwrap_or_else(|| "SELECT…".into())
+                            ).color(Colors::TEXT).size(9.0)
+                        )
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            for proj in &self.config.projects {
+                                ui.selectable_value(
+                                    &mut self.planner_add.project_id,
+                                    proj.id.clone(),
+                                    RichText::new(proj.name.to_uppercase()).size(9.0)
+                                );
+                            }
+                        });
+                });
+                ui.add_space(8.0);
+
+                // Task title
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("TITLE").color(Colors::TEXT_MUTED).size(8.5));
+                    ui.add_space(18.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.planner_add.task_title)
+                            .hint_text("Task description…")
+                            .font(egui::FontId::new(9.5, egui::FontFamily::Monospace))
+                            .desired_width(f32::INFINITY)
+                            .frame(true)
+                    );
+                });
+                ui.add_space(8.0);
+
+                // Type: HUMAN / AI
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("TYPE").color(Colors::TEXT_MUTED).size(8.5));
+                    ui.add_space(20.0);
+                    for (tp, lbl) in [
+                        (crate::app::PlannerAddType::Human, "HUMAN"),
+                        (crate::app::PlannerAddType::Ai,    "AI"),
+                    ] {
+                        let active = self.planner_add.task_type == tp;
+                        let fill = if active { Color32::from_rgb(0, 20, 6) } else { Color32::TRANSPARENT };
+                        let col  = if active { Colors::GREEN } else { Colors::TEXT_DIM };
+                        if ui.add(
+                            egui::Button::new(RichText::new(lbl).color(col).size(8.5))
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.0, if active { Colors::GREEN_DIM } else { Colors::BORDER }))
+                                .min_size(egui::vec2(54.0, 20.0))
+                        ).clicked() { self.planner_add.task_type = tp; }
+                        ui.add_space(4.0);
+                    }
+                });
+                ui.add_space(8.0);
+
+                // Priority: LOW / MED / HIGH
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("PRIORITY").color(Colors::TEXT_MUTED).size(8.5));
+                    for prio in [
+                        crate::app::PlannerAddPriority::Low,
+                        crate::app::PlannerAddPriority::Med,
+                        crate::app::PlannerAddPriority::High,
+                    ] {
+                        let active = self.planner_add.priority == prio;
+                        let col = if active { prio.color() } else { Colors::TEXT_MUTED };
+                        let fill = if active { Color32::from_rgba_premultiplied(
+                            prio.color().r() / 4, prio.color().g() / 4, prio.color().b() / 4, 80
+                        )} else { Color32::TRANSPARENT };
+                        if ui.add(
+                            egui::Button::new(RichText::new(prio.label()).color(col).size(8.5))
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.0, if active { col } else { Colors::BORDER }))
+                                .min_size(egui::vec2(44.0, 20.0))
+                        ).clicked() { self.planner_add.priority = prio; }
+                        ui.add_space(3.0);
+                    }
+                });
+                ui.add_space(8.0);
+
+                // Description
+                ui.label(RichText::new("DESCRIPTION").color(Colors::TEXT_MUTED).size(8.5));
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.planner_add.description)
+                        .hint_text("Optional notes / context…")
+                        .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(3)
+                        .frame(true)
+                );
+                ui.add_space(8.0);
+
+                // Sub-tasks
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("SUB-TASKS").color(Colors::TEXT_MUTED).size(8.5));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_add = !self.planner_add.new_sub_task.trim().is_empty();
+                        if ui.add_enabled(can_add,
+                            egui::Button::new(RichText::new("+ ADD").color(Colors::GREEN).size(8.5))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM))
+                        ).clicked() {
+                            let st = std::mem::take(&mut self.planner_add.new_sub_task);
+                            self.planner_add.sub_tasks.push((st, false));
+                        }
+                    });
+                });
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.planner_add.new_sub_task)
+                        .hint_text("Add a sub-task…")
+                        .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
+                        .desired_width(f32::INFINITY)
+                        .frame(true)
+                );
+                ui.add_space(4.0);
+                let mut remove_sub: Option<usize> = None;
+                for (i, (st, done)) in self.planner_add.sub_tasks.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(done, "");
+                        let col = if *done { Colors::TEXT_MUTED } else { Colors::TEXT };
+                        ui.label(RichText::new(st.as_str()).color(col).size(9.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(
+                                egui::Button::new(RichText::new("✕").color(Colors::RED).size(8.0))
+                                    .fill(Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
+                            ).clicked() { remove_sub = Some(i); }
+                        });
+                    });
+                }
+                if let Some(i) = remove_sub { self.planner_add.sub_tasks.remove(i); }
+
+                ui.add_space(12.0);
+                ui.add(egui::Separator::default().spacing(4.0));
+
+                // Action buttons
+                ui.horizontal(|ui| {
+                    let can_submit = !self.planner_add.task_title.trim().is_empty()
+                        && !self.planner_add.project_id.is_empty();
+                    if ui.add_enabled(can_submit,
+                        egui::Button::new(RichText::new("+ ADD TASK").color(Colors::GREEN).size(9.5).strong())
+                            .fill(Color32::from_rgb(0, 20, 6))
+                            .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM))
+                            .min_size(egui::vec2(120.0, 26.0))
+                    ).clicked() { confirm = true; }
+                    ui.add_space(8.0);
+                    if ui.add(
+                        egui::Button::new(RichText::new("CANCEL").color(Colors::TEXT_MUTED).size(9.0))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+                            .min_size(egui::vec2(80.0, 26.0))
+                    ).clicked() { close = true; }
+                });
+            });
+
+        if confirm {
+            let task_id = format!("task_{}", chrono::Utc::now().timestamp_millis());
+            let task = match self.planner_add.task_type {
+                crate::app::PlannerAddType::Human => PlannerTask::human(task_id, &self.planner_add.task_title),
+                crate::app::PlannerAddType::Ai    => PlannerTask::ai(task_id, &self.planner_add.task_title),
+            };
+            let proj_id = self.planner_add.project_id.clone();
+            self.planner_tasks.entry(proj_id).or_default().push(task);
+            self.planner_add = PlannerAddState::default();
+        }
+        if close {
+            self.planner_add.open = false;
+        }
+    }
+
+    /// Floating modal for adding a new project from the nav panel [+ NEW] button
+    fn render_project_add_popup(&mut self, ctx: &egui::Context) {
+        if !self.project_add.open { return; }
+
+        let mut close = false;
+        let mut confirm = false;
+
+        egui::Window::new("NEW PROJECT")
+            .id(egui::Id::new("project_add_popup"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .fixed_size(egui::vec2(300.0, 0.0))
+            .frame(egui::Frame::window(&ctx.style())
+                .fill(crate::theme::Colors::BG_PANEL)
+                .stroke(egui::Stroke::new(1.0, crate::theme::Colors::GREEN_DIM))
+            )
+            .show(ctx, |ui| {
+                use egui::RichText;
+                ui.add_space(8.0);
+
+                // Name
+                ui.label(RichText::new("PROJECT NAME").color(crate::theme::Colors::TEXT_DIM).size(9.0).strong());
+                ui.add_space(3.0);
+                ui.add(egui::TextEdit::singleline(&mut self.project_add.name)
+                    .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                    .desired_width(f32::INFINITY)
+                    .hint_text("MY PROJECT")
+                );
+
+                ui.add_space(10.0);
+
+                // Quick-slot picker
+                ui.label(RichText::new("PIN TO QUICK-SLOT").color(crate::theme::Colors::TEXT_DIM).size(9.0).strong());
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for s in 0..4usize {
+                        let active = self.project_add.slot == s;
+                        let col = if active { crate::theme::Colors::GREEN } else { crate::theme::Colors::TEXT_MUTED };
+                        let fill = if active { egui::Color32::from_rgb(0, 20, 6) } else { egui::Color32::TRANSPARENT };
+                        let btn = egui::Button::new(RichText::new(format!("SLOT {}", s + 1)).color(col).size(8.5))
+                            .fill(fill)
+                            .stroke(egui::Stroke::new(1.0, col))
+                            .min_size(egui::vec2(55.0, 22.0));
+                        if ui.add(btn).clicked() { self.project_add.slot = s; }
+                    }
+                });
+
+                ui.add_space(14.0);
+                ui.add(egui::Separator::default().spacing(0.0));
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    let name_ok = !self.project_add.name.trim().is_empty();
+                    let create_col = if name_ok { crate::theme::Colors::GREEN } else { crate::theme::Colors::TEXT_MUTED };
+                    let create_resp = ui.add(
+                        egui::Button::new(RichText::new("+ CREATE PROJECT").color(create_col).size(9.5).strong())
+                            .fill(egui::Color32::from_rgb(0, 20, 6))
+                            .stroke(egui::Stroke::new(1.0, crate::theme::Colors::GREEN_DIM))
+                            .min_size(egui::vec2(160.0, 28.0))
+                    );
+                    if create_resp.clicked() && name_ok { confirm = true; }
+
+                    ui.add_space(8.0);
+                    if ui.add(
+                        egui::Button::new(RichText::new("CANCEL").color(crate::theme::Colors::TEXT_MUTED).size(9.0))
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::new(1.0, crate::theme::Colors::BORDER))
+                            .min_size(egui::vec2(70.0, 28.0))
+                    ).clicked() { close = true; }
+                });
+                ui.add_space(8.0);
+            });
+
+        if confirm {
+            let name = self.project_add.name.trim().to_string();
+            let id = format!("proj_{}", chrono::Utc::now().timestamp_millis());
+            let slot = self.project_add.slot;
+            let proj = thegrid_core::models::Project {
+                id: id.clone(),
+                name,
+                description: String::new(),
+                tags: Vec::new(),
+            };
+            self.config.projects.push(proj);
+            self.quick_view.slots[slot] = Some(id);
+            self.project_add = ProjectAddState::default();
+        }
+        if close {
+            self.project_add = ProjectAddState::default();
         }
     }
 }

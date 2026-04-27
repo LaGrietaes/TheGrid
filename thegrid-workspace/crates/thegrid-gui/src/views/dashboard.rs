@@ -148,8 +148,17 @@ pub struct DetailActions {
 // Device panel (left sidebar)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Returned by render_device_panel each frame.
+#[derive(Default)]
+pub struct NavPanelResult {
+    pub clicked_device:    Option<usize>,
+    pub navigate_to:       Option<crate::app::Screen>,
+    pub open_planner_add:  bool,
+    pub open_project_add:  bool,
+}
+
 /// Render the left device panel.
-/// Returns: (clicked device index, refresh requested)
+#[allow(clippy::too_many_arguments)]
 pub fn render_device_panel(
     ui: &mut Ui,
     devices_with_status: &[(TailscaleDevice, crate::app::NodeStatus)],
@@ -164,8 +173,18 @@ pub fn render_device_panel(
     filter: &mut String,
     needs_refresh: &mut bool,
     local_device_name: &str,
-) -> Option<usize> {
-    let mut clicked = None;
+    // ── new navigation state ────────────────────────────────────────────────
+    project_nav_tab: &mut crate::app::ProjectNavTab,
+    nav_nodes_collapsed: &mut bool,
+    quick_view: &mut crate::app::QuickViewState,
+    project_statuses: &std::collections::HashMap<String, crate::app::ProjectStatus>,
+    // ── context for cross-section navigation / previews ─────────────────────
+    active_screen: crate::app::Screen,
+    planner_tasks: &std::collections::HashMap<String, Vec<crate::app::PlannerTask>>,
+    planner_selected: Option<&str>,
+    planner_add_open: &mut bool,
+) -> NavPanelResult {
+    let mut result = NavPanelResult::default();
 
     fn is_local_device(device: &TailscaleDevice, local_device_name: &str) -> bool {
         device.hostname.eq_ignore_ascii_case(local_device_name)
@@ -173,71 +192,44 @@ pub fn render_device_panel(
             || device.display_name().eq_ignore_ascii_case(local_device_name)
     }
 
-    // ── Header ────────────────────────────────────────────────────────────────
+    // ── Filter + Refresh row ────────────────────────────────────────────────
+    let _ = nav_nodes_collapsed; // collapse replaced by nav tabs
     egui::Frame::none()
         .fill(Colors::BG_PANEL)
-        .inner_margin(egui::Margin::symmetric(16.0, 12.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("// NODES")
-                        .color(Colors::GREEN).size(9.0).strong()
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Refresh button lives here — avoids the &self / &mut self conflict
-                    // that plagued v0.1's titlebar implementation
-                    // Refresh Vector Button
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::click());
-                    let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
-                    let c = rect.center();
-                    ui.painter().circle_stroke(c, 4.5, egui::Stroke::new(1.2, color));
-                    // Arrow tip
-                    ui.painter().line_segment([c + egui::vec2(3.0, -3.0), c + egui::vec2(6.0, -5.0)], egui::Stroke::new(1.2, color));
-                    ui.painter().line_segment([c + egui::vec2(3.0, -3.0), c + egui::vec2(5.0, -1.0)], egui::Stroke::new(1.2, color));
-                    if resp.clicked() {
-                        *needs_refresh = true;
-                    }
-                    ui.label(
-                        RichText::new(format!("{}", devices_with_status.len()))
-                            .color(Colors::TEXT_DIM).size(9.0)
-                    );
-
-                    if !selected_node_ids.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(format!("CLUSTER {}", selected_node_ids.len()))
-                                .color(Colors::GREEN)
-                                .size(8.0)
-                                .strong()
-                        );
-                    }
-                });
-            });
-        });
-
-    ui.add(egui::Separator::default().spacing(0.0));
-
-    // ── Search ────────────────────────────────────────────────────────────────
-    egui::Frame::none()
-        .fill(Colors::BG_PANEL)
-        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Vector Search Magnifier
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                // Search icon
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                 let c = rect.center() - egui::vec2(1.0, 1.0);
-                ui.painter().circle_stroke(c, 3.5, egui::Stroke::new(1.0, Colors::TEXT_MUTED));
+                ui.painter().circle_stroke(c, 3.0, egui::Stroke::new(1.0, Colors::TEXT_MUTED));
                 ui.painter().line_segment(
-                    [c + egui::vec2(2.5, 2.5), c + egui::vec2(5.0, 5.0)],
+                    [c + egui::vec2(2.0, 2.0), c + egui::vec2(4.5, 4.5)],
                     egui::Stroke::new(1.2, Colors::TEXT_MUTED)
                 );
                 ui.add(
                     egui::TextEdit::singleline(filter)
                         .hint_text("FILTER NODES...")
-                        .font(egui::FontId::new(10.0, egui::FontFamily::Monospace))
+                        .font(egui::FontId::new(9.5, egui::FontFamily::Monospace))
                         .desired_width(f32::INFINITY)
                         .frame(false)
                 );
+                // Refresh + cluster count on right
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                    let color = if resp.hovered() { Colors::GREEN } else { Colors::TEXT_DIM };
+                    let c = rect.center();
+                    ui.painter().circle_stroke(c, 3.5, egui::Stroke::new(1.1, color));
+                    ui.painter().line_segment([c + egui::vec2(2.0, -2.0), c + egui::vec2(4.5, -4.0)], egui::Stroke::new(1.1, color));
+                    ui.painter().line_segment([c + egui::vec2(2.0, -2.0), c + egui::vec2(4.0, -0.2)], egui::Stroke::new(1.1, color));
+                    if resp.clicked() { *needs_refresh = true; }
+                    resp.on_hover_text("Refresh nodes");
+                    if !selected_node_ids.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(format!("CLU:{}", selected_node_ids.len()))
+                            .color(Colors::GREEN).size(7.5).strong());
+                    }
+                });
             });
         });
 
@@ -246,13 +238,12 @@ pub fn render_device_panel(
     let filter_lower = filter.to_lowercase();
     ScrollArea::vertical()
         .id_source("device_list_scroll")
+        .max_height(320.0)
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
             // ── Nodes Section ────────────────────────────────────────────────────────
-            ui.add_space(8.0);
-            let mut rendered_local_section = false;
-            let mut rendered_tailnet_section = false;
+            ui.add_space(4.0);
             for (idx, (device, status)) in devices_with_status.iter().enumerate() {
                 let matches = filter_lower.is_empty()
                     || device.hostname.to_lowercase().contains(&filter_lower)
@@ -262,21 +253,6 @@ pub fn render_device_panel(
                 if !matches { continue; }
 
                 let is_local = is_local_device(device, local_device_name);
-                if is_local && !rendered_local_section {
-                    ui.label(RichText::new("// THIS NODE").color(Colors::GREEN).size(9.0).strong());
-                    ui.add_space(4.0);
-                    rendered_local_section = true;
-                }
-                if !is_local && !rendered_tailnet_section {
-                    if rendered_local_section {
-                        ui.add_space(6.0);
-                        ui.add(egui::Separator::default().spacing(0.0));
-                        ui.add_space(6.0);
-                    }
-                    ui.label(RichText::new("// TAILNET NODES").color(Colors::GREEN).size(9.0).strong());
-                    ui.add_space(4.0);
-                    rendered_tailnet_section = true;
-                }
 
                 let is_selected = selected_idx == Some(idx);
                 let is_in_cluster = selected_node_ids.contains(&device.id);
@@ -285,7 +261,6 @@ pub fn render_device_panel(
                          else if is_in_cluster { Color32::from_rgba_premultiplied(0, 80, 20, 18) }
                          else { Color32::TRANSPARENT };
                 
-                // Prefer richer DeviceDisplayState color when available.
                 let status_color = if let Some(ds) = display_states.get(&device.id) {
                     theme::device_state_color(ds)
                 } else {
@@ -296,7 +271,6 @@ pub fn render_device_panel(
                     }
                 };
 
-                // Telemetry for this device (AI info, device type)
                 let telem = telemetries.get(&device.id);
                 let is_ai = telem.map(|t| t.is_ai_capable).unwrap_or(false);
                 let ai_model: Option<&str> = telem.and_then(|t| {
@@ -304,50 +278,23 @@ pub fn render_device_panel(
                 });
                 let device_type_str = telem.map(|t| t.device_type.as_str()).unwrap_or("Desktop");
 
-                // ── Tailscale name and IP strings (for secondary row + copy) ────────
-                // The "clean" tailscale hostname (e.g. "rog-one.tail1234.ts.net")
                 let ts_name: &str = if !device.name.is_empty() { &device.name } else { &device.hostname };
                 let ts_ip: &str = device.primary_ip().unwrap_or("");
 
-                let mut cluster_toggled = false;
-                let mut copy_ts_name = false;
-                let mut copy_ts_ip   = false;
+                let mut copy_ts_ip = false;
                 let resp = egui::Frame::none()
                     .fill(bg)
-                    .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 7.0, bottom: 7.0 })
+                    .inner_margin(egui::Margin { left: 8.0, right: 6.0, top: 4.0, bottom: 4.0 })
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
+                        // ── Compact single-area layout ────────────────────────
                         ui.horizontal(|ui| {
-                            // ── Cluster toggle button ─────────────────────
-                            let (cluster_rect, cluster_resp) = ui.allocate_exact_size(
-                                egui::vec2(16.0, 16.0),
-                                egui::Sense::click(),
-                            );
-                            let cluster_color = if is_in_cluster { Colors::GREEN } else { Colors::TEXT_DIM };
-                            if is_in_cluster {
-                                ui.painter().rect_filled(cluster_rect, egui::Rounding::same(2.0), Color32::from_rgba_premultiplied(0, 120, 40, 28));
-                            }
-                            ui.painter().rect_stroke(
-                                cluster_rect,
-                                egui::Rounding::same(2.0),
-                                egui::Stroke::new(1.0, if cluster_resp.hovered() { Colors::TEXT } else { cluster_color }),
-                            );
-                            let icon_r = egui::Rect::from_center_size(cluster_rect.center(), egui::vec2(9.0, 9.0));
-                            theme::draw_vector_icon(ui, icon_r, theme::IconType::Network, cluster_color);
-                            if cluster_resp.clicked() {
-                                cluster_toggled = true;
-                                if is_in_cluster {
-                                    selected_node_ids.retain(|id| id != &device.id);
-                                } else if !selected_node_ids.contains(&device.id) {
-                                    selected_node_ids.push(device.id.clone());
-                                }
-                            }
-                            cluster_resp.on_hover_text("Toggle cluster membership");
+                            // Status dot (replaces cluster toggle as primary left glyph)
+                            let (dot_r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot_r.center(), 3.5, status_color);
+                            ui.add_space(5.0);
 
-                            ui.add_space(6.0);
-
-                            // ── Device icon (colored by status) ───────────────────
-                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                            // Device icon
                             let h_lower = device.hostname.to_lowercase();
                             let d_lower = device.display_name().to_lowercase();
                             let icon_type = if h_lower.contains("nubia") || d_lower.contains("nubia") || device_type_str == "Tablet" {
@@ -356,93 +303,79 @@ pub fn render_device_panel(
                                 theme::IconType::Smartphone
                             } else {
                                 match device_type_str {
-                                    "Laptop"     => theme::IconType::Laptop,
-                                    "Server"     => theme::IconType::Server,
-                                    "Tablet"     => theme::IconType::Tablet,
+                                    "Laptop"               => theme::IconType::Laptop,
+                                    "Server"               => theme::IconType::Server,
+                                    "Tablet"               => theme::IconType::Tablet,
                                     "Smartphone" | "Phone" => theme::IconType::Smartphone,
-                                    "Chromebook" => theme::IconType::Chromebook,
-                                    _ => theme::IconType::Desktop,
+                                    "Chromebook"           => theme::IconType::Chromebook,
+                                    _                      => theme::IconType::Desktop,
                                 }
                             };
+                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
                             theme::draw_vector_icon(ui, icon_rect, icon_type, status_color);
+                            ui.add_space(6.0);
 
-                            ui.add_space(8.0);
-
-                            // ── Text column ───────────────────────────────────────
+                            // Text column: name row + info row
                             ui.vertical(|ui| {
-                                // Row 1: short device label (part before first '.'), bold title
+                                // Row 1: short hostname + [LOCAL] + AI badge
                                 let short_name = device.display_name()
-                                    .split('.')
-                                    .next()
+                                    .split('.').next()
                                     .unwrap_or(device.display_name());
                                 ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 3.0;
                                     ui.label(
                                         RichText::new(short_name.to_uppercase())
                                             .color(if is_selected { Colors::GREEN } else { Colors::TEXT })
-                                            .size(10.5).strong()
+                                            .size(9.0).strong()
                                     );
                                     if is_local {
-                                        ui.add_space(3.0);
-                                        ui.label(RichText::new("[LOCAL]").color(Colors::GREEN).size(7.5).strong());
+                                        ui.label(RichText::new("[LOCAL]").color(Colors::GREEN).size(7.0));
+                                    }
+                                    if is_ai {
+                                        let ai_lbl = if let Some(m) = ai_model {
+                                            format!("⟁{}", m)
+                                        } else {
+                                            "⟁AI".to_string()
+                                        };
+                                        ui.label(RichText::new(ai_lbl).color(Colors::STATE_COMPUTE_PROVIDE).size(6.5));
                                     }
                                 });
-
-                                // Row 2: tailscale hostname — clickable to copy
-                                if !ts_name.is_empty() {
-                                    let resp_name = ui.add(
-                                        egui::Label::new(
-                                            RichText::new(ts_name).color(Colors::TEXT_DIM).size(8.0)
-                                        ).sense(egui::Sense::click())
-                                    );
-                                    if resp_name.clicked() { copy_ts_name = true; }
-                                    resp_name.on_hover_text("Click to copy tailscale name");
-                                }
-
-                                // Row 3: tailscale IP — clickable to copy
-                                if !ts_ip.is_empty() {
-                                    let resp_ip = ui.add(
-                                        egui::Label::new(
-                                            RichText::new(ts_ip).color(Colors::TEXT_MUTED).size(8.0)
-                                        ).sense(egui::Sense::click())
-                                    );
-                                    if resp_ip.clicked() { copy_ts_ip = true; }
-                                    resp_ip.on_hover_text("Click to copy IP");
-                                }
-
-                                // Row 4: status badges
+                                // Row 2: IP (clickable to copy) + status text
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
-                                    // Online / Offline badge
+                                    if !ts_ip.is_empty() {
+                                        let ip_resp = ui.add(
+                                            egui::Label::new(
+                                                RichText::new(ts_ip).color(Colors::TEXT_MUTED).size(7.5)
+                                            ).sense(egui::Sense::click())
+                                        );
+                                        if ip_resp.clicked() { copy_ts_ip = true; }
+                                        ip_resp.on_hover_text(format!("{ts_name}  —  click to copy IP"));
+                                    }
                                     let (badge_text, badge_color) = match status {
                                         crate::app::NodeStatus::GridActive => ("⬡ ONLINE", Colors::GREEN),
-                                        crate::app::NodeStatus::Reachable  => ("◌ UP", Colors::AMBER),
-                                        crate::app::NodeStatus::Offline    => ("◯ OFFLINE", Colors::TEXT_MUTED),
+                                        crate::app::NodeStatus::Reachable  => ("◌ UP",     Colors::AMBER),
+                                        crate::app::NodeStatus::Offline    => ("◯ OFF",    Colors::TEXT_MUTED),
                                     };
-                                    ui.label(RichText::new(badge_text).color(badge_color).size(7.5).strong());
-
-                                    // AI badge
-                                    if is_ai {
-                                        let model_label = if let Some(m) = ai_model {
-                                            format!("⟁ AI:{}", m)
-                                        } else {
-                                            "⟁ AI".to_string()
-                                        };
-                                        ui.label(RichText::new(model_label).color(Colors::STATE_COMPUTE_PROVIDE).size(7.5));
-                                    }
+                                    ui.label(RichText::new(badge_text).color(badge_color).size(7.0));
                                 });
                             });
-                        });
 
+                            // Cluster indicator dot (far right) — Ctrl+click card to toggle
+                            if is_in_cluster {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(r.center(), 2.5, Colors::GREEN);
+                                });
+                            }
+                        });
                     }).response;
 
-                // Copy-to-clipboard actions (after the frame so borrow is released)
-                if copy_ts_name {
-                    ui.output_mut(|o| o.copied_text = ts_name.to_string());
-                }
                 if copy_ts_ip {
                     ui.output_mut(|o| o.copied_text = ts_ip.to_string());
                 }
 
+                // Left accent bar for selected row
                 if is_selected {
                     ui.painter().rect_filled(
                         egui::Rect::from_min_size(
@@ -463,70 +396,356 @@ pub fn render_device_panel(
                         } else if !selected_node_ids.contains(&device.id) {
                             selected_node_ids.push(device.id.clone());
                         }
-                    } else if !cluster_toggled {
-                        clicked = Some(idx);
+                    } else {
+                        result.clicked_device = Some(idx);
                     }
                 }
             }
 
-            // ── Projects Section ──────────────────────────────────────────────────
-            ui.add_space(16.0);
-            ui.label(RichText::new("// PROJECTS").color(Colors::GREEN).size(9.0).strong());
-            ui.add_space(4.0);
-            for project in projects {
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    if ui.selectable_label(false, RichText::new(format!("⬡ {}", project.name.to_uppercase())).color(Colors::TEXT).size(10.0)).clicked() {
-                        // Project filter logic (Phase 3 next)
-                    }
-                });
-            }
+        }); // end device list scroll
 
-            // ── Categories Section ────────────────────────────────────────────────
-            ui.add_space(16.0);
-            ui.label(RichText::new("// CATEGORIES").color(Colors::GREEN).size(9.0).strong());
-            ui.add_space(4.0);
-            for cat in categories {
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    if ui.selectable_label(false, RichText::new(format!("{} {}", cat.icon, cat.name.to_uppercase())).color(Colors::TEXT).size(10.0)).clicked() {
-                        // Category filter logic (Phase 3 next)
-                    }
-                });
-            }
+    ui.add(egui::Separator::default().spacing(0.0));
 
-            // ── Smart Rules Section ───────────────────────────────────────────────
-            ui.add_space(16.0);
-            ui.label(RichText::new("// SMART RULES").color(Colors::GREEN).size(9.0).strong());
-            ui.add_space(4.0);
-            if smart_rules.is_empty() {
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(RichText::new("NO RULES").color(Colors::TEXT_DIM).size(9.0).italics());
-                });
-            } else {
-                for rule in smart_rules {
+    // ══════════════════════════════════════════════════════════════════════════
+    // WORKSPACE — unified Projects + Quick View + Planner preview block
+    // ══════════════════════════════════════════════════════════════════════════
+    ScrollArea::vertical()
+        .id_source("nav_workspace_scroll")
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            // ── WORKSPACE section header (navigates to Projects screen) ────────
+            egui::Frame::none()
+                .fill(Colors::BG_PANEL)
+                .inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 7.0, bottom: 4.0 })
+                .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add_space(16.0);
-                        let is_active = *active_rule == Some(rule.id.clone());
-                        let color = if is_active { Colors::GREEN } else { Colors::TEXT };
-                        if ui.selectable_label(is_active, RichText::new(format!("⭍ {}", rule.name.to_uppercase())).color(color).size(10.0)).clicked() {
-                            // Toggle active rule
-                            if is_active {
-                                *active_rule = None;
-                            } else {
-                                *active_rule = Some(rule.id.clone());
-                            }
+                        let proj_active = active_screen == crate::app::Screen::Projects;
+                        let hdr_btn = egui::Button::new(
+                            RichText::new("// PROJECTS").color(
+                                if proj_active { Colors::GREEN } else { Colors::TEXT_DIM }
+                            ).size(9.0).strong()
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE)
+                        .min_size(egui::vec2(0.0, 16.0));
+                        if ui.add(hdr_btn).clicked() && !proj_active {
+                            result.navigate_to = Some(crate::app::Screen::Projects);
+                        }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // [+ NEW] Add project button
+                            let new_resp = ui.add(
+                                egui::Button::new(RichText::new("+ NEW").color(Colors::GREEN).size(8.0))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM))
+                                    .min_size(egui::vec2(0.0, 16.0))
+                            );
+                            if new_resp.clicked() { result.open_project_add = true; }
+                            ui.add_space(4.0);
+                            // SWAP menu for quick-view slots
+                            egui::menu::menu_button(ui,
+                                RichText::new("PIN").color(Colors::TEXT_MUTED).size(8.0), |ui| {
+                                    ui.set_min_width(150.0);
+                                    ui.label(RichText::new("PIN TO SLOT").color(Colors::GREEN).size(8.5).strong());
+                                    ui.add(egui::Separator::default().spacing(0.0));
+                                    for slot_i in 0..4usize {
+                                        let slot_lbl = format!("SLOT {}", slot_i + 1);
+                                        egui::menu::menu_button(ui,
+                                            RichText::new(slot_lbl).color(Colors::TEXT_DIM).size(8.5), |ui| {
+                                            ui.set_min_width(130.0);
+                                            if ui.selectable_label(false, "CLEAR").clicked() {
+                                                quick_view.slots[slot_i] = None;
+                                                ui.close_menu();
+                                            }
+                                            ui.add(egui::Separator::default().spacing(0.0));
+                                            for proj in projects {
+                                                if ui.selectable_label(false, proj.name.to_uppercase()).clicked() {
+                                                    quick_view.slots[slot_i] = Some(proj.id.clone());
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            );
+                        });
+                    });
+
+                    ui.add_space(5.0);
+                    // Tab row: [BRAND] [WEB] [MEDIA] [DESIGN]
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for tab in crate::app::ProjectNavTab::all() {
+                            let active = *project_nav_tab == tab;
+                            let fill   = if active { Color32::from_rgb(0, 20, 6) } else { Color32::TRANSPARENT };
+                            let border = if active { Colors::GREEN_DIM } else { Colors::BORDER };
+                            let color  = if active { Colors::GREEN } else { Colors::TEXT_MUTED };
+                            let btn = egui::Button::new(RichText::new(tab.label()).color(color).size(8.0))
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.0, border))
+                                .min_size(egui::vec2(0.0, 17.0));
+                            if ui.add(btn).clicked() { *project_nav_tab = tab; }
                         }
                     });
-                }
+                    ui.add_space(3.0);
+
+                    // Project list (compact single-line rows)
+                    let kws = project_nav_tab.keywords();
+                    let tab_projects: Vec<&thegrid_core::models::Project> = projects.iter().filter(|p| {
+                        let n = p.name.to_lowercase();
+                        kws.iter().any(|k| n.contains(k))
+                            || p.tags.iter().any(|t| kws.iter().any(|k| t.to_lowercase().contains(k)))
+                    }).collect();
+
+                    if tab_projects.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("NO PROJECTS").color(Colors::TEXT_MUTED).size(8.0).italics());
+                        });
+                    } else {
+                        for proj in &tab_projects {
+                            let eff_status = project_statuses.get(&proj.id).cloned()
+                                .unwrap_or(crate::app::ProjectStatus::Planned);
+                            let row_resp = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new({
+                                        let s = if proj.name.len() > 18 {
+                                            format!("{}…", &proj.name[..18])
+                                        } else { proj.name.clone() };
+                                        s.to_uppercase()
+                                    }).color(Colors::TEXT).size(8.5)
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE)
+                                .min_size(egui::vec2(0.0, 20.0))
+                            );
+                            // Draw status dot manually to the left of the button rect
+                            let dot_center = egui::pos2(
+                                row_resp.rect.min.x - 6.0,
+                                row_resp.rect.center().y,
+                            );
+                            ui.painter().circle_filled(dot_center, 3.0, eff_status.color());
+
+                            if row_resp.clicked() {
+                                result.navigate_to = Some(crate::app::Screen::Projects);
+                            }
+                        }
+                    }
+                });
+
+            ui.add(egui::Separator::default().spacing(0.0));
+
+            // ── Quick-View 2×2 grid ────────────────────────────────────────────
+            egui::Frame::none()
+                .fill(Colors::BG_PANEL)
+                .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 5.0, bottom: 6.0 })
+                .show(ui, |ui| {
+                    let avail = ui.available_width();
+                    // slot_inner_w: accounts for 4px gap, 2×4px inner_margin, 2×1px border per slot
+                    let slot_inner_w = ((avail - 4.0) / 2.0 - 10.0).max(10.0);
+                    let slot_h = 40.0;
+
+                    for row in 0..2usize {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            for col in 0..2usize {
+                                let slot_i = row * 2 + col;
+                                let slot_proj = quick_view.slots[slot_i].as_ref()
+                                    .and_then(|id| projects.iter().find(|p| &p.id == id));
+                                let slot_filled = slot_proj.is_some();
+                                let frame_resp = egui::Frame::none()
+                                    .fill(if slot_filled { Color32::from_rgb(0, 18, 5) } else { Colors::BG_WIDGET })
+                                    .stroke(egui::Stroke::new(1.0, if slot_filled { Colors::GREEN_DIM } else { Colors::BORDER2 }))
+                                    .inner_margin(egui::Margin::symmetric(4.0, 3.0))
+                                    .show(ui, |ui| {
+                                        ui.set_min_size(egui::vec2(slot_inner_w, slot_h));
+                                        if let Some(proj) = slot_proj {
+                                            let eff_status = project_statuses.get(&proj.id).cloned()
+                                                .unwrap_or(crate::app::ProjectStatus::Planned);
+                                            let short = if proj.name.len() > 9 {
+                                                format!("{}…", &proj.name[..9])
+                                            } else { proj.name.clone() };
+                                            ui.vertical(|ui| {
+                                                ui.horizontal(|ui| {
+                                                    let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                                                    ui.painter().circle_filled(r.center(), 3.0, eff_status.color());
+                                                    ui.add_space(2.0);
+                                                    ui.label(RichText::new(short.to_uppercase()).color(Colors::TEXT).size(7.5).strong());
+                                                });
+                                                ui.label(RichText::new(eff_status.label()).color(eff_status.color()).size(6.5));
+                                            });
+                                        } else {
+                                            ui.vertical_centered(|ui| {
+                                                ui.add_space(11.0);
+                                                ui.label(RichText::new(format!("SLOT {}", slot_i + 1)).color(Colors::TEXT_MUTED).size(7.5));
+                                            });
+                                        }
+                                    });
+                                if ui.interact(
+                                    frame_resp.response.rect,
+                                    egui::Id::new(("qslot", slot_i)),
+                                    egui::Sense::click(),
+                                ).clicked() {
+                                    result.navigate_to = Some(crate::app::Screen::Projects);
+                                }
+                            }
+                        });
+                        if row == 0 { ui.add_space(4.0); }
+                    }
+                });
+
+            ui.add(egui::Separator::default().spacing(0.0));
+
+            // ── Categories (compact collapsible) ───────────────────────────────
+            if !categories.is_empty() {
+                egui::Frame::none()
+                    .fill(Colors::BG_PANEL)
+                    .inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 5.0, bottom: 4.0 })
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("// CATEGORIES").color(Colors::TEXT_MUTED).size(8.5).strong());
+                        ui.add_space(2.0);
+                        for cat in categories {
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(
+                                    format!("{} {}", cat.icon, cat.name.to_uppercase())
+                                ).color(Colors::TEXT_MUTED).size(8.0));
+                            });
+                        }
+                    });
+                ui.add(egui::Separator::default().spacing(0.0));
             }
-        });
 
-    clicked
+            // ── Modes / Smart Rules (compact) ─────────────────────────────────
+            if !smart_rules.is_empty() {
+                egui::Frame::none()
+                    .fill(Colors::BG_PANEL)
+                    .inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 5.0, bottom: 4.0 })
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("// MODES").color(Colors::TEXT_MUTED).size(8.5).strong());
+                        ui.add_space(2.0);
+                        for rule in smart_rules {
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                let is_active = *active_rule == Some(rule.id.clone());
+                                let color = if is_active { Colors::GREEN } else { Colors::TEXT_MUTED };
+                                let btn = egui::Button::new(
+                                    RichText::new(format!("⭍ {}", rule.name.to_uppercase())).color(color).size(8.0)
+                                ).fill(Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
+                                 .min_size(egui::vec2(0.0, 16.0));
+                                if ui.add(btn).clicked() {
+                                    if is_active { *active_rule = None; } else { *active_rule = Some(rule.id.clone()); }
+                                }
+                            });
+                        }
+                    });
+                ui.add(egui::Separator::default().spacing(0.0));
+            }
+
+            // ── PLANNER mini-preview ───────────────────────────────────────────
+            egui::Frame::none()
+                .fill(Colors::BG_PANEL)
+                .inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 7.0, bottom: 8.0 })
+                .show(ui, |ui| {
+                    // Section header — navigates to Planner screen
+                    ui.horizontal(|ui| {
+                        let plan_active = active_screen == crate::app::Screen::Planner;
+                        let hdr_btn = egui::Button::new(
+                            RichText::new("// PLANNER").color(
+                                if plan_active { Colors::GREEN } else { Colors::TEXT_DIM }
+                            ).size(9.0).strong()
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE)
+                        .min_size(egui::vec2(0.0, 16.0));
+                        if ui.add(hdr_btn).clicked() && !plan_active {
+                            result.navigate_to = Some(crate::app::Screen::Planner);
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // [+] Add task button
+                            let add_resp = ui.add(
+                                egui::Button::new(RichText::new("+ ADD").color(Colors::GREEN).size(8.0))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM))
+                                    .min_size(egui::vec2(0.0, 16.0))
+                            );
+                            if add_resp.clicked() {
+                                result.open_planner_add = true;
+                                // Pre-fill the project if one is selected
+                                if let Some(proj_id) = planner_selected {
+                                    *planner_add_open = true;
+                                    let _ = proj_id; // the caller will set the project_id
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+
+                    // Show tasks for the selected project (up to 5, any status)
+                    let preview_tasks: Vec<&crate::app::PlannerTask> = planner_selected
+                        .and_then(|pid| planner_tasks.get(pid))
+                        .map(|v| v.iter().collect())
+                        .unwrap_or_default();
+
+                    if preview_tasks.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            if let Some(pid) = planner_selected {
+                                let proj_name = projects.iter()
+                                    .find(|p| p.id == pid)
+                                    .map(|p| p.name.as_str())
+                                    .unwrap_or("?");
+                                ui.label(RichText::new(format!("NO TASKS  ({})", proj_name.to_uppercase()))
+                                    .color(Colors::TEXT_MUTED).size(8.0).italics());
+                            } else {
+                                ui.label(RichText::new("SELECT A PROJECT")
+                                    .color(Colors::TEXT_MUTED).size(8.0).italics());
+                            }
+                        });
+                    } else {
+                        for task in preview_tasks.iter().take(5) {
+                            ui.horizontal(|ui| {
+                                ui.add_space(6.0);
+                                let col = task.status.color();
+                                // Mini status badge
+                                egui::Frame::none()
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::new(1.0, col))
+                                    .inner_margin(egui::Margin::symmetric(2.0, 1.0))
+                                    .show(ui, |ui| {
+                                        let s = match task.status {
+                                            crate::app::PlannerTaskStatus::Todo       => "·",
+                                            crate::app::PlannerTaskStatus::InProgress => "▶",
+                                            crate::app::PlannerTaskStatus::Done       => "✓",
+                                            crate::app::PlannerTaskStatus::Blocked    => "✕",
+                                        };
+                                        ui.label(RichText::new(s).color(col).size(7.5));
+                                    });
+                                ui.add_space(3.0);
+                                let title_short = if task.title.len() > 22 {
+                                    format!("{}…", &task.title[..22])
+                                } else { task.title.clone() };
+                                ui.label(RichText::new(title_short).color(Colors::TEXT).size(8.5));
+                                if task.ai_suggested {
+                                    ui.label(RichText::new("⟁").color(Colors::STATE_COMPUTE_PROVIDE).size(7.5));
+                                }
+                            });
+                            ui.add_space(2.0);
+                        }
+                        if preview_tasks.len() > 5 {
+                            ui.horizontal(|ui| {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new(format!("…+{} more", preview_tasks.len() - 5))
+                                    .color(Colors::TEXT_MUTED).size(7.5).italics());
+                            });
+                        }
+                    }
+                });
+        }); // end nav workspace scroll
+
+    result
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ACTIONS tab

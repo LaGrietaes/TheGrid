@@ -1,8 +1,7 @@
-use anyhow::Result;
+﻿use anyhow::Result;
 use chrono::Local;
 use semver::Version;
 use serde::Deserialize;
-use terminal_size::{Width, terminal_size};
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -14,6 +13,21 @@ use std::time::{Duration, Instant};
 use thegrid_core::{AppEvent, Config, models::SyncHealthMetrics};
 use thegrid_runtime::AppRuntime;
 
+// ── ratatui / crossterm ───────────────────────────────────────────────────────
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line as TuiLine, Span},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap},
+};
+
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
 const SIGNATURE_LINE: &str = "> Powered and Designed by: sinergias.lagrieta.es";
 const LAST_UPDATE_ENV: &str = "THEGRID_LAST_UPDATE";
@@ -21,10 +35,7 @@ const LAST_UPDATE_ENV: &str = "THEGRID_LAST_UPDATE";
 const ANSI_RESET: &str = "\x1B[0m";
 const ANSI_BOLD: &str = "\x1B[1m";
 const ANSI_DIM: &str = "\x1B[2m";
-const ANSI_GREEN: &str = "\x1B[32m";
 const ANSI_GREEN_BRIGHT: &str = "\x1B[92m"; // live-node indicator (◉ LIVE)
-const ANSI_YELLOW: &str = "\x1B[33m";
-const ANSI_RED: &str = "\x1B[31m";
 const ANSI_CYAN: &str = "\x1B[36m";
 const ANSI_WHITE: &str = "\x1B[37m";
 
@@ -45,14 +56,6 @@ const COMMAND_REGISTRY: &[(&str, &str)] = &[
     ("gitupdate", "Fetch, pull, build, restart"),
     ("quit", "Stop node"),
 ];
-
-fn command_hint_lines(max_lines: usize) -> Vec<String> {
-    COMMAND_REGISTRY
-        .iter()
-        .take(max_lines)
-        .map(|(usage, _)| format!("  {}", usage))
-        .collect()
-}
 
 fn command_help_lines() -> Vec<String> {
     COMMAND_REGISTRY
@@ -213,32 +216,6 @@ fn try_git_update() -> Result<GitUpdateOutcome> {
     }
 }
 
-fn git_branch_head() -> Option<String> {
-    let branch_out = Command::new("git")
-        .arg("rev-parse")
-        .arg("--abbrev-ref")
-        .arg("HEAD")
-        .output()
-        .ok()?;
-    if !branch_out.status.success() {
-        return None;
-    }
-
-    let head_out = Command::new("git")
-        .arg("rev-parse")
-        .arg("--short")
-        .arg("HEAD")
-        .output()
-        .ok()?;
-    if !head_out.status.success() {
-        return None;
-    }
-
-    let branch = String::from_utf8_lossy(&branch_out.stdout).trim().to_string();
-    let head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
-    Some(format!("{} @ {}", branch, head))
-}
-
 fn try_rebuild_binaries() -> Result<String> {
     let build = Command::new("cargo")
         .arg("build")
@@ -319,17 +296,44 @@ fn ts() -> String {
 }
 
 fn print_banner(device_name: &str, port: u16) {
-    println!("╔═══════════════════════════════════════════════════════════════╗");
-    println!("║ THE GRID HEADLESS NODE v{:<35} ║", env!("CARGO_PKG_VERSION"));
-    println!("║ {:<61} ║", SIGNATURE_LINE);
-    println!("╠═══════════════════════════════════════════════════════════════╣");
-    println!("║ Device: {:<55}║", device_name);
-    println!("║ Agent Port: {:<51}║", port);
-    println!("╚═══════════════════════════════════════════════════════════════╝");
+    // ASCII art derived from The Grid icon (hexagonal mesh / circuit motif)
+    println!("{}{}{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ╔══╗  ┌─────────────────────────────────────────────────╗{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ║  ║  │  ████████╗██╗  ██╗███████╗                     │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ╠══╣  │     ██╔══╝██║  ██║██╔════╝                     │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ║  ╠══╣     ██║   ███████║█████╗   GRID                 │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ╠══╣  │     ██║   ██╔══██║██╔══╝                       │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ║  ║  │     ██║   ██║  ██║███████╗                     │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}  ╚══╝  │     ╚═╝   ╚═╝  ╚═╝╚══════╝  HEADLESS NODE      │{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!("{}{}        └─────────────────────────────────────────────────┘{}", ANSI_CYAN, ANSI_BOLD, ANSI_RESET);
+    println!();
+    let vb = "\u{2551}"; // ║
+    println!("{}\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2557}{}", ANSI_CYAN, ANSI_RESET);
+    println!("{}{} {} THE GRID HEADLESS NODE v{:<35} {}{}{}", ANSI_CYAN, vb, ANSI_BOLD, env!("CARGO_PKG_VERSION"), ANSI_RESET, vb, ANSI_RESET);
+    println!("{}{} {} {:<61} {}{}{}", ANSI_CYAN, vb, ANSI_DIM, SIGNATURE_LINE, ANSI_RESET, vb, ANSI_RESET);
+    println!("{}\u{2560}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2563}{}", ANSI_CYAN, ANSI_RESET);
+    println!("{}{} {} Device:     {}{:<51}{}{}{}", ANSI_CYAN, vb, ANSI_RESET, ANSI_GREEN_BRIGHT, device_name, ANSI_RESET, vb, ANSI_RESET);
+    println!("{}{} {} Agent Port: {}{:<51}{}{}{}", ANSI_CYAN, vb, ANSI_RESET, ANSI_WHITE, port, ANSI_RESET, vb, ANSI_RESET);
+    println!("{}\u{255A}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255D}{}", ANSI_CYAN, ANSI_RESET);
 }
 
 fn event_line(icon: &str, label: &str, message: impl AsRef<str>) {
     println!("{} {} {:<12} {}", ts(), icon, label, message.as_ref());
+}
+
+// ── ratatui terminal lifecycle ───────────────────────────────────────────────
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    crossterm::terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    crossterm::terminal::disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -345,6 +349,13 @@ struct TuiState {
     /// Last known ping result per IP: true = ok, false = failed, absent = untested.
     node_status: std::collections::HashMap<String, bool>,
     dirty: bool,
+    // ── ratatui input & scroll state ─────────────────────────────────────────
+    /// Current text being typed in the input bar.
+    input_buf: String,
+    /// Lines scrolled back from tail (0 = auto-scroll to newest).
+    log_scroll: usize,
+    /// Index into command_history for Up/Down navigation (None = not navigating).
+    history_cursor: Option<usize>,
 }
 
 impl TuiState {
@@ -360,6 +371,9 @@ impl TuiState {
             sync_health: std::collections::HashMap::new(),
             node_status: std::collections::HashMap::new(),
             dirty: true,
+            input_buf: String::new(),
+            log_scroll: 0,
+            history_cursor: None,
         }
     }
 
@@ -385,316 +399,416 @@ impl TuiState {
     }
 }
 
-fn term_width() -> usize {
-    // Explicit override: useful for SSH sessions, tmux panes, or CI.
-    // --width arg in main() sets this env var before threads start.
-    if let Ok(v) = std::env::var("THEGRID_WIDTH") {
-        if let Ok(w) = v.parse::<usize>() {
-            if w >= 40 {
-                return w;
-            }
-        }
+// ── ratatui draw helpers ─────────────────────────────────────────────────────
+
+fn log_style(line: &str) -> Style {
+    if line.contains(" \u{2717} ") {
+        Style::default().fg(Color::Red)
+    } else if line.contains(" \u{26A0} ") || line.contains(" ! ") {
+        Style::default().fg(Color::Yellow)
+    } else if line.contains(" \u{21C4} ") || line.contains(" \u{0394} ") {
+        Style::default().fg(Color::Cyan)
+    } else if line.contains(" \u{00B7} ") || line.contains(" \u{2139} ") {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::White)
     }
-    terminal_size()
-        .map(|(Width(w), _)| w as usize)
-        .or_else(|| {
-            std::env::var("COLUMNS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-        })
-        .unwrap_or(110)
 }
 
-fn status_color(status: &str) -> &'static str {
+fn status_style_for(status: &str) -> Style {
     let s = status.to_ascii_lowercase();
     if s.contains("fail") || s.contains("error") || s.contains("refused")
         || s.contains("timeout") || s.contains("unreachable")
     {
-        ANSI_RED
+        Style::default().fg(Color::Red)
     } else if s.contains("warn") || s.contains("mismatch") || s.contains("retry") {
-        ANSI_YELLOW
+        Style::default().fg(Color::Yellow)
     } else {
-        ANSI_GREEN
+        Style::default().fg(Color::Green)
     }
 }
 
-// Routes log-line color by the icon that appears after the timestamp.
-// Format: "HH:MM:SS ICON  LABEL      message"
-fn log_color(line: &str) -> &'static str {
-    if line.contains(" ✗ ") {
-        return ANSI_RED;
-    }
-    if line.contains(" ⚠ ") || line.contains(" ! ") {
-        return ANSI_YELLOW;
-    }
-    if line.contains(" ⇄ ") || line.contains(" Δ ") {
-        return ANSI_CYAN;
-    }
-    if line.contains(" · ") || line.contains(" ℹ ") {
-        return ANSI_DIM;
-    }
-    ANSI_WHITE
-}
-
-fn pulse_frame(elapsed: Duration) -> &'static str {
-    match (elapsed.as_millis() / 260) % 4 {
-        0 => "◴",
-        1 => "◷",
-        2 => "◶",
-        _ => "◵",
+fn pulse_char(elapsed: Duration) -> &'static str {
+    match (elapsed.as_millis() / 300) % 4 {
+        0 => "\u{25F4}",
+        1 => "\u{25F7}",
+        2 => "\u{25F6}",
+        _ => "\u{25F5}",
     }
 }
 
-// ── TUI width tiers ────────────────────────────────────────────────────────
-// WIDE     : left panel ≥ 46 cols  (terminal ≥ ~99 cols)  → 5-cell grid logo
-// STANDARD : left panel ≥ 28 cols  (terminal ≥ ~63 cols)  → 3-cell grid logo
-// NARROW   : left panel  < 28 cols                        → single-line mark
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TuiTier { Wide, Standard, Narrow }
-
-fn tui_tier(left_w: usize) -> TuiTier {
-    if left_w >= 46 { TuiTier::Wide }
-    else if left_w >= 28 { TuiTier::Standard }
-    else { TuiTier::Narrow }
-}
-
-// Returns (logo_lines, logo_row_count).
-// Logo rows get ANSI_GREEN coloring; the count tells render_tui where branding ends.
-fn build_logo(tier: TuiTier, pulse: &str) -> (Vec<String>, usize) {
-    match tier {
-        TuiTier::Wide => (vec![
-            format!("{} ╔═══╦═══╦═══╦═══╦═══╗", pulse),
-            "   ║ ◈ ║ ◈ ║ ◈ ║ ◈ ║ ◈ ║".to_string(),
-            "   ╠═══╬═══╬═══╬═══╬═══╣".to_string(),
-            "   ║ ◈ ║ ◈ ║ ◈ ║ ◈ ║ ◈ ║".to_string(),
-            "   ╚═══╩═══╩═══╩═══╩═══╝".to_string(),
-            "    T H E   G R I D".to_string(),
-        ], 6),
-        TuiTier::Standard => (vec![
-            format!("{} ╔═══╦═══╦═══╗", pulse),
-            "   ║ ◈ ║ ◈ ║ ◈ ║".to_string(),
-            "   ╠═══╬═══╬═══╣".to_string(),
-            "   ║ ◈ ║ ◈ ║ ◈ ║".to_string(),
-            "   ╚═══╩═══╩═══╝".to_string(),
-            "   T H E   G R I D".to_string(),
-        ], 6),
-        TuiTier::Narrow => (vec![
-            format!("{} ◈ THE GRID ◈", pulse),
-        ], 1),
-    }
-}
-
-// Prints a full-width section header, e.g.: ╠══[MESH]══════════╣
-fn print_section_header(label: &str, width: usize) {
-    let inner_w = width.saturating_sub(2); // subtract ╠ and ╣
-    let label_block = format!("[{}]", label);
-    let right_fill = inner_w.saturating_sub(label_block.len() + 3);
-    println!(
-        "{ANSI_GREEN}╠══{label_block}{fill}╣{ANSI_RESET}",
-        fill = "═".repeat(right_fill),
-    );
-}
-
-fn render_labeled_line(
-    left: &str,
-    right: &str,
-    left_w: usize,
-    right_w: usize,
-    left_color: &str,
-    right_color: &str,
+fn draw_left_panel(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &TuiState,
+    device_name: &str,
+    port: u16,
 ) {
-    println!(
-        "{ANSI_GREEN}║{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
-        left_color,
-        trim_fit(left, left_w),
-        right_color,
-        trim_fit(right, right_w),
-    );
-}
-
-fn trim_fit(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        return format!("{s:<width$}");
-    }
-    if width <= 1 {
-        return "".to_string();
-    }
-    let mut out = String::new();
-    for c in s.chars().take(width - 1) {
-        out.push(c);
-    }
-    out.push('…');
-    out
-}
-
-fn render_tui(state: &TuiState, device_name: &str, port: u16) {
-    let width = term_width();
-    let left_w = (width.saturating_sub(7)) / 2;
-    let right_w = width.saturating_sub(7).saturating_sub(left_w);
-    let lower_w = width.saturating_sub(4);
-
-    print!("\x1B[2J\x1B[H");
-
-    let uptime = state.started_at.elapsed().as_secs();
-    let pulse = pulse_frame(state.started_at.elapsed());
-    let tier = tui_tier(left_w);
-
-    // ── Left panel: branded logo + node metadata ──────────────────────────────
-    let (mut left, logo_rows) = build_logo(tier, pulse);
-    left.push(format!("NODE v{}", env!("CARGO_PKG_VERSION")));
-    left.push(SIGNATURE_LINE.to_string());
-    left.push(format!("Device : {}", device_name));
-    left.push(format!("Port   : {}", port));
-    left.push(format!("Uptime : {}s", uptime));
-    left.push(format!("Ping   : {}/{} ok/fail", state.ping_ok, state.ping_fail));
-    left.push(format!("Last   : {}", state.last_status));
-
-    // ── Right panel: commands (left sub-col) + dev tools (right sub-col) ─────
-    let mut commands = vec!["COMMANDS".to_string()];
-    commands.extend(command_hint_lines(8));
-
-    let mut dev_commands = vec!["DEV TOOLS".to_string(), "  gitupdate".to_string()];
-    dev_commands.push("  pull+build+restart".to_string());
-    if let Some(refs) = git_branch_head() {
-        dev_commands.push(format!("  {}", refs));
+    let elapsed = state.started_at.elapsed();
+    let uptime = elapsed.as_secs();
+    let uptime_str = if uptime >= 3600 {
+        format!("{}h {:02}m {:02}s", uptime / 3600, (uptime % 3600) / 60, uptime % 60)
+    } else if uptime >= 60 {
+        format!("{}m {:02}s", uptime / 60, uptime % 60)
     } else {
-        dev_commands.push("  git: —".to_string());
+        format!("{}s", uptime)
+    };
+    let pulse = pulse_char(elapsed);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let cyan = Style::default().fg(Color::Cyan);
+    let white = Style::default().fg(Color::White);
+    let green_bold = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let cyan_bold = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+
+    // Grid logo using unicode escapes to avoid encoding issues
+    let top_row    = "\u{2554}\u{2550}\u{2550}\u{2550}\u{256A}\u{2550}\u{2550}\u{2550}\u{256A}\u{2550}\u{2550}\u{2550}\u{2557}";
+    let mid_row    = "\u{2551} \u{25C8} \u{2551} \u{25C8} \u{2551} \u{25C8} \u{2551}";
+    let div_row    = "\u{2560}\u{2550}\u{2550}\u{2550}\u{256C}\u{2550}\u{2550}\u{2550}\u{256C}\u{2550}\u{2550}\u{2550}\u{2563}";
+    let bot_row    = "\u{255A}\u{2550}\u{2550}\u{2550}\u{2569}\u{2550}\u{2550}\u{2550}\u{2569}\u{2550}\u{2550}\u{2550}\u{255D}";
+
+    let lines: Vec<TuiLine> = vec![
+        TuiLine::from(vec![
+            Span::styled(format!("{} ", pulse), green_bold),
+            Span::styled(top_row, cyan),
+        ]),
+        TuiLine::from(Span::styled(format!("   {}", mid_row), cyan)),
+        TuiLine::from(Span::styled(format!("   {}", div_row), cyan)),
+        TuiLine::from(Span::styled(format!("   {}", mid_row), cyan)),
+        TuiLine::from(Span::styled(format!("   {}", bot_row), cyan)),
+        TuiLine::from(Span::styled("   T H E   G R I D", cyan_bold)),
+        TuiLine::from(""),
+        TuiLine::from(vec![
+            Span::styled("  v", dim),
+            Span::styled(env!("CARGO_PKG_VERSION"), white.add_modifier(Modifier::BOLD)),
+            Span::styled("  NODE", dim),
+        ]),
+        TuiLine::from(vec![
+            Span::styled("  Device  ", dim),
+            Span::styled(device_name.to_string(), green_bold),
+        ]),
+        TuiLine::from(vec![
+            Span::styled("  Port    ", dim),
+            Span::styled(format!("{}", port), white),
+        ]),
+        TuiLine::from(vec![
+            Span::styled("  Uptime  ", dim),
+            Span::styled(uptime_str, white),
+        ]),
+        TuiLine::from(vec![
+            Span::styled("  Ping    ", dim),
+            Span::styled(format!("{}", state.ping_ok), Style::default().fg(Color::Green)),
+            Span::styled("/", dim),
+            Span::styled(format!("{}", state.ping_fail), Style::default().fg(Color::Red)),
+            Span::styled(" ok/fail", dim),
+        ]),
+        TuiLine::from(vec![
+            Span::styled("  Status  ", dim),
+            Span::styled(state.last_status.clone(), status_style_for(&state.last_status)),
+        ]),
+        TuiLine::from(vec![
+            Span::styled("  ", dim),
+            Span::styled("sinergias.lagrieta.es", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(cyan)
+                .title(Span::styled(" NODE ", cyan_bold)),
+        )
+        .wrap(Wrap { trim: true });
+
+    frame.render_widget(para, area);
+}
+
+fn draw_commands_panel(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    let cyan = Style::default().fg(Color::Cyan);
+    let cyan_bold = cyan.add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let white = Style::default().fg(Color::White);
+
+    let mut lines: Vec<TuiLine> = Vec::new();
+    for (usage, desc) in COMMAND_REGISTRY {
+        lines.push(TuiLine::from(Span::styled(format!("  {}", usage), white)));
+        lines.push(TuiLine::from(Span::styled(format!("    {}", desc), dim)));
     }
 
-    commands.push("CONNECTED".to_string());
-    for (idx, (name, ip)) in state.devices.iter().take(5).enumerate() {
-        let dot = match state.node_status.get(ip.as_str()) {
-            Some(true)  => "◉",
-            Some(false) => "◌",
-            None        => "◈",
-        };
-        commands.push(format!("  {} {}. {} ({})", dot, idx + 1, trim_fit(name, 12), ip));
-    }
-    if state.devices.is_empty() {
-        commands.push("  none — run: devices".to_string());
-    }
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(cyan)
+                .title(Span::styled(" COMMANDS ", cyan_bold)),
+        );
+    frame.render_widget(para, area);
+}
 
-    // ── Top border ────────────────────────────────────────────────────────────
-    println!(
-        "{ANSI_GREEN}╔{}╦{}╗{ANSI_RESET}",
-        "═".repeat(left_w + 2),
-        "═".repeat(right_w + 2)
-    );
+fn draw_devices_panel(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &TuiState,
+) {
+    let cyan = Style::default().fg(Color::Cyan);
+    let cyan_bold = cyan.add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let green_bright = Style::default().fg(Color::LightGreen);
+    let red = Style::default().fg(Color::Red);
+    let white = Style::default().fg(Color::White);
 
-    // ── Upper rows (logo + metadata | commands + dev tools) ───────────────────
-    let cmd_w = (right_w.saturating_sub(3)) / 2;
-    let dev_w = right_w.saturating_sub(3).saturating_sub(cmd_w);
-    let upper_lines = left.len().max(commands.len().max(dev_commands.len()));
-    let status_idx = left.len().saturating_sub(1);
+    let rows: Vec<Row> = if state.devices.is_empty() {
+        vec![Row::new(vec![
+            Cell::from(Span::styled("  \u{25C8}", dim)),
+            Cell::from(""),
+            Cell::from(Span::styled("none — run: devices", dim)),
+            Cell::from(""),
+        ])]
+    } else {
+        state
+            .devices
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, ip))| {
+                let (dot, dot_style) = match state.node_status.get(ip.as_str()) {
+                    Some(true) => ("\u{25C9}", green_bright),
+                    Some(false) => ("\u{25CC}", red),
+                    None => ("\u{25C8}", dim),
+                };
+                Row::new(vec![
+                    Cell::from(Span::styled(format!(" {} ", dot), dot_style)),
+                    Cell::from(Span::styled(format!("{}.", idx + 1), dim)),
+                    Cell::from(Span::styled(name.clone(), white)),
+                    Cell::from(Span::styled(ip.clone(), dim)),
+                ])
+            })
+            .collect()
+    };
 
-    for i in 0..upper_lines {
-        let l = left.get(i).map_or("", |s| s.as_str());
-        let c = commands.get(i).map_or("", |s| s.as_str());
-        let d = dev_commands.get(i).map_or("", |s| s.as_str());
-        let r = format!("{} │ {}", trim_fit(c, cmd_w), trim_fit(d, dev_w));
-        let left_color  = if i < logo_rows { ANSI_GREEN } else { ANSI_WHITE };
-        let right_color = if i == 0 { ANSI_BOLD } else { ANSI_WHITE };
-        if i == status_idx {
-            let sc = status_color(&state.last_status);
-            println!(
-                "{ANSI_GREEN}║{ANSI_RESET} {sc}{}{ANSI_RESET} {ANSI_GREEN}│{ANSI_RESET} {right_color}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
-                trim_fit(l, left_w),
-                trim_fit(&r, right_w),
-            );
-        } else {
-            render_labeled_line(l, &r, left_w, right_w, left_color, right_color);
-        }
-    }
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Length(3),
+        Constraint::Fill(1),
+        Constraint::Length(16),
+    ];
 
-    // ── MESH STATUS section (only when there is data and enough width) ────────
-    let has_mesh = !state.sync_health.is_empty() || !state.devices.is_empty();
-    if has_mesh && lower_w >= 40 {
-        print_section_header("MESH", width);
+    let table = Table::new(rows, widths)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(cyan)
+                .title(Span::styled(" CONNECTED ", cyan_bold)),
+        )
+        .header(
+            Row::new(vec![
+                Cell::from(""),
+                Cell::from(Span::styled("#", dim)),
+                Cell::from(Span::styled("Name", dim)),
+                Cell::from(Span::styled("IP", dim)),
+            ])
+            .style(dim),
+        );
 
-        // Sort for deterministic display order.
-        let mut mesh_entries: Vec<(&String, &SyncHealthMetrics)> = state.sync_health.iter().collect();
-        mesh_entries.sort_by_key(|(id, _)| id.as_str());
+    frame.render_widget(table, area);
+}
 
-        let mut shown: std::collections::HashSet<&str> = std::collections::HashSet::new();
+fn draw_mesh_panel(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &TuiState,
+) {
+    let cyan = Style::default().fg(Color::Cyan);
+    let cyan_bold = cyan.add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let green_bright = Style::default().fg(Color::LightGreen);
+    let red = Style::default().fg(Color::Red);
 
-        for (id, h) in mesh_entries.iter().take(5) {
-            shown.insert(id.as_str());
-            let age_s = h.sync_age_secs
-                .map(|s| format!("{:>5}s", s))
-                .unwrap_or_else(|| "    —".to_string());
+    let mut entries: Vec<(&String, &SyncHealthMetrics)> = state.sync_health.iter().collect();
+    entries.sort_by_key(|(id, _)| id.as_str());
+
+    let mut rows: Vec<Row> = entries
+        .iter()
+        .take(8)
+        .map(|(id, h)| {
+            let age = h.sync_age_secs
+                .map(|s| format!("{}s", s))
+                .unwrap_or_else(|| "\u{2014}".to_string());
             let is_live = h.sync_age_secs.map(|s| s < 120).unwrap_or(false);
-            // Build the main part of the line (plain, for trim_fit width accounting)
-            let body = format!(
-                " ⇄  {:16}  age {}  tombs {:>3}  fail {:>2}  ",
-                trim_fit(id, 16), age_s, h.tombstone_count, h.sync_failures,
-            );
-            // Status marker — bright green for live, dim for stale
-            let (status_col, dot, state_txt) = if is_live {
-                (ANSI_GREEN_BRIGHT, "◉", "LIVE ")
+            let (dot, live_txt, dot_style) = if is_live {
+                ("\u{25C9}", "LIVE ", green_bright)
             } else {
-                (ANSI_DIM, "◌", "STALE")
+                ("\u{25CC}", "STALE", dim)
             };
-            let body_fit = trim_fit(&body, lower_w.saturating_sub(7));
-            println!(
-                "{ANSI_GREEN}║{ANSI_RESET} {ANSI_CYAN}{body_fit}{ANSI_RESET}{status_col}{dot} {state_txt}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
-            );
-        }
+            Row::new(vec![
+                Cell::from(Span::styled(format!(" {} ", dot), dot_style)),
+                Cell::from(Span::styled(id.as_str().to_string(), cyan)),
+                Cell::from(Span::styled(format!("age {}", age), dim)),
+                Cell::from(Span::styled(format!("tombs {:>3}", h.tombstone_count), dim)),
+                Cell::from(Span::styled(format!("fail {:>2}", h.sync_failures), dim)),
+                Cell::from(Span::styled(live_txt.to_string(), dot_style)),
+            ])
+        })
+        .collect();
 
-        // Devices not yet in sync_health: show them as pending.
-        for (name, ip) in state.devices.iter().take(5) {
-            if shown.contains(name.as_str()) { continue; }
-            let dot = match state.node_status.get(ip.as_str()) {
-                Some(true)  => "◉",
-                Some(false) => "◌",
-                None        => "◈",
-            };
-            let line = format!(
-                " {}  {:16}  ({})  pending sync",
-                dot, trim_fit(name, 16), ip,
-            );
-            println!(
-                "{ANSI_GREEN}║{ANSI_RESET} {ANSI_DIM}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
-                trim_fit(&line, lower_w),
-            );
+    let known: std::collections::HashSet<&str> =
+        entries.iter().map(|(id, _)| id.as_str()).collect();
+    for (name, ip) in state.devices.iter().take(8) {
+        if known.contains(name.as_str()) {
+            continue;
         }
-
-        if state.sync_health.is_empty() && state.devices.is_empty() {
-            println!(
-                "{ANSI_GREEN}║{ANSI_RESET} {ANSI_DIM}{:<lower_w$}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
-                "  no nodes — run: devices",
-            );
-        }
+        let (dot, dot_style) = match state.node_status.get(ip.as_str()) {
+            Some(true) => ("\u{25C9}", green_bright),
+            Some(false) => ("\u{25CC}", red),
+            None => ("\u{25C8}", dim),
+        };
+        rows.push(Row::new(vec![
+            Cell::from(Span::styled(format!(" {} ", dot), dot_style)),
+            Cell::from(Span::styled(name.clone(), dim)),
+            Cell::from(Span::styled(format!("({})", ip), dim)),
+            Cell::from(Span::styled("pending sync", dim)),
+            Cell::from(""),
+            Cell::from(""),
+        ]));
     }
 
-    // ── LOG section ───────────────────────────────────────────────────────────
-    print_section_header("LOG", width);
+    let widths = [
+        Constraint::Length(4),
+        Constraint::Fill(1),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(9),
+        Constraint::Length(6),
+    ];
 
-    let max_logs = 10usize;
-    let start = state.recent_logs.len().saturating_sub(max_logs);
-    for line in state.recent_logs.iter().skip(start) {
-        println!(
-            "{ANSI_GREEN}║{ANSI_RESET} {}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
-            log_color(line),
-            trim_fit(line, lower_w),
+    let table = Table::new(rows, widths)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(cyan)
+                .title(Span::styled(" MESH ", cyan_bold)),
+        )
+        .header(
+            Row::new(vec![
+                Cell::from(""),
+                Cell::from(Span::styled("Device", dim)),
+                Cell::from(Span::styled("Age", dim)),
+                Cell::from(Span::styled("Tombstones", dim)),
+                Cell::from(Span::styled("Failures", dim)),
+                Cell::from(Span::styled("State", dim)),
+            ])
+            .style(dim),
         );
-    }
-    let rendered = state.recent_logs.len().saturating_sub(start);
-    for _ in rendered..max_logs {
-        println!(
-            "{ANSI_GREEN}║{ANSI_RESET} {:<lower_w$} {ANSI_GREEN}║{ANSI_RESET}",
-            "",
-        );
-    }
+    frame.render_widget(table, area);
+}
 
-    // ── Hint + prompt ─────────────────────────────────────────────────────────
-    println!("{ANSI_GREEN}╠{}╣{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
-    println!(
-        "{ANSI_GREEN}║{ANSI_RESET} {ANSI_DIM}{}{ANSI_RESET} {ANSI_GREEN}║{ANSI_RESET}",
-        trim_fit("Type command then Enter  (help · history · quit)", lower_w),
+fn draw_log_panel(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &TuiState,
+) {
+    let cyan = Style::default().fg(Color::Cyan);
+    let cyan_bold = cyan.add_modifier(Modifier::BOLD);
+
+    let lines: Vec<TuiLine> = state
+        .recent_logs
+        .iter()
+        .map(|line| TuiLine::from(Span::styled(line.clone(), log_style(line))))
+        .collect();
+
+    let total = lines.len() as u16;
+    let visible = area.height.saturating_sub(2);
+    let scroll_from_top = total
+        .saturating_sub(visible)
+        .saturating_sub(state.log_scroll as u16);
+
+    let title = if state.log_scroll > 0 {
+        format!(" LOG  \u{2191} {}L scrolled  PgDn=tail ", state.log_scroll)
+    } else {
+        " LOG ".to_string()
+    };
+
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(cyan)
+                .title(Span::styled(title, cyan_bold)),
+        )
+        .scroll((scroll_from_top, 0));
+    frame.render_widget(para, area);
+}
+
+fn draw_input_bar(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &TuiState,
+) {
+    let cyan = Style::default().fg(Color::Cyan);
+    let cyan_bold = cyan.add_modifier(Modifier::BOLD);
+    let green_bold = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+
+    let prompt_line = TuiLine::from(vec![
+        Span::styled("> ", green_bold),
+        Span::styled(state.input_buf.clone(), Style::default().fg(Color::White)),
+    ]);
+
+    let para = Paragraph::new(vec![prompt_line]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(cyan)
+            .title(Span::styled(" command ", cyan_bold)),
     );
-    println!("{ANSI_GREEN}╚{}╝{ANSI_RESET}", "═".repeat(width.saturating_sub(2)));
-    print!("{ANSI_BOLD}{ANSI_GREEN}> {ANSI_RESET}");
-    let _ = io::stdout().flush();
+    frame.render_widget(para, area);
+
+    // Place cursor after typed text (inside block: +1 border, +2 for "> ")
+    let cursor_x = area.x + 1 + 2 + state.input_buf.len() as u16;
+    let cursor_y = area.y + 1;
+    if cursor_x < area.x + area.width.saturating_sub(1) {
+        frame.set_cursor_position((cursor_x, cursor_y));
+    }
+}
+
+fn draw_tui(frame: &mut ratatui::Frame, state: &TuiState, device_name: &str, port: u16) {
+    let area = frame.area();
+    let has_mesh = !state.sync_health.is_empty() || !state.devices.is_empty();
+    let mesh_h = if has_mesh {
+        (state.sync_health.len().max(state.devices.len()).min(6) + 3) as u16
+    } else {
+        0
+    };
+
+    // Outer vertical chunks: top panel | mesh | log | input
+    let outer = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(mesh_h),
+        Constraint::Length(13),
+        Constraint::Length(3),
+    ])
+    .split(area);
+
+    // Top: left info | right (commands + devices)
+    let top = Layout::horizontal([
+        Constraint::Percentage(32),
+        Constraint::Fill(1),
+    ])
+    .split(outer[0]);
+
+    // Right: commands | devices
+    let right = Layout::horizontal([
+        Constraint::Percentage(52),
+        Constraint::Fill(1),
+    ])
+    .split(top[1]);
+
+    draw_left_panel(frame, top[0], state, device_name, port);
+    draw_commands_panel(frame, right[0]);
+    draw_devices_panel(frame, right[1], state);
+    if has_mesh {
+        draw_mesh_panel(frame, outer[1], state);
+    }
+    draw_log_panel(frame, outer[2], state);
+    draw_input_bar(frame, outer[3], state);
 }
 
 fn emit(state: &Arc<Mutex<TuiState>>, tui_mode: bool, icon: &str, label: &str, message: impl AsRef<str>) {
@@ -1317,24 +1431,136 @@ fn main() -> Result<()> {
     }
 
     let running = Arc::new(AtomicBool::new(true));
-    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
-    spawn_command_reader(cmd_tx, Arc::clone(&running));
+
+    // ── TUI mode: set up ratatui terminal; plain: start stdin reader ──────────
+    let mut tui_terminal: Option<Terminal<CrosstermBackend<io::Stdout>>> = None;
+    let plain_cmd_rx: Option<mpsc::Receiver<String>>;
+    if tui_mode {
+        // Restore terminal on panic so the shell is not left broken.
+        let original_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            original_hook(info);
+        }));
+        tui_terminal = Some(setup_terminal()?);
+        plain_cmd_rx = None;
+    } else {
+        let (cmd_tx, rx) = mpsc::channel::<String>();
+        spawn_command_reader(cmd_tx, Arc::clone(&running));
+        plain_cmd_rx = Some(rx);
+    }
+
     let mut last_render = Instant::now();
     // Refresh device list automatically every 60 s in TUI mode.
     let mut last_device_refresh = Instant::now();
 
-    if tui_mode {
-        if let Ok(s) = ui_state.lock() {
-            let cfg = runtime.config.lock().unwrap();
-            render_tui(&s, &cfg.device_name, cfg.agent_port);
-        }
-    }
-
-    // Simple loop to handle events
+    // Main event loop
     while running.load(Ordering::Relaxed) {
-        while let Ok(cmd_line) = cmd_rx.try_recv() {
-            if let Some(effective_cmd) = resolve_history_alias(&cmd_line, &ui_state, tui_mode) {
-                execute_command(&effective_cmd, &runtime, &ui_state, tui_mode, &running);
+        // ── TUI: handle crossterm keyboard events ─────────────────────────────
+        if tui_mode {
+            while event::poll(Duration::ZERO).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(key)) => match key.code {
+                        KeyCode::Enter => {
+                            let cmd = {
+                                let mut s = ui_state.lock().unwrap();
+                                let c = s.input_buf.trim().to_string();
+                                s.input_buf.clear();
+                                s.history_cursor = None;
+                                s.dirty = true;
+                                c
+                            };
+                            if !cmd.is_empty() {
+                                if let Some(eff) = resolve_history_alias(&cmd, &ui_state, tui_mode) {
+                                    execute_command(&eff, &runtime, &ui_state, tui_mode, &running);
+                                }
+                            }
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            running.store(false, Ordering::Relaxed);
+                        }
+                        KeyCode::Char(ch) => {
+                            if let Ok(mut s) = ui_state.lock() {
+                                s.input_buf.push(ch);
+                                s.dirty = true;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if let Ok(mut s) = ui_state.lock() {
+                                s.input_buf.pop();
+                                s.dirty = true;
+                            }
+                        }
+                        KeyCode::Delete => {
+                            if let Ok(mut s) = ui_state.lock() {
+                                s.input_buf.clear();
+                                s.dirty = true;
+                            }
+                        }
+                        KeyCode::Up => {
+                            if let Ok(mut s) = ui_state.lock() {
+                                let hlen = s.command_history.len();
+                                if hlen > 0 {
+                                    let idx = match s.history_cursor {
+                                        None => hlen - 1,
+                                        Some(0) => 0,
+                                        Some(i) => i - 1,
+                                    };
+                                    s.history_cursor = Some(idx);
+                                    s.input_buf = s.command_history[idx].clone();
+                                    s.dirty = true;
+                                }
+                            }
+                        }
+                        KeyCode::Down => {
+                            if let Ok(mut s) = ui_state.lock() {
+                                let hlen = s.command_history.len();
+                                match s.history_cursor {
+                                    None => {}
+                                    Some(i) if i + 1 >= hlen => {
+                                        s.history_cursor = None;
+                                        s.input_buf.clear();
+                                        s.dirty = true;
+                                    }
+                                    Some(i) => {
+                                        s.history_cursor = Some(i + 1);
+                                        s.input_buf = s.command_history[i + 1].clone();
+                                        s.dirty = true;
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            if let Ok(mut s) = ui_state.lock() {
+                                s.log_scroll = s.log_scroll.saturating_add(8);
+                                s.dirty = true;
+                            }
+                        }
+                        KeyCode::PageDown => {
+                            if let Ok(mut s) = ui_state.lock() {
+                                s.log_scroll = s.log_scroll.saturating_sub(8);
+                                s.dirty = true;
+                            }
+                        }
+                        _ => {}
+                    },
+                    Ok(Event::Resize(_, _)) => {
+                        if let Ok(mut s) = ui_state.lock() {
+                            s.dirty = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // ── Plain mode: drain stdin reader thread ─────────────────────────────
+        if let Some(ref rx) = plain_cmd_rx {
+            while let Ok(cmd_line) = rx.try_recv() {
+                if let Some(effective_cmd) = resolve_history_alias(&cmd_line, &ui_state, tui_mode) {
+                    execute_command(&effective_cmd, &runtime, &ui_state, tui_mode, &running);
+                }
             }
         }
 
@@ -1589,24 +1815,33 @@ fn main() -> Result<()> {
             }
         }
 
-        if tui_mode {
-            let force_heartbeat = last_render.elapsed() >= Duration::from_secs(20);
-            let mut should_render = force_heartbeat;
-            if let Ok(s) = ui_state.lock() {
-                should_render = should_render || s.dirty;
-            }
-
+        // ── ratatui draw (TUI mode only) ──────────────────────────────────────
+        if let Some(ref mut terminal) = tui_terminal {
+            let should_render = {
+                let s = ui_state.lock().unwrap();
+                last_render.elapsed() >= Duration::from_millis(500) || s.dirty
+            };
             if should_render {
+                let s = ui_state.lock().unwrap();
+                let cfg = runtime.config.lock().unwrap();
+                let device_name = cfg.device_name.clone();
+                let port = cfg.agent_port;
+                drop(cfg);
+                terminal.draw(|frame| draw_tui(frame, &s, &device_name, port))?;
+                drop(s);
                 if let Ok(mut s) = ui_state.lock() {
-                    let cfg = runtime.config.lock().unwrap();
-                    render_tui(&s, &cfg.device_name, cfg.agent_port);
                     s.dirty = false;
                 }
                 last_render = Instant::now();
             }
         }
 
-        std::thread::sleep(Duration::from_millis(140));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // ── Restore terminal before exit ──────────────────────────────────────────
+    if let Some(ref mut terminal) = tui_terminal {
+        restore_terminal(terminal)?;
     }
 
     Ok(())
