@@ -9,10 +9,12 @@ use rusqlite::params;
 
 use thegrid_core::{
     fingerprint_file, match_rules, should_skip_dir, should_skip_path, AppEvent, Config, Database,
-    DetectionSourceDistribution, FileChange, FileWatcher, SyncHealthMetrics,
+    DetectionSourceDistribution, FileChange, FileWatcher, SyncHealthMetrics, TailscaleDevice,
+    models::ComputeTaskType,
 };
 use thegrid_net::{AgentClient, AgentServer, TailscaleClient, TermuxAgent, WolSentry};
 use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
+use crate::ComputeRouter;
 
 fn apply_automation_rules_for_file(
     db: &Database,
@@ -123,6 +125,10 @@ pub struct AppRuntime {
     pub agent_shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub hash_worker_running: Arc<AtomicBool>,
     pub sync_health: Arc<Mutex<std::collections::HashMap<String, SyncHealthMetrics>>>,
+
+    // Compute delegation
+    pub tailscale_peers: Arc<Mutex<Vec<TailscaleDevice>>>,
+    pub compute_router: Arc<ComputeRouter>,
 }
 
 impl AppRuntime {
@@ -179,8 +185,14 @@ impl AppRuntime {
         let ai_node_detector = AiNodeDetector::new();
         let is_ai_node = ai_node_detector.is_ai_node();
 
+        let config_arc = Arc::new(Mutex::new(config));
+        let compute_router = Arc::new(ComputeRouter::new(
+            Arc::clone(&config_arc),
+            event_tx.clone(),
+        ));
+
         let runtime = Self {
-            config: Arc::new(Mutex::new(config)),
+            config: config_arc,
             db,
             event_tx,
             file_watcher,
@@ -192,9 +204,47 @@ impl AppRuntime {
             agent_shutdown: Arc::new(Mutex::new(None)),
             hash_worker_running: Arc::new(AtomicBool::new(false)),
             sync_health: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            tailscale_peers: Arc::new(Mutex::new(Vec::new())),
+            compute_router,
         };
 
         Ok(runtime)
+    }
+
+    /// Called by the GUI whenever Tailscale peer list is refreshed so that the
+    /// compute router always has a current view of available nodes.
+    pub fn update_tailscale_peers(&self, peers: Vec<TailscaleDevice>) {
+        let mut lock = self.tailscale_peers.lock().unwrap();
+        *lock = peers;
+    }
+
+    /// Periodically re-fetch Tailscale devices in the background so that
+    /// the compute router works even without an active GUI (e.g., node mode).
+    pub fn spawn_peer_refresh_loop(&self) {
+        let api_key = self.config.lock().unwrap().api_key.clone();
+        let peers_slot = Arc::clone(&self.tailscale_peers);
+        let tx = self.event_tx.clone();
+        std::thread::Builder::new()
+            .name("thegrid-peer-refresh".into())
+            .spawn(move || {
+                loop {
+                    match TailscaleClient::new(api_key.clone()).and_then(|c| c.fetch_devices()) {
+                        Ok(devices) => {
+                            let n = devices.len();
+                            let mut lock = peers_slot.lock().unwrap();
+                            *lock = devices;
+                            drop(lock);
+                            log::debug!("[Runtime] Peer refresh: {} device(s) known", n);
+                        }
+                        Err(e) => {
+                            log::debug!("[Runtime] Peer refresh failed: {}", e);
+                        }
+                    }
+                    // Refresh every 2 minutes — cheap since Tailscale API caches for 5 min
+                    std::thread::sleep(std::time::Duration::from_secs(120));
+                }
+            })
+            .ok();
     }
 
     pub fn start_services(&self) {
@@ -291,7 +341,8 @@ impl AppRuntime {
             }
         }
 
-        // Background indexing helpers
+        // Background indexing helpers + peer discovery for compute delegation
+        self.spawn_peer_refresh_loop();
         self.spawn_hashing_worker();
 
         let shutdown_handle = server.shutdown_handle();
@@ -1153,6 +1204,8 @@ impl AppRuntime {
         let semantic = self.semantic_search.clone();
         let remote_ai = self.remote_ai_nodes.clone();
         let termux_agent = self.termux_agent.clone();
+        let tailscale_peers = Arc::clone(&self.tailscale_peers);
+        let compute_router = Arc::clone(&self.compute_router);
         let (api_key, port, tablet_assist_enabled, tablet_cpu_max, tablet_gpu_max, max_parallel_requests) = {
             let cfg = self.config.lock().unwrap();
             (
@@ -1171,6 +1224,9 @@ impl AppRuntime {
             let mut last_termux_heartbeat = std::time::Instant::now() - std::time::Duration::from_secs(60);
             let mut last_tablet_probe = std::time::Instant::now() - std::time::Duration::from_secs(60);
             let mut tablet_is_idle = false;
+            // Cache the best router-resolved peer so we don't re-probe every batch.
+            let mut router_peer_cache: Option<(String, u16)> = None;
+            let mut last_router_probe = std::time::Instant::now() - std::time::Duration::from_secs(300);
 
             loop {
                 let local_engine = {
@@ -1298,6 +1354,27 @@ impl AppRuntime {
                     .map(|(idx, (fid, text))| (idx, fid, text))
                     .collect();
 
+                // Refresh the best compute-router peer every 3 minutes.
+                // route_task probes /v1/compute/status (2s timeout) so we cache the result.
+                if last_router_probe.elapsed() >= std::time::Duration::from_secs(180) {
+                    let peers = tailscale_peers.lock().unwrap().clone();
+                    router_peer_cache = match compute_router.route_task(
+                        &ComputeTaskType::TextEmbedding,
+                        &peers,
+                    ) {
+                        crate::compute_router::RouteTarget::Remote { ip, .. } => {
+                            log::info!("[EmbedWorker] Compute router selected peer: {}", ip);
+                            Some((ip, port))
+                        }
+                        crate::compute_router::RouteTarget::Local => {
+                            log::debug!("[EmbedWorker] Compute router: no capable remote peer, using local only");
+                            None
+                        }
+                    };
+                    last_router_probe = std::time::Instant::now();
+                }
+                let router_peer = router_peer_cache.clone();
+
                 let worker_count = max_parallel_requests
                     .max(1)
                     .min(8)
@@ -1312,6 +1389,7 @@ impl AppRuntime {
                     let model_id = local_model_id.clone();
                     let tt = termux_target.clone();
                     let rn = remote_node.clone();
+                    let rp = router_peer.clone();
                     let use_tablet_assist = tablet_assist_enabled;
                     let tablet_idle_now = tablet_is_idle;
 
@@ -1365,6 +1443,18 @@ impl AppRuntime {
                                     if let Ok(client) = AgentClient::new(ip, port, key.clone()) {
                                         if let Ok(v) = client.remote_embed(&text) {
                                             vector = v;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Final fallback: compute-router selected best available Tailscale peer
+                            if vector.is_empty() {
+                                if let Some((ip, p)) = &rp {
+                                    if let Ok(client) = AgentClient::new(ip, *p, key.clone()) {
+                                        if let Ok(v) = client.remote_embed(&text) {
+                                            vector = v;
+                                            source = format!("router:{}", ip);
                                         }
                                     }
                                 }

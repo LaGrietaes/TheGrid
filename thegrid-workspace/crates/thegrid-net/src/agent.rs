@@ -58,7 +58,7 @@ pub struct AgentServer {
     ts_client: Option<Arc<TailscaleClient>>,
     config: Arc<Mutex<Config>>,
     terminal_sessions: Mutex<HashMap<String, TerminalSession>>,
-    compute_state: Mutex<ComputeState>,
+    compute_state: Arc<Mutex<ComputeState>>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -78,9 +78,9 @@ impl AgentServer {
             ts_client: None,
             config: config.clone(),
             terminal_sessions: Mutex::new(HashMap::new()),
-            compute_state: Mutex::new(ComputeState::new(
+            compute_state: Arc::new(Mutex::new(ComputeState::new(
                 config.lock().map(|c| c.max_parallel_compute_tasks).unwrap_or(2)
-            )),
+            ))),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -965,24 +965,100 @@ impl AgentServer {
                 Ok(task) => {
                     let mut cs = self.compute_state.lock().unwrap();
                     let receipt = if cs.is_available() {
-                        let progress = thegrid_core::models::ComputeTaskProgress {
+                        cs.active_tasks.insert(task.task_id.clone(), thegrid_core::models::ComputeTaskProgress {
                             task_id: task.task_id.clone(),
                             state: thegrid_core::models::ComputeTaskState::Queued,
                             pct: 0,
                             result_uri: None,
                             error: None,
-                        };
-                        cs.active_tasks.insert(task.task_id.clone(), progress);
-                        // Emit event so runtime can execute the task
-                        let _ = self.event_tx.send(AppEvent::ComputeTaskUpdate(
-                            thegrid_core::models::ComputeTaskProgress {
-                                task_id: task.task_id.clone(),
-                                state: thegrid_core::models::ComputeTaskState::Queued,
-                                pct: 0,
-                                result_uri: None,
-                                error: None,
-                            }
-                        ));
+                        });
+                        drop(cs); // release lock before spawning
+
+                        // Spawn execution thread — does the real work and updates state.
+                        let cs_arc = Arc::clone(&self.compute_state);
+                        let evt_tx = self.event_tx.clone();
+                        let task_id = task.task_id.clone();
+                        std::thread::Builder::new()
+                            .name(format!("compute-{}", &task_id[..8.min(task_id.len())]))
+                            .spawn(move || {
+                                // Mark as Running
+                                if let Ok(mut cs) = cs_arc.lock() {
+                                    if let Some(p) = cs.active_tasks.get_mut(&task_id) {
+                                        p.state = thegrid_core::models::ComputeTaskState::Running;
+                                        p.pct = 10;
+                                    }
+                                }
+
+                                let (final_state, result_uri, error_msg) = match &task.payload {
+                                    thegrid_core::models::ComputePayload::TextEmbed { text } => {
+                                        // Delegate to the existing /v1/ai/embed event pipeline
+                                        let (tx, rx) = std::sync::mpsc::channel();
+                                        let _ = evt_tx.send(AppEvent::RemoteAiEmbedRequest {
+                                            text: text.clone(),
+                                            response_tx: tx,
+                                        });
+                                        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                                            Ok(vec) if !vec.is_empty() => {
+                                                // Encode result as JSON for transfer
+                                                let uri = serde_json::to_string(&vec)
+                                                    .unwrap_or_default();
+                                                (thegrid_core::models::ComputeTaskState::Done, Some(uri), None)
+                                            }
+                                            Ok(_) => (
+                                                thegrid_core::models::ComputeTaskState::Failed,
+                                                None,
+                                                Some("embedding returned empty vector".to_string()),
+                                            ),
+                                            Err(_) => (
+                                                thegrid_core::models::ComputeTaskState::Failed,
+                                                None,
+                                                Some("embedding timed out".to_string()),
+                                            ),
+                                        }
+                                    }
+                                    thegrid_core::models::ComputePayload::FullHash { file_url } => {
+                                        // Hash a local file by path — only works if file is local
+                                        let path = std::path::PathBuf::from(file_url);
+                                        if path.exists() && path.is_file() {
+                                            match thegrid_core::hash_file(&path) {
+                                                Ok(h) => (
+                                                    thegrid_core::models::ComputeTaskState::Done,
+                                                    Some(h),
+                                                    None,
+                                                ),
+                                                Err(e) => (
+                                                    thegrid_core::models::ComputeTaskState::Failed,
+                                                    None,
+                                                    Some(e.to_string()),
+                                                ),
+                                            }
+                                        } else {
+                                            (
+                                                thegrid_core::models::ComputeTaskState::Failed,
+                                                None,
+                                                Some("file not found on this node".to_string()),
+                                            )
+                                        }
+                                    }
+                                    _ => (
+                                        thegrid_core::models::ComputeTaskState::Failed,
+                                        None,
+                                        Some("unsupported task type".to_string()),
+                                    ),
+                                };
+
+                                // Write final state
+                                if let Ok(mut cs) = cs_arc.lock() {
+                                    if let Some(p) = cs.active_tasks.get_mut(&task_id) {
+                                        p.state = final_state;
+                                        p.pct = 100;
+                                        p.result_uri = result_uri;
+                                        p.error = error_msg;
+                                    }
+                                }
+                            })
+                            .ok();
+
                         thegrid_core::models::ComputeTaskReceipt {
                             task_id: task.task_id,
                             accepted: true,
@@ -1406,11 +1482,13 @@ impl AgentClient {
         resp.json().context("Parsing remote search response")
     }
 
-    /// GET /v1/compute/status
+    /// GET /v1/compute/status — uses a 2-second timeout so the compute router
+    /// can probe many peers quickly without stalling on unreachable nodes.
     pub fn get_compute_status(&self) -> Result<thegrid_core::models::ComputeStatus> {
         let endpoint = format!("{}/v1/compute/status", self.base_url);
         let resp = self.http.get(&endpoint)
             .header("X-Grid-Key", &self.api_key)
+            .timeout(std::time::Duration::from_secs(2))
             .send()
             .context("GET /v1/compute/status")?;
         if !resp.status().is_success() {

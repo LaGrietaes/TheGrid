@@ -1664,6 +1664,9 @@ impl TheGridApp {
                     }
                     self.set_status(format!("{} nodes discovered", n));
 
+                    // Share peer list with runtime so the compute router can use them
+                    self.runtime.update_tailscale_peers(self.devices.clone());
+
                     // Start local telemetry collection immediately after first load
                     if let Some(local_device_id) = self
                         .devices
