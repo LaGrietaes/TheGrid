@@ -26,7 +26,8 @@ reqwest       = { workspace = true }
 
 # GUI framework — eframe wraps egui with a native OS window
 # "default_fonts" includes the monospace Hack font used for brutalist aesthetic
-eframe        = { version = "0.27", default-features = true }
+eframe        = { version = "0.27", default-features = false, features = ["wgpu", "default_fonts"] }
+# wgpu renderer avoids the egui_glow GL_INVALID_OPERATION / STATUS_ACCESS_VIOLATION crash on Windows
 egui          = "0.27"
 egui_extras   = { version = "0.27", features = ["image", "svg"] }
 egui_tiles    = "0.8"
