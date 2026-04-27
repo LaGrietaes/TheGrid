@@ -370,10 +370,14 @@ pub fn render_device_panel(
 
                             // ── Text column ───────────────────────────────────────
                             ui.vertical(|ui| {
-                                // Row 1: device name (large, bold) + badges
+                                // Row 1: short device label (part before first '.'), bold title
+                                let short_name = device.display_name()
+                                    .split('.')
+                                    .next()
+                                    .unwrap_or(device.display_name());
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(device.display_name().to_uppercase())
+                                        RichText::new(short_name.to_uppercase())
                                             .color(if is_selected { Colors::GREEN } else { Colors::TEXT })
                                             .size(10.5).strong()
                                     );
