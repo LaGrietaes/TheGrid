@@ -206,6 +206,32 @@ impl Database {
                 executed_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_deletion_audit_session ON deletion_audit(session_id);
+
+            -- ── Persistent duplicate groups (cross-source, cross-device) ──────
+            -- Groups survive restarts and re-scans; member review decisions are kept.
+            CREATE TABLE IF NOT EXISTS duplicate_groups (
+                hash             TEXT    NOT NULL,
+                size             INTEGER NOT NULL,
+                file_count       INTEGER NOT NULL DEFAULT 0,
+                source_count     INTEGER NOT NULL DEFAULT 0,
+                suggested_anchor TEXT,
+                status           TEXT    NOT NULL DEFAULT 'pending',
+                first_seen_at    INTEGER NOT NULL,
+                last_seen_at     INTEGER NOT NULL,
+                PRIMARY KEY (hash, size)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dup_groups_status ON duplicate_groups(status);
+
+            -- One row per file per group; stores the user's review decision.
+            CREATE TABLE IF NOT EXISTS duplicate_group_members (
+                hash       TEXT    NOT NULL,
+                size       INTEGER NOT NULL,
+                file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                action     TEXT    NOT NULL DEFAULT 'undecided',
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (hash, size, file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_dup_members_file ON duplicate_group_members(file_id);
         "#).context("Initializing database schema")?;
 
         // Migrate existing DBs: add new columns if missing
@@ -1752,6 +1778,182 @@ impl Database {
         }
 
         Ok(renamed)
+    }
+
+    // ── Persistent duplicate group registry ───────────────────────────────────
+
+    /// Persist detected duplicate groups to the database.
+    /// Group metadata is updated on re-scan; existing member review actions are preserved
+    /// (INSERT OR IGNORE on members so prior Keep/Delete decisions survive).
+    pub fn upsert_duplicate_groups(&self, groups: &[crate::models::DuplicateGroup]) -> Result<()> {
+        let now = unix_now();
+        for g in groups {
+            self.conn.execute(
+                "INSERT INTO duplicate_groups
+                    (hash, size, file_count, source_count, suggested_anchor, status, first_seen_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)
+                 ON CONFLICT(hash, size) DO UPDATE
+                   SET file_count       = excluded.file_count,
+                       source_count     = excluded.source_count,
+                       suggested_anchor = excluded.suggested_anchor,
+                       last_seen_at     = excluded.last_seen_at
+                   WHERE status != 'resolved'",
+                params![
+                    g.hash,
+                    g.size as i64,
+                    g.file_count as i64,
+                    g.source_count as i64,
+                    g.suggested_anchor,
+                    now,
+                ],
+            )?;
+            for file in &g.files {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO duplicate_group_members
+                        (hash, size, file_id, action, updated_at)
+                     VALUES (?1, ?2, ?3, 'undecided', ?4)",
+                    params![g.hash, g.size as i64, file.id, now],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load all non-resolved duplicate groups from the database, joining back to the files
+    /// table to reconstruct full `DuplicateGroup` objects.
+    /// Returns `(groups, actions_map)` where `actions_map` is `file_id → action string`.
+    pub fn load_persisted_duplicate_groups(
+        &self,
+    ) -> Result<(Vec<crate::models::DuplicateGroup>, std::collections::HashMap<i64, String>)> {
+        use crate::models::{DuplicateGroup, FileSearchResult, SourceSummary, SourceType, DetectionSource};
+        use std::collections::HashMap;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                dg.hash, dg.size, dg.file_count, dg.source_count, dg.suggested_anchor,
+                f.id, f.device_id, f.device_name, f.path, f.name, f.ext,
+                f.size AS file_size, f.modified, f.hash AS file_hash, f.quick_hash,
+                f.indexed_at, f.detected_by,
+                COALESCE(f.source_type, 'Local') AS source_type,
+                dgm.action
+             FROM duplicate_groups dg
+             JOIN duplicate_group_members dgm ON dgm.hash = dg.hash AND dgm.size = dg.size
+             JOIN files f ON f.id = dgm.file_id
+             WHERE dg.status != 'resolved'
+             ORDER BY dg.size DESC, dg.hash, f.device_id, f.path"
+        )?;
+
+        // Collect raw rows grouped by (hash, size)
+        struct RawRow {
+            hash: String, size: u64,
+            file_count: u32, source_count: u32, suggested_anchor: Option<String>,
+            file: FileSearchResult, source_type: String, action: String,
+        }
+
+        let mut raw_rows: Vec<RawRow> = Vec::new();
+        let iter = stmt.query_map([], |row| {
+            Ok(RawRow {
+                hash:             row.get::<_, String>(0)?,
+                size:             row.get::<_, i64>(1)? as u64,
+                file_count:       row.get::<_, i64>(2)? as u32,
+                source_count:     row.get::<_, i64>(3)? as u32,
+                suggested_anchor: row.get::<_, Option<String>>(4)?,
+                file: FileSearchResult {
+                    id:          row.get::<_, i64>(5)?,
+                    device_id:   row.get::<_, String>(6)?,
+                    device_name: row.get::<_, String>(7)?,
+                    path:        std::path::PathBuf::from(row.get::<_, String>(8)?),
+                    name:        row.get::<_, String>(9)?,
+                    ext:         row.get::<_, Option<String>>(10)?,
+                    size:        row.get::<_, i64>(11)? as u64,
+                    modified:    row.get::<_, Option<i64>>(12)?,
+                    hash:        row.get::<_, Option<String>>(13)?,
+                    quick_hash:  row.get::<_, Option<String>>(14)?,
+                    indexed_at:  row.get::<_, i64>(15)?,
+                    detected_by: row.get::<_, Option<String>>(16)?
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok())
+                        .unwrap_or(DetectionSource::FullScan),
+                    rank: None,
+                },
+                source_type: row.get::<_, String>(17)?,
+                action:      row.get::<_, String>(18)?,
+            })
+        })?;
+        for r in iter { raw_rows.push(r?); }
+
+        // Group by (hash, size)
+        let mut groups_map: std::collections::BTreeMap<(String, u64), DuplicateGroup> =
+            std::collections::BTreeMap::new();
+        let mut actions_map: HashMap<i64, String> = HashMap::new();
+
+        for row in raw_rows {
+            let key = (row.hash.clone(), row.size);
+
+            let group = groups_map.entry(key).or_insert_with(|| DuplicateGroup {
+                hash:             row.hash.clone(),
+                size:             row.size,
+                file_count:       row.file_count,
+                source_count:     row.source_count,
+                suggested_anchor: row.suggested_anchor.clone(),
+                sources:          Vec::new(),
+                files:            Vec::new(),
+            });
+
+            actions_map.insert(row.file.id, row.action.clone());
+
+            // Build / update SourceSummary for this device
+            let src_type = match row.source_type.as_str() {
+                "GoogleDrive" => SourceType::GoogleDrive,
+                "Nas"         => SourceType::Nas,
+                _             => SourceType::Local,
+            };
+            if let Some(existing) = group.sources.iter_mut()
+                .find(|s| s.device_id == row.file.device_id) {
+                existing.file_count += 1;
+            } else {
+                group.sources.push(SourceSummary {
+                    device_id:   row.file.device_id.clone(),
+                    device_name: row.file.device_name.clone(),
+                    file_count:  1,
+                    source_type: src_type,
+                });
+            }
+
+            group.files.push(row.file);
+        }
+
+        let groups: Vec<DuplicateGroup> = groups_map.into_values().collect();
+        Ok((groups, actions_map))
+    }
+
+    /// Batch-save per-file review decisions back to the DB.
+    /// Each item is `(hash, size, file_id, action)` where action is "keep"|"delete"|"undecided".
+    pub fn save_dedup_actions_batch(
+        &self,
+        items: &[(String, u64, i64, String)],
+    ) -> Result<()> {
+        let now = unix_now();
+        for (hash, size, file_id, action) in items {
+            self.conn.execute(
+                "INSERT INTO duplicate_group_members (hash, size, file_id, action, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(hash, size, file_id) DO UPDATE
+                   SET action = excluded.action, updated_at = excluded.updated_at",
+                params![hash, *size as i64, file_id, action, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Mark a duplicate group as resolved (all decisions executed).
+    /// Resolved groups are not returned by `load_persisted_duplicate_groups`.
+    pub fn mark_duplicate_group_resolved(&self, hash: &str, size: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE duplicate_groups SET status = 'resolved' WHERE hash = ?1 AND size = ?2",
+            params![hash, size as i64],
+        )?;
+        Ok(())
     }
 }
 

@@ -282,6 +282,10 @@ pub enum AppEvent {
     DriveIndexError(String),
 
     // ── Duplicate groups (rich cross-source format) ────────────────────────
-    /// Rich duplicate groups ready for review UI.
+    /// Rich duplicate groups ready for review UI (emitted after a live scan).
     DuplicatesGrouped(Vec<crate::models::DuplicateGroup>),
+
+    /// Persisted duplicate groups restored from the DB on startup or explicit reload.
+    /// Second field is the stored per-file review decisions: file_id → action string.
+    DuplicateGroupsRestored(Vec<crate::models::DuplicateGroup>, std::collections::HashMap<i64, String>),
 }

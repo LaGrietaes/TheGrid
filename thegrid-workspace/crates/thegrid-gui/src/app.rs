@@ -1698,6 +1698,7 @@ impl TheGridApp {
                     self.config       = config;
                     self.screen       = Screen::Dashboard;
                     self.spawn_load_devices();
+                    self.runtime.spawn_load_persisted_duplicate_groups();
                 }
 
                 AppEvent::SetupFailed(err) => {
@@ -2519,9 +2520,25 @@ impl TheGridApp {
                 AppEvent::DuplicatesGrouped(groups) => {
                     log::info!("DuplicatesGrouped: {} groups", groups.len());
                     self.dedup_review_state.scanning = false;
+                    // Persist group structure (preserves existing member actions via INSERT OR IGNORE)
+                    if let Ok(guard) = self.runtime.db.try_lock() {
+                        if let Err(e) = guard.upsert_duplicate_groups(&groups) {
+                            log::error!("[App] Failed to persist duplicate groups: {}", e);
+                        }
+                    }
+                    // Seed anchor suggestions only for files not already decided
                     self.dedup_review_state.seed_from_groups(&groups);
                     self.rich_duplicate_groups = groups;
                     self.push_toast(Toast::info(format!("{} duplicate groups found", self.rich_duplicate_groups.len())));
+                }
+
+                AppEvent::DuplicateGroupsRestored(groups, stored_actions) => {
+                    log::info!("DuplicateGroupsRestored: {} groups from DB", groups.len());
+                    // Stored actions override anchor suggestions — apply first, then fill gaps
+                    self.dedup_review_state.apply_stored_actions(&stored_actions);
+                    self.dedup_review_state.seed_from_groups(&groups);
+                    self.rich_duplicate_groups = groups;
+                    self.set_status(format!("{} duplicate groups restored", self.rich_duplicate_groups.len()));
                 }
 
                 _ => {}
@@ -3067,10 +3084,62 @@ impl TheGridApp {
         }
 
         if let Some(files) = actions.dedup_delete_files {
+            // Persist current review decisions before executing so they survive a restart.
+            let decisions = &self.dedup_review_state.actions;
+            let batch: Vec<(String, u64, i64, String)> = self.rich_duplicate_groups
+                .iter()
+                .flat_map(|g| g.files.iter().map(|f| {
+                    let action_str = match decisions.get(&f.id) {
+                        Some(crate::views::dedup_review::FileAction::Keep)   => "keep",
+                        Some(crate::views::dedup_review::FileAction::Delete) => "delete",
+                        _ => "undecided",
+                    };
+                    (g.hash.clone(), g.size, f.id, action_str.to_string())
+                }))
+                .collect();
+            if let Ok(guard) = self.runtime.db.try_lock() {
+                let _ = guard.save_dedup_actions_batch(&batch);
+            }
+            // Mark each affected group resolved and remove from in-memory list.
+            let file_ids: std::collections::HashSet<i64> = files.iter().map(|f| f.id).collect();
+            let affected_groups: Vec<(String, u64)> = self.rich_duplicate_groups
+                .iter()
+                .filter(|g| g.files.iter().any(|gf| file_ids.contains(&gf.id)))
+                .map(|g| (g.hash.clone(), g.size))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter().collect();
+            if !affected_groups.is_empty() {
+                if let Ok(guard) = self.runtime.db.try_lock() {
+                    for (hash, size) in &affected_groups {
+                        let _ = guard.mark_duplicate_group_resolved(hash, *size);
+                    }
+                }
+                self.rich_duplicate_groups.retain(|g| {
+                    !affected_groups.iter().any(|(h, s)| *h == g.hash && *s == g.size)
+                });
+            }
             self.spawn_rich_dedup_delete(files);
         }
 
         if actions.run_cross_source_scan {
+            // Save current decisions before the re-scan so no work is lost.
+            let decisions = &self.dedup_review_state.actions;
+            let batch: Vec<(String, u64, i64, String)> = self.rich_duplicate_groups
+                .iter()
+                .flat_map(|g| g.files.iter().map(|f| {
+                    let action_str = match decisions.get(&f.id) {
+                        Some(crate::views::dedup_review::FileAction::Keep)   => "keep",
+                        Some(crate::views::dedup_review::FileAction::Delete) => "delete",
+                        _ => "undecided",
+                    };
+                    (g.hash.clone(), g.size, f.id, action_str.to_string())
+                }))
+                .collect();
+            if !batch.is_empty() {
+                if let Ok(guard) = self.runtime.db.try_lock() {
+                    let _ = guard.save_dedup_actions_batch(&batch);
+                }
+            }
             self.dedup_review_state.scanning = true;
             self.runtime.spawn_cross_source_dedup_scan();
         }
@@ -3467,6 +3536,7 @@ impl eframe::App for TheGridApp {
                             if self.config.is_configured() {
                                 self.screen = Screen::Dashboard;
                                 self.spawn_load_devices();
+                                self.runtime.spawn_load_persisted_duplicate_groups();
                             } else {
                                 self.screen = Screen::Setup;
                             }

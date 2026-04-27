@@ -50,17 +50,37 @@ impl Default for DedupReviewState {
 }
 
 impl DedupReviewState {
-    /// Auto-seed actions from suggested_anchor: anchor copies → Keep, others → Delete.
+    /// Seed actions from suggested_anchor for any file that does not already have a
+    /// Keep or Delete decision.  Existing decisions are preserved so that re-scanning
+    /// does not overwrite what the user has already marked.
     pub fn seed_from_groups(&mut self, groups: &[DuplicateGroup]) {
-        self.actions.clear();
         for g in groups {
             for file in &g.files {
-                let is_anchor = g.suggested_anchor.as_deref() == Some(&file.device_id);
-                self.actions.insert(
-                    file.id,
-                    if is_anchor { FileAction::Keep } else { FileAction::Delete },
+                let already_decided = matches!(
+                    self.actions.get(&file.id),
+                    Some(FileAction::Keep) | Some(FileAction::Delete)
                 );
+                if !already_decided {
+                    let is_anchor = g.suggested_anchor.as_deref() == Some(&file.device_id);
+                    self.actions.insert(
+                        file.id,
+                        if is_anchor { FileAction::Keep } else { FileAction::Delete },
+                    );
+                }
             }
+        }
+    }
+
+    /// Apply stored actions loaded from the DB (overrides in-memory state).
+    /// Called when restoring persisted groups on startup.
+    pub fn apply_stored_actions(&mut self, stored: &std::collections::HashMap<i64, String>) {
+        for (&file_id, action_str) in stored {
+            let action = match action_str.as_str() {
+                "keep"   => FileAction::Keep,
+                "delete" => FileAction::Delete,
+                _        => FileAction::Undecided,
+            };
+            self.actions.insert(file_id, action);
         }
     }
 

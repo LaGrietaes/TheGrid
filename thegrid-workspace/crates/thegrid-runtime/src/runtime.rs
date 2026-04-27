@@ -1856,6 +1856,25 @@ impl AppRuntime {
         });
     }
 
+    /// Load persisted duplicate groups from the DB and emit `DuplicateGroupsRestored`.
+    /// Called on startup so the DEDUP tab is populated without requiring a live scan.
+    pub fn spawn_load_persisted_duplicate_groups(&self) {
+        let db = Arc::clone(&self.db);
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match db.lock().map(|g| g.load_persisted_duplicate_groups()) {
+                Ok(Ok((groups, actions))) => {
+                    if !groups.is_empty() {
+                        log::info!("[Runtime] Restored {} persisted duplicate group(s)", groups.len());
+                        let _ = tx.send(AppEvent::DuplicateGroupsRestored(groups, actions));
+                    }
+                }
+                Ok(Err(e)) => log::error!("[Runtime] Load persisted duplicate groups: {}", e),
+                Err(_)     => log::error!("[Runtime] Load persisted duplicate groups: DB lock poisoned"),
+            }
+        });
+    }
+
     /// Scan the DB for cross-source duplicate groups and emit `DuplicatesGrouped`.
     pub fn spawn_cross_source_dedup_scan(&self) {
         let db = Arc::clone(&self.db);
