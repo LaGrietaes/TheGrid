@@ -390,6 +390,19 @@ impl AgentServer {
             return Ok(());
         }
 
+        if method == "POST" && url == "/v1/restart" {
+            if !self.capability_enabled("remote_control") {
+                Self::respond_capability_forbidden(req, "remote_control")?;
+                return Ok(());
+            }
+            let _ = self.event_tx.send(AppEvent::Status("restart_requested:".to_string()));
+            req.respond(
+                Response::from_string(r#"{"ok":true,"message":"restart scheduled"}"#)
+                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()),
+            )?;
+            return Ok(());
+        }
+
         if method == "POST" && url == "/adb/enable" {
             if !self.capability_enabled("remote_control") {
                 Self::respond_capability_forbidden(req, "remote_control")?;
@@ -1562,7 +1575,22 @@ impl AgentClient {
             .json(&body)
             .send()
             .context("Sending config update")?;
-        
+
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(())
+    }
+
+    /// POST /v1/restart — asks the remote node to restart and re-read config from disk.
+    pub fn restart_node(&self) -> Result<()> {
+        let endpoint = format!("{}/v1/restart", self.base_url);
+        let resp = self.http.post(&endpoint)
+            .header("X-Grid-Key", &self.api_key)
+            .header("Content-Length", "0")
+            .body("")
+            .send()
+            .context("Sending restart request")?;
         if !resp.status().is_success() {
             return Err(Self::handle_error(resp));
         }

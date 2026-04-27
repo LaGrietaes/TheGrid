@@ -623,7 +623,15 @@ impl TheGridApp {
             idle_notified: false,
             initial_scan_dispatched: false,
             release_check_dispatched: false,
-            device_display_states: HashMap::new(),
+            device_display_states: {
+                // Pre-seed local machine as Online so the status dot is green from startup.
+                let mut map = HashMap::new();
+                let local_id = config.device_name.clone();
+                if !local_id.is_empty() {
+                    map.insert(local_id, DeviceDisplayState::Online);
+                }
+                map
+            },
             compute_sessions: Vec::new(),
             rich_duplicate_groups: Vec::new(),
             dedup_review_state: crate::views::dedup_review::DedupReviewState::default(),
@@ -921,6 +929,19 @@ impl TheGridApp {
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             match AgentClient::new(&ip, port, api_key).and_then(|c| c.update_config(device_type, model, url)) {
+                Ok(_) => { let _ = tx.send(AppEvent::RemoteConfigUpdated { device_id }); }
+                Err(e) => { let _ = tx.send(AppEvent::RemoteConfigFailed { device_id, error: e.to_string() }); }
+            }
+        });
+    }
+
+    /// Sends a restart request to a remote node via `POST /v1/restart`.
+    fn spawn_restart_remote_node(&self, ip: String, device_id: String) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.restart_node()) {
                 Ok(_) => { let _ = tx.send(AppEvent::RemoteConfigUpdated { device_id }); }
                 Err(e) => { let _ = tx.send(AppEvent::RemoteConfigFailed { device_id, error: e.to_string() }); }
             }
@@ -1666,6 +1687,14 @@ impl TheGridApp {
 
                     // Share peer list with runtime so the compute router can use them
                     self.runtime.update_tailscale_peers(self.devices.clone());
+
+                    // Mark local device Online — it's running right now, no ping needed.
+                    let local_cfg_id = self.config.device_name.clone();
+                    self.mark_device_online(&local_cfg_id);
+                    if let Some(local_dev) = self.devices.iter().find(|d| self.is_local_device(d)) {
+                        let lid = local_dev.id.clone();
+                        self.mark_device_online(&lid);
+                    }
 
                     // Seed display state colors immediately so cards show color before first ping
                     self.refresh_device_display_states();
@@ -2461,7 +2490,17 @@ impl TheGridApp {
                         }
                     });
                 }
-                AppEvent::OpenSettings   => { self.settings.open = true; }
+                AppEvent::OpenSettings => {
+                    self.settings.open = true;
+                    // Pre-fill push target with currently selected remote device (if any).
+                    let (ip, id) = self.selected_device()
+                        .filter(|d| !self.is_local_device(d))
+                        .and_then(|d| d.primary_ip().map(|ip| (ip.to_string(), d.id.clone())))
+                        .map(|(ip, id)| (Some(ip), Some(id)))
+                        .unwrap_or((None, None));
+                    self.settings.target_device_ip = ip;
+                    self.settings.target_device_id = id;
+                }
 
                 // ── Preview ───────────────────────────────────────────────────
                 AppEvent::RequestFilePreview(file) => {
@@ -2561,16 +2600,10 @@ impl TheGridApp {
     }
 
     fn derive_display_state(&self, device_id: &str, _hostname: &str) -> DeviceDisplayState {
-        // Error: agent ping explicitly failed
-        // (We don't track per-device ping failures currently, so skip for now.)
-
         // ComputeBorrowing: we have an active session delegated TO this device
         if self.compute_sessions.iter().any(|s| s.provider_device_id == device_id) {
             return DeviceDisplayState::ComputeBorrowing;
         }
-
-        // ComputeProviding: a remote session is running ON THIS machine
-        // (would come from a separate field; placeholder)
 
         // Indexing: the device is in an active index scan
         if self.index_stats.scanning && device_id == self.config.device_name {
@@ -2585,13 +2618,17 @@ impl TheGridApp {
             }
         }
 
-        // Online / Offline: based on last ping outcome
-        // (stored in device_display_states itself as a base, or derived from NodeStatus)
-        // Default: check existing state or fall back to Offline.
-        self.device_display_states
-            .get(device_id)
-            .cloned()
-            .unwrap_or(DeviceDisplayState::Offline)
+        // Online / Offline: use the persisted map first (set by ping success/fail),
+        // then fall back to NodeStatus so that devices that were never explicitly
+        // pinged still get a sensible color.
+        match self.device_display_states.get(device_id).cloned() {
+            Some(s) if s != DeviceDisplayState::Offline => s,
+            _ => match self.get_node_status(device_id) {
+                NodeStatus::GridActive => DeviceDisplayState::Online,
+                NodeStatus::Reachable  => DeviceDisplayState::Online,
+                NodeStatus::Offline    => DeviceDisplayState::Offline,
+            },
+        }
     }
 
     /// Called when a ping succeeds — marks device Online (or keeps higher-precedence state).
@@ -3788,8 +3825,26 @@ impl eframe::App for TheGridApp {
                             if needs_restart {
                                 self.runtime.restart_services();
                             }
-                            
+
                             self.spawn_load_devices();
+
+                            // If user clicked "Push to Node & Restart", send config + restart signal.
+                            if self.settings.push_and_restart {
+                                self.settings.push_and_restart = false;
+                                if let (Some(ip), Some(id)) = (
+                                    self.settings.target_device_ip.clone(),
+                                    self.settings.target_device_id.clone(),
+                                ) {
+                                    self.spawn_update_remote_config(
+                                        ip.clone(), id.clone(),
+                                        Some(self.config.device_type.clone()),
+                                        self.config.ai_model.clone(),
+                                        self.config.ai_provider_url.clone(),
+                                    );
+                                    self.spawn_restart_remote_node(ip.clone(), id.clone());
+                                    self.push_toast(Toast::ok(format!("Config pushed to {} — restarting node", ip)));
+                                }
+                            }
                         }
                         Err(e) => self.push_toast(Toast::err(format!("Save failed: {}", e))),
                     }

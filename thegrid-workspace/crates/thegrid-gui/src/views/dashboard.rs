@@ -281,8 +281,8 @@ pub fn render_device_panel(
                 let is_selected = selected_idx == Some(idx);
                 let is_in_cluster = selected_node_ids.contains(&device.id);
                 
-                let bg = if is_selected { Colors::BG_ACTIVE } 
-                         else if is_in_cluster { Color32::from_rgba_premultiplied(0, 150, 0, 30) }
+                let bg = if is_selected { Colors::BG_ACTIVE }
+                         else if is_in_cluster { Color32::from_rgba_premultiplied(0, 80, 20, 18) }
                          else { Color32::TRANSPARENT };
                 
                 // Prefer richer DeviceDisplayState color when available.
@@ -296,32 +296,44 @@ pub fn render_device_panel(
                     }
                 };
 
+                // Telemetry for this device (AI info, device type)
+                let telem = telemetries.get(&device.id);
+                let is_ai = telem.map(|t| t.is_ai_capable).unwrap_or(false);
+                let ai_model: Option<&str> = telem.and_then(|t| {
+                    t.capabilities.ai_models.first().map(|m| m.as_str())
+                });
+                let device_type_str = telem.map(|t| t.device_type.as_str()).unwrap_or("Desktop");
+
+                // ── Tailscale name and IP strings (for secondary row + copy) ────────
+                // The "clean" tailscale hostname (e.g. "rog-one.tail1234.ts.net")
+                let ts_name: &str = if !device.name.is_empty() { &device.name } else { &device.hostname };
+                let ts_ip: &str = device.primary_ip().unwrap_or("");
+
                 let mut cluster_toggled = false;
+                let mut copy_ts_name = false;
+                let mut copy_ts_ip   = false;
                 let resp = egui::Frame::none()
                     .fill(bg)
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0))
+                    .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 7.0, bottom: 7.0 })
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            // Compact cluster icon toggle (small footprint)
+                            // ── Cluster toggle button ─────────────────────
                             let (cluster_rect, cluster_resp) = ui.allocate_exact_size(
-                                egui::vec2(18.0, 16.0),
+                                egui::vec2(16.0, 16.0),
                                 egui::Sense::click(),
                             );
                             let cluster_color = if is_in_cluster { Colors::GREEN } else { Colors::TEXT_DIM };
-                            let cluster_bg = if is_in_cluster {
-                                Color32::from_rgba_premultiplied(0, 150, 0, 26)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            ui.painter().rect_filled(cluster_rect, egui::Rounding::same(2.0), cluster_bg);
+                            if is_in_cluster {
+                                ui.painter().rect_filled(cluster_rect, egui::Rounding::same(2.0), Color32::from_rgba_premultiplied(0, 120, 40, 28));
+                            }
                             ui.painter().rect_stroke(
                                 cluster_rect,
                                 egui::Rounding::same(2.0),
                                 egui::Stroke::new(1.0, if cluster_resp.hovered() { Colors::TEXT } else { cluster_color }),
                             );
-                            let icon_rect = egui::Rect::from_center_size(cluster_rect.center(), egui::vec2(10.0, 10.0));
-                            theme::draw_vector_icon(ui, icon_rect, theme::IconType::Network, cluster_color);
+                            let icon_r = egui::Rect::from_center_size(cluster_rect.center(), egui::vec2(9.0, 9.0));
+                            theme::draw_vector_icon(ui, icon_r, theme::IconType::Network, cluster_color);
                             if cluster_resp.clicked() {
                                 cluster_toggled = true;
                                 if is_in_cluster {
@@ -332,54 +344,100 @@ pub fn render_device_panel(
                             }
                             cluster_resp.on_hover_text("Toggle cluster membership");
 
-                            ui.add_space(2.0);
-                            theme::status_dot(ui, status_color);
-                            ui.add_space(2.0);
-                            
-                            // Sidebar Row Vector Icon
-                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            ui.add_space(6.0);
+
+                            // ── Device icon (colored by status) ───────────────────
+                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
                             let h_lower = device.hostname.to_lowercase();
                             let d_lower = device.display_name().to_lowercase();
-                            
-                            let device_type = telemetries.get(&device.id).map(|t| t.device_type.as_str()).unwrap_or("Desktop");
-                            let icon_type = if h_lower.contains("nubia") || d_lower.contains("nubia") || device_type == "Tablet" {
+                            let icon_type = if h_lower.contains("nubia") || d_lower.contains("nubia") || device_type_str == "Tablet" {
                                 theme::IconType::Tablet
-                            } else if h_lower.contains("nothing") || d_lower.contains("nothing") || device_type == "Smartphone" || device_type == "Phone" {
+                            } else if h_lower.contains("nothing") || d_lower.contains("nothing") || device_type_str == "Smartphone" || device_type_str == "Phone" {
                                 theme::IconType::Smartphone
                             } else {
-                                match device_type {
-                                    "Laptop" => theme::IconType::Laptop,
-                                    "Server" => theme::IconType::Server,
-                                    "Tablet" => theme::IconType::Tablet,
-                                    "Smartphone" => theme::IconType::Smartphone,
-                                    "Phone" => theme::IconType::Smartphone,
+                                match device_type_str {
+                                    "Laptop"     => theme::IconType::Laptop,
+                                    "Server"     => theme::IconType::Server,
+                                    "Tablet"     => theme::IconType::Tablet,
+                                    "Smartphone" | "Phone" => theme::IconType::Smartphone,
                                     "Chromebook" => theme::IconType::Chromebook,
                                     _ => theme::IconType::Desktop,
                                 }
                             };
                             theme::draw_vector_icon(ui, icon_rect, icon_type, status_color);
-                            
-                            ui.add_space(6.0);
+
+                            ui.add_space(8.0);
+
+                            // ── Text column ───────────────────────────────────────
                             ui.vertical(|ui| {
+                                // Row 1: device name (large, bold) + badges
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(device.display_name().to_uppercase())
-                                            .color(Colors::TEXT).size(10.0).strong()
+                                            .color(if is_selected { Colors::GREEN } else { Colors::TEXT })
+                                            .size(10.5).strong()
                                     );
-                                    
                                     if is_local {
-                                        ui.add_space(4.0);
-                                        ui.label(RichText::new("[LOCAL NODE]").color(Colors::GREEN).size(7.0).strong());
+                                        ui.add_space(3.0);
+                                        ui.label(RichText::new("[LOCAL]").color(Colors::GREEN).size(7.5).strong());
                                     }
                                 });
-                                ui.label(
-                                    RichText::new(device.primary_ip().unwrap_or("—"))
-                                        .color(Colors::TEXT_DIM).size(8.0)
-                                );
+
+                                // Row 2: tailscale hostname — clickable to copy
+                                if !ts_name.is_empty() {
+                                    let resp_name = ui.add(
+                                        egui::Label::new(
+                                            RichText::new(ts_name).color(Colors::TEXT_DIM).size(8.0)
+                                        ).sense(egui::Sense::click())
+                                    );
+                                    if resp_name.clicked() { copy_ts_name = true; }
+                                    resp_name.on_hover_text("Click to copy tailscale name");
+                                }
+
+                                // Row 3: tailscale IP — clickable to copy
+                                if !ts_ip.is_empty() {
+                                    let resp_ip = ui.add(
+                                        egui::Label::new(
+                                            RichText::new(ts_ip).color(Colors::TEXT_MUTED).size(8.0)
+                                        ).sense(egui::Sense::click())
+                                    );
+                                    if resp_ip.clicked() { copy_ts_ip = true; }
+                                    resp_ip.on_hover_text("Click to copy IP");
+                                }
+
+                                // Row 4: status badges
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    // Online / Offline badge
+                                    let (badge_text, badge_color) = match status {
+                                        crate::app::NodeStatus::GridActive => ("⬡ ONLINE", Colors::GREEN),
+                                        crate::app::NodeStatus::Reachable  => ("◌ UP", Colors::AMBER),
+                                        crate::app::NodeStatus::Offline    => ("◯ OFFLINE", Colors::TEXT_MUTED),
+                                    };
+                                    ui.label(RichText::new(badge_text).color(badge_color).size(7.5).strong());
+
+                                    // AI badge
+                                    if is_ai {
+                                        let model_label = if let Some(m) = ai_model {
+                                            format!("⟁ AI:{}", m)
+                                        } else {
+                                            "⟁ AI".to_string()
+                                        };
+                                        ui.label(RichText::new(model_label).color(Colors::STATE_COMPUTE_PROVIDE).size(7.5));
+                                    }
+                                });
                             });
                         });
 
                     }).response;
+
+                // Copy-to-clipboard actions (after the frame so borrow is released)
+                if copy_ts_name {
+                    ui.output_mut(|o| o.copied_text = ts_name.to_string());
+                }
+                if copy_ts_ip {
+                    ui.output_mut(|o| o.copied_text = ts_ip.to_string());
+                }
 
                 if is_selected {
                     ui.painter().rect_filled(
@@ -1049,6 +1107,12 @@ pub struct SettingsState {
     pub connect_drive: bool,
     /// Set to true for one frame when user clicks "Index Drive"
     pub index_drive: bool,
+    /// If set, "PUSH TO NODE & RESTART" button is enabled; cleared after app reads it.
+    pub push_and_restart: bool,
+    /// IP of the remote node to push config to (set by app before opening modal for a remote device).
+    pub target_device_ip: Option<String>,
+    /// Device ID of the remote node.
+    pub target_device_id: Option<String>,
 }
 
 impl SettingsState {
@@ -1066,6 +1130,9 @@ impl SettingsState {
             google_client_secret: cfg.google_client_secret.clone().unwrap_or_default(),
             connect_drive: false,
             index_drive:   false,
+            push_and_restart: false,
+            target_device_ip: None,
+            target_device_id: None,
         }
     }
 }
@@ -1209,10 +1276,21 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
             egui::Frame::none()
                 .inner_margin(egui::Margin::symmetric(24.0, 16.0))
                 .show(ui, |ui| {
-                    if theme::primary_button(ui, "SAVE & REFRESH").clicked() {
-                        s.open = false;
-                        saved = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if theme::primary_button(ui, "SAVE & REFRESH").clicked() {
+                            s.open = false;
+                            saved = true;
+                        }
+                        if let Some(ref ip) = s.target_device_ip.clone() {
+                            let label = format!("PUSH TO {} & RESTART", ip);
+                            ui.add_space(8.0);
+                            if theme::primary_button(ui, &label).clicked() {
+                                s.open = false;
+                                saved = true;
+                                s.push_and_restart = true;
+                            }
+                        }
+                    });
                 });
         });
 

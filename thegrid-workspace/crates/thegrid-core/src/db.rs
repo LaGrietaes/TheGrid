@@ -679,6 +679,20 @@ impl Database {
         Ok(n.max(0) as usize)
     }
 
+    /// Returns (total_files, total_size_bytes, device_count) for the storage overview command.
+    pub fn get_storage_stats(&self) -> Result<(u64, u64, u64)> {
+        let total_files: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files", [], |r| r.get(0),
+        ).unwrap_or(0);
+        let total_size: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM files WHERE size IS NOT NULL", [], |r| r.get(0),
+        ).unwrap_or(0);
+        let device_count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT device_id) FROM files", [], |r| r.get(0),
+        ).unwrap_or(0);
+        Ok((total_files.max(0) as u64, total_size.max(0) as u64, device_count.max(0) as u64))
+    }
+
     pub fn get_files_needing_hash(&self, limit: usize) -> Result<Vec<(i64, PathBuf)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, path FROM files 

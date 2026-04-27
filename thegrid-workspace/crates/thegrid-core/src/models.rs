@@ -153,10 +153,20 @@ pub struct TailscaleDevice {
 }
 
 impl TailscaleDevice {
+    /// Returns the best routable IP: prefers the Tailscale IPv4 (`100.x`),
+    /// falls back to the IPv6 Tailscale range (`fd7a:`), then any address.
     pub fn primary_ip(&self) -> Option<&str> {
-        self.addresses.iter()
-            .find(|a| a.starts_with("100."))
-            .map(|s| s.split('/').next().unwrap_or(s))
+        fn strip(s: &str) -> &str { s.split('/').next().unwrap_or(s) }
+        // 1. Tailscale IPv4 (always preferred — works with ping/http)
+        if let Some(a) = self.addresses.iter().find(|a| a.starts_with("100.")) {
+            return Some(strip(a));
+        }
+        // 2. Tailscale IPv6 (fd7a:) — still routable on the tailnet
+        if let Some(a) = self.addresses.iter().find(|a| a.starts_with("fd7a:") || a.starts_with("fd")) {
+            return Some(strip(a));
+        }
+        // 3. Any address — surface it so the device is visible even if unusual
+        self.addresses.first().map(|a| strip(a))
     }
 
     pub fn is_likely_online(&self) -> bool {

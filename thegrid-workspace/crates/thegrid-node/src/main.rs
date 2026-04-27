@@ -32,11 +32,13 @@ const ANSI_WHITE: &str = "\x1B[37m";
 const COMMAND_REGISTRY: &[(&str, &str)] = &[
     ("help", "Show command list"),
     ("devices", "Refresh connected device list"),
-    ("ping <ip|#>", "Ping device + agent"),
-    ("pingdev <ip|#>", "Ping device endpoint"),
-    ("pingagent <ip|#>", "Ping agent endpoint"),
+    ("ping <ip|#|name>", "Ping device + agent"),
+    ("pingdev <ip|#|name>", "Ping device endpoint"),
+    ("pingagent <ip|#|name>", "Ping agent endpoint"),
     ("mesh [status]", "Sync health overview"),
-    ("mesh sync <ip|#>", "Trigger sync to device"),
+    ("mesh sync <ip|#|name>", "Trigger sync to device"),
+    ("scan [path]", "Index a path (or all watch_paths)"),
+    ("storage", "Storage stats: files indexed, size, dupes"),
     ("dupes", "Scan and report duplicate files"),
     ("history | !! | !N", "Command history and replay"),
     ("update", "Check latest release"),
@@ -67,6 +69,8 @@ enum ParsedCommand<'a> {
     PingDevice,
     PingAgent,
     Mesh,
+    Scan,
+    Storage,
     Dupes,
     History,
     Update,
@@ -83,6 +87,8 @@ fn parse_command(token: &str) -> ParsedCommand<'_> {
         "pingdev" => ParsedCommand::PingDevice,
         "pingagent" => ParsedCommand::PingAgent,
         "mesh" => ParsedCommand::Mesh,
+        "scan" | "index" => ParsedCommand::Scan,
+        "storage" | "store" => ParsedCommand::Storage,
         "dupes" | "duplicates" => ParsedCommand::Dupes,
         "history" => ParsedCommand::History,
         "update" => ParsedCommand::Update,
@@ -763,21 +769,38 @@ fn resolve_history_alias(
     Some(effective_cmd)
 }
 
+/// Resolves a command target (<ip>, <#index>, or <device name>) to (label, ip).
+/// Name matching: exact first, then case-insensitive substring; falls back to treating as IP.
 fn resolve_ping_target(target: &str, ui_state: &Arc<Mutex<TuiState>>) -> Option<(String, String)> {
+    // Numeric index
     if let Ok(idx) = target.parse::<usize>() {
-        if let Ok(s) = ui_state.lock() {
-            if idx == 0 || idx > s.devices.len() {
-                None
-            } else {
-                let (name, ip) = s.devices[idx - 1].clone();
-                Some((format!("#{} {}", idx, name), ip))
-            }
-        } else {
-            None
+        let guard = ui_state.lock().ok()?;
+        if idx == 0 || idx > guard.devices.len() {
+            return None;
         }
-    } else {
-        Some((target.to_string(), target.to_string()))
+        let (name, ip) = guard.devices[idx - 1].clone();
+        return Some((format!("#{} {}", idx, name), ip));
     }
+
+    // Name match (exact then substring, case-insensitive)
+    if let Ok(guard) = ui_state.lock() {
+        let lower = target.to_ascii_lowercase();
+        // Exact name match
+        for (i, (name, ip)) in guard.devices.iter().enumerate() {
+            if name.to_ascii_lowercase() == lower {
+                return Some((format!("#{} {}", i + 1, name), ip.clone()));
+            }
+        }
+        // Substring match
+        for (i, (name, ip)) in guard.devices.iter().enumerate() {
+            if name.to_ascii_lowercase().contains(&lower) {
+                return Some((format!("#{} {}", i + 1, name), ip.clone()));
+            }
+        }
+    }
+
+    // Fallback: treat as raw IP
+    Some((target.to_string(), target.to_string()))
 }
 
 // S2-C2: isolate command execution from the main loop for safer incremental CLI growth.
@@ -886,6 +909,44 @@ fn execute_command(
                     }
                 }
             }
+        }
+        ParsedCommand::Scan => {
+            let explicit_path = parts.get(1).map(|p| std::path::PathBuf::from(p));
+            let cfg = runtime.config.lock().unwrap().clone();
+            let device_id   = cfg.device_name.clone();
+            let device_name = cfg.device_name.clone();
+            if let Some(path) = explicit_path {
+                emit(ui_state, tui_mode, "▶", "INDEX", format!("Scanning {}", path.display()));
+                runtime.spawn_index_directory(path, device_id, device_name);
+            } else if cfg.watch_paths.is_empty() {
+                emit(ui_state, tui_mode, "⚠", "INDEX", "No watch_paths configured. Use: scan <path>");
+            } else {
+                emit(ui_state, tui_mode, "▶", "INDEX",
+                    format!("Scanning {} watch path(s)…", cfg.watch_paths.len()));
+                runtime.spawn_index_directories(cfg.watch_paths, device_id, device_name);
+            }
+        }
+        ParsedCommand::Storage => {
+            let cfg = runtime.config.lock().unwrap().clone();
+            emit(ui_state, tui_mode, "ℹ", "STORE",
+                format!("Watch paths: {}", if cfg.watch_paths.is_empty() { "none".to_string() }
+                    else { cfg.watch_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ") }));
+            if let Ok(db) = runtime.db.lock() {
+                match db.get_storage_stats() {
+                    Ok((files, size_bytes, devices)) => {
+                        let size_mb = size_bytes / 1_048_576;
+                        emit(ui_state, tui_mode, "ℹ", "STORE",
+                            format!("{} files indexed  |  {} MB total  |  {} device(s)", files, size_mb, devices));
+                    }
+                    Err(e) => emit(ui_state, tui_mode, "⚠", "STORE", format!("DB query failed: {}", e)),
+                }
+                match db.count_files_needing_hash() {
+                    Ok(n) if n > 0 => emit(ui_state, tui_mode, "ℹ", "STORE",
+                        format!("{} file(s) still need hashing — run 'dupes' after", n)),
+                    _ => {}
+                }
+            }
+            emit(ui_state, tui_mode, "ℹ", "STORE", "Run 'scan' to index, 'dupes' to find duplicates");
         }
         // Duplicate file detection — triggers async scan; results arrive via DuplicatesFound event
         ParsedCommand::Dupes => {
@@ -1218,6 +1279,9 @@ fn main() -> Result<()> {
 
     emit(&ui_state, tui_mode, "▶", "RUNTIME", "Services started. Press Ctrl+C to stop.");
 
+    // Auto-discover peers on startup without requiring the user to type 'devices'.
+    runtime.spawn_load_devices();
+
     {
         let cfg = runtime.config.lock().unwrap().clone();
         if cfg.watch_paths.is_empty() {
@@ -1256,6 +1320,8 @@ fn main() -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
     spawn_command_reader(cmd_tx, Arc::clone(&running));
     let mut last_render = Instant::now();
+    // Refresh device list automatically every 60 s in TUI mode.
+    let mut last_device_refresh = Instant::now();
 
     if tui_mode {
         if let Ok(s) = ui_state.lock() {
@@ -1272,17 +1338,44 @@ fn main() -> Result<()> {
             }
         }
 
+        // Periodic silent device refresh (TUI mode only, every 60 s).
+        if tui_mode && last_device_refresh.elapsed() >= Duration::from_secs(60) {
+            runtime.spawn_load_devices();
+            last_device_refresh = Instant::now();
+        }
+
         // Drain events
         while let Ok(event) = rx.try_recv() {
             match event {
                 AppEvent::DevicesLoaded(devices) => {
-                    if let Ok(mut s) = ui_state.lock() {
+                    let peer_ips: Vec<String>;
+                    let mut no_ip: Vec<String> = Vec::new();
+                    {
+                        let mut s = ui_state.lock().unwrap();
                         s.devices = devices
                             .iter()
-                            .filter_map(|d| d.primary_ip().map(|ip| (d.display_name().to_string(), ip.to_string())))
+                            .filter_map(|d| {
+                                if let Some(ip) = d.primary_ip() {
+                                    Some((d.display_name().to_string(), ip.to_string()))
+                                } else {
+                                    no_ip.push(d.display_name().to_string());
+                                    None
+                                }
+                            })
                             .collect();
+                        peer_ips = s.devices.iter().map(|(_, ip)| ip.clone()).collect();
                     }
-                    emit(&ui_state, tui_mode, "✓", "DEVICES", format!("Loaded {} devices", devices.len()));
+                    emit(&ui_state, tui_mode, "✓", "DEVICES",
+                        format!("Loaded {} device(s) from tailnet", devices.len()));
+                    // Warn about any device that has no routable IP (e.g., never connected to Tailscale).
+                    for name in &no_ip {
+                        emit(&ui_state, tui_mode, "⚠", "DEVICES",
+                            format!("{}: no Tailscale IP — device may not be connected to tailnet", name));
+                    }
+                    // Auto-ping all discovered peers (silent — only updates node_status dot).
+                    for ip in peer_ips {
+                        runtime.spawn_ping(ip, false);
+                    }
                 }
                 AppEvent::DevicesFailed(err) => {
                     emit(&ui_state, tui_mode, "⚠", "DEVICES", format!("Load failed: {}", err));
@@ -1359,20 +1452,20 @@ fn main() -> Result<()> {
                     log::warn!("EnableRdp received: RDP enablement is not supported on this headless node.");
                 }
                 AppEvent::AgentPingOk { ip, response, manual } => {
+                    if let Ok(mut s) = ui_state.lock() {
+                        s.node_status.insert(ip.clone(), true);
+                        if manual { s.ping_ok += 1; }
+                    }
                     if manual {
-                        if let Ok(mut s) = ui_state.lock() {
-                            s.ping_ok += 1;
-                            s.node_status.insert(ip.clone(), true);
-                        }
                         emit(&ui_state, tui_mode, "✓", "PING", format!("{} OK (auth={})", ip, response.authorized));
                     }
                 }
                 AppEvent::AgentPingFailed { ip, error, manual } => {
+                    if let Ok(mut s) = ui_state.lock() {
+                        s.node_status.insert(ip.clone(), false);
+                        if manual { s.ping_fail += 1; }
+                    }
                     if manual {
-                        if let Ok(mut s) = ui_state.lock() {
-                            s.ping_fail += 1;
-                            s.node_status.insert(ip.clone(), false);
-                        }
                         emit(&ui_state, tui_mode, "⚠", "PING", format!("{} failed: {}", ip, error));
                     }
                 }
@@ -1421,7 +1514,13 @@ fn main() -> Result<()> {
                     emit(&ui_state, tui_mode, "✓", "INDEX", format!("Complete: {} files in {} ms", files_added, duration_ms));
                 }
                 AppEvent::Status(msg) => {
-                    if msg.starts_with("db_error:") {
+                    if msg.starts_with("restart_requested:") {
+                        emit(&ui_state, tui_mode, "↻", "RESTART", "Remote config saved — restarting node…");
+                        match restart_current_node_process(None) {
+                            Ok(_) => running.store(false, Ordering::Relaxed),
+                            Err(e) => emit(&ui_state, tui_mode, "⚠", "RESTART", format!("Restart failed: {}", e)),
+                        }
+                    } else if msg.starts_with("db_error:") {
                         emit(&ui_state, tui_mode, "⚠", "DB", &msg["db_error:".len()..]);
                     } else if msg.starts_with("agent_start_failed:") {
                         let parts: Vec<&str> = msg.splitn(3, ':').collect();
