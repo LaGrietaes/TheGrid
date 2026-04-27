@@ -63,21 +63,26 @@ pub fn apply(ctx: &Context) {
 }
 
 fn configure_fonts(ctx: &Context) {
-    // egui ships with a bundled monospace font (Hack).
-    // We use it for all text to enforce the terminal aesthetic.
-    // Phase 2 enhancement: embed JetBrains Mono as bytes and install it here.
-    //
-    // To embed a custom font:
-    //   let font_data = egui::FontData::from_static(include_bytes!("../fonts/JetBrainsMono-Regular.ttf"));
-    //   fonts.font_data.insert("JetBrainsMono".to_owned(), font_data);
-    //   fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "JetBrainsMono".to_owned());
-    //   fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "JetBrainsMono".to_owned());
-    //   ctx.set_fonts(fonts);
+    let mut fonts = egui::FontDefinitions::default();
 
-    let fonts = egui::FontDefinitions::default();
-    
-    // Use default egui fonts (Hack for Monospace, Proportional for others)
-    // We don't need explicit fallbacks now that we use Vector graphics for all symbols.
+    // Register the Phosphor icon font (1,000+ vector icons).
+    // add_to_fonts inserts the font data and appends "phosphor" to the
+    // Proportional family as a fallback.
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+
+    // Our app uses Monospace everywhere, so push phosphor there too so that
+    // any label containing phosphor PUA chars will fall back to this font.
+    if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
+        mono.push("phosphor".to_owned());
+    }
+
+    // Also register as a named family so callers can force phosphor rendering:
+    //   FontId::new(size, FontFamily::Name("phosphor".into()))
+    fonts.families
+        .entry(FontFamily::Name("phosphor".into()))
+        .or_default()
+        .push("phosphor".to_owned());
+
     ctx.set_fonts(fonts);
 
     // Override the default text style sizes to monospace at our scale

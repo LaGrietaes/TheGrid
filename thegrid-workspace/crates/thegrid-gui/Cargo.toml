@@ -31,6 +31,8 @@ eframe        = { version = "0.27", default-features = false, features = ["wgpu"
 egui          = "0.27"
 egui_extras   = { version = "0.27", features = ["image", "svg"] }
 egui_tiles    = "0.8"
+# Phosphor icon font — 1000+ clean vector icons, works with egui 0.27
+egui-phosphor = { version = "0.5", features = ["regular"] }
 open        = "2.0"
 get_if_addrs = "0.5"
 semver       = "1"
@@ -57,6 +59,9 @@ uuid          = { version = "1.7", features = ["v4"] }
 
 # Image processing (used for loading window icon)
 image         = "0.24"
+
+# Adobe PSD file decoding — extracts merged composite for preview
+psd           = "0.3"
 
 [build-dependencies]
 winres = "0.1"

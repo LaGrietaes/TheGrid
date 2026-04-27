@@ -574,16 +574,23 @@ pub enum FileViewMode {
     Grid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum FileSortField {
+    #[default]
+    Name,
+    Type,
+    Size,
+    Date,
+}
+
 #[allow(dead_code)]
 pub struct FileManagerState {
     pub current_path:    std::path::PathBuf,
     pub selected_files:  std::collections::HashSet<String>,
     pub view_mode:       FileViewMode,
-    pub _show_hidden:    bool,
-    pub _last_refresh:   Option<std::time::Instant>,
     pub filter_query:    String,
-    pub sort_by_name:    bool,
     pub sort_ascending:  bool,
+    pub sort_field:      crate::app::FileSortField,
     /// Preview: the name of the file currently being previewed
     pub preview_file:    Option<String>,
     /// Preview: raw bytes content (comes from the agent)
@@ -592,6 +599,22 @@ pub struct FileManagerState {
     pub preview_texture: Option<egui::TextureHandle>,
     /// Active SmartRule ID for filtering the current view
     pub active_rule:     Option<String>,
+    /// Inline rename: name of the file being renamed (if any)
+    pub rename_target:   Option<String>,
+    /// Inline rename: current edit buffer
+    pub rename_buffer:   String,
+    /// Filter strip: comma-separated extension filter, e.g. "rs,py,md"
+    pub filter_type:        String,
+    /// Filter strip: minimum file size in KB (text input)
+    pub filter_min_size_kb: String,
+    /// Filter strip: maximum file size in KB (text input)
+    pub filter_max_size_kb: String,
+    /// Filter strip: modified-after date "YYYY-MM-DD"
+    pub filter_date_after:  String,
+    /// Filter strip: modified-before date "YYYY-MM-DD"
+    pub filter_date_before: String,
+    /// Whether the big inline content-preview panel is expanded
+    pub inline_preview_open: bool,
     pub duplicate_min_size_mb: u64,
     pub duplicate_ext_filter: String,
     pub duplicate_path_filter: String,
@@ -607,15 +630,21 @@ impl Default for FileManagerState {
             current_path:    std::path::PathBuf::new(),
             selected_files:  std::collections::HashSet::new(),
             view_mode:       FileViewMode::List,
-            _show_hidden:    false,
-            _last_refresh:   None,
             filter_query:    String::new(),
-            sort_by_name:    true,
             sort_ascending:  true,
+            sort_field:      crate::app::FileSortField::Name,
             preview_file:    None,
             preview_content: None,
             preview_texture: None,
             active_rule:     None,
+            rename_target:   None,
+            rename_buffer:   String::new(),
+            filter_type:        String::new(),
+            filter_min_size_kb: String::new(),
+            filter_max_size_kb: String::new(),
+            filter_date_after:  String::new(),
+            filter_date_before: String::new(),
+            inline_preview_open: false,
             duplicate_min_size_mb: 0,
             duplicate_ext_filter: String::new(),
             duplicate_path_filter: String::new(),
@@ -630,10 +659,12 @@ impl Default for FileManagerState {
 
 #[derive(Default)]
 pub struct ViewportState {
-    pub active_file: Option<FileSearchResult>,
-    pub content:     String,
-    pub is_loading:  bool,
+    pub active_file:  Option<FileSearchResult>,
+    pub content:      String,
+    pub is_loading:   bool,
     pub preview_kind: PreviewKind,
+    /// Cached texture for Image/Psd previews — loaded lazily in viewport.rs
+    pub texture:      Option<egui::TextureHandle>,
 }
 
 impl TheGridApp {
@@ -1200,7 +1231,6 @@ impl TheGridApp {
         });
     }
 
-    #[allow(dead_code)]
     fn spawn_fm_rename(&self, ip: String, _device_id: String, old_path: String, new_name: String) {
         let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
@@ -1216,7 +1246,6 @@ impl TheGridApp {
         });
     }
 
-    #[allow(dead_code)]
     fn spawn_fm_move(&self, ip: String, _device_id: String, paths: Vec<String>, dest_dir: PathBuf) {
         let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
@@ -2735,12 +2764,14 @@ impl TheGridApp {
                     self.viewport.active_file = Some(file.clone());
                     self.viewport.is_loading = true;
                     self.viewport.content.clear();
+                    self.viewport.texture = None; // invalidate cached texture
                     self.spawn_fetch_preview(file);
                 }
                 AppEvent::FilePreviewLoaded { file_id: _, content, kind } => {
                     self.viewport.is_loading = false;
                     self.viewport.content = content;
                     self.viewport.preview_kind = kind;
+                    self.viewport.texture = None; // will be loaded lazily in viewport.rs
                 }
 
                 // ── Compute sharing ───────────────────────────────────────────
@@ -2795,6 +2826,11 @@ impl TheGridApp {
                     }
                     // Seed anchor suggestions only for files not already decided
                     self.dedup_review_state.seed_from_groups(&groups);
+                    // Sync legacy Storage-tab view (duplicate_groups uses the flat tuple format)
+                    self.duplicate_groups = groups.iter()
+                        .map(|g| (g.hash.clone(), g.size, g.files.clone()))
+                        .collect();
+                    self.duplicate_last_scan = Some(chrono::Utc::now().timestamp());
                     self.rich_duplicate_groups = groups;
                     self.push_toast(Toast::info(format!("{} duplicate groups found", self.rich_duplicate_groups.len())));
                 }
@@ -2804,6 +2840,13 @@ impl TheGridApp {
                     // Stored actions override anchor suggestions — apply first, then fill gaps
                     self.dedup_review_state.apply_stored_actions(&stored_actions);
                     self.dedup_review_state.seed_from_groups(&groups);
+                    // Sync legacy Storage-tab view
+                    self.duplicate_groups = groups.iter()
+                        .map(|g| (g.hash.clone(), g.size, g.files.clone()))
+                        .collect();
+                    if self.duplicate_last_scan.is_none() {
+                        self.duplicate_last_scan = Some(chrono::Utc::now().timestamp());
+                    }
                     self.rich_duplicate_groups = groups;
                     self.set_status(format!("{} duplicate groups restored", self.rich_duplicate_groups.len()));
                 }
@@ -2923,8 +2966,12 @@ impl TheGridApp {
             // Determine PreviewKind based on extension
             let ext = file.ext.clone().unwrap_or_default().to_lowercase();
             let kind = match ext.as_str() {
-                "txt" | "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "md" | "json" | "toml" | "yaml" | "yml" | "iss" | "ps1" => PreviewKind::Text,
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" => PreviewKind::Image,
+                "txt" | "rs" | "py" | "js" | "ts" | "c" | "cpp" | "h" | "md"
+                | "json" | "toml" | "yaml" | "yml" | "iss" | "ps1" | "log"
+                | "csv" | "xml" | "html" | "css" | "ini" | "cfg" | "conf" => PreviewKind::Text,
+                "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg"
+                | "tiff" | "tif" | "ico" => PreviewKind::Image,
+                "psd" => PreviewKind::Psd,
                 "pdf" => PreviewKind::Pdf,
                 _ => PreviewKind::UnSupported
             };
@@ -3545,6 +3592,19 @@ impl TheGridApp {
             self.spawn_fm_delete(ip.to_string(), device_id.to_string(), paths);
         }
 
+        if let Some((old_name, new_name)) = actions.fm_rename {
+            let old_path = self.file_manager.current_path.join(&old_name)
+                .to_string_lossy().to_string();
+            self.spawn_fm_rename(ip.to_string(), device_id.to_string(), old_path, new_name);
+        }
+
+        if let Some((paths, dest)) = actions.fm_move {
+            let full_paths: Vec<String> = paths.iter()
+                .map(|n| self.file_manager.current_path.join(n).to_string_lossy().to_string())
+                .collect();
+            self.spawn_fm_move(ip.to_string(), device_id.to_string(), full_paths, dest);
+        }
+
         if let Some(path) = actions.browse_remote {
             let is_local = self.devices.iter()
                 .find(|d| d.id == device_id)
@@ -3605,6 +3665,22 @@ impl TheGridApp {
 
         if actions.load_timeline {
             self.spawn_load_timeline();
+        }
+
+        if let Some(entry) = actions.open_timeline_entry {
+            // Navigate the file manager to the file's directory and select it for preview
+            let file_path = std::path::PathBuf::from(&entry.path);
+            if let Some(dir) = file_path.parent() {
+                self.file_manager.current_path = dir.to_path_buf();
+                self.file_manager.selected_files.clear();
+                self.file_manager.selected_files.insert(entry.name.clone());
+                self.file_manager.preview_file = Some(entry.name.clone());
+                self.file_manager.preview_content = None;
+                self.file_manager.preview_texture = None;
+                // Switch to the Files tab so the preview is visible
+                self.active_tab = crate::app::DashTab::Files;
+                self.spawn_preview_remote_file(ip.to_string(), file_path);
+            }
         }
 
         if actions.enable_rdp {
@@ -3952,7 +4028,6 @@ impl eframe::App for TheGridApp {
                 self.start_initial_watch_scans();
                 self.start_release_check();
                 self.render_titlebar(ctx);
-                self.render_navtabs(ctx);
                 self.render_statusbar(ctx);
                 self.render_footer_progress(ctx);
 
@@ -3966,13 +4041,15 @@ impl eframe::App for TheGridApp {
                     self.telemetry_cache.clone();
 
                 egui::SidePanel::left("devices_panel")
-                    .exact_width(240.0)
+                    .exact_width(200.0)
                     .resizable(false)
+                    .show_separator_line(false)
                     .frame(egui::Frame::none()
                         .fill(Colors::BG_PANEL)
-                        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+                        .inner_margin(egui::Margin::ZERO)
                     )
                     .show(ctx, |ui| {
+                        ui.set_max_width(200.0);
                         let devices_with_status: Vec<_> = self.devices.iter().map(|d| {
                             (d.clone(), self.get_node_status(&d.id))
                         }).collect();
@@ -4339,7 +4416,6 @@ impl eframe::App for TheGridApp {
                 self.start_initial_watch_scans();
                 self.start_release_check();
                 self.render_titlebar(ctx);
-                self.render_navtabs(ctx);
                 self.render_statusbar(ctx);
 
                 let telemetry_snap: HashMap<String, NodeTelemetry> =
@@ -4349,13 +4425,15 @@ impl eframe::App for TheGridApp {
                 let mut _device_clicked: Option<usize> = None;
                 let mut needs_refresh = false;
                 egui::SidePanel::left("devices_panel_proj")
-                    .exact_width(240.0)
+                    .exact_width(200.0)
                     .resizable(false)
+                    .show_separator_line(false)
                     .frame(egui::Frame::none()
                         .fill(Colors::BG_PANEL)
-                        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+                        .inner_margin(egui::Margin::ZERO)
                     )
                     .show(ctx, |ui| {
+                        ui.set_max_width(200.0);
                         let devices_with_status: Vec<_> = self.devices.iter().map(|d| {
                             (d.clone(), self.get_node_status(&d.id))
                         }).collect();
@@ -4432,7 +4510,6 @@ impl eframe::App for TheGridApp {
                 self.start_initial_watch_scans();
                 self.start_release_check();
                 self.render_titlebar(ctx);
-                self.render_navtabs(ctx);
                 self.render_statusbar(ctx);
 
                 let telemetry_snap: HashMap<String, NodeTelemetry> =
@@ -4441,13 +4518,15 @@ impl eframe::App for TheGridApp {
                 let mut _device_clicked: Option<usize> = None;
                 let mut needs_refresh = false;
                 egui::SidePanel::left("devices_panel_plan")
-                    .exact_width(240.0)
+                    .exact_width(200.0)
                     .resizable(false)
+                    .show_separator_line(false)
                     .frame(egui::Frame::none()
                         .fill(Colors::BG_PANEL)
-                        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+                        .inner_margin(egui::Margin::ZERO)
                     )
                     .show(ctx, |ui| {
+                        ui.set_max_width(200.0);
                         let devices_with_status: Vec<_> = self.devices.iter().map(|d| {
                             (d.clone(), self.get_node_status(&d.id))
                         }).collect();

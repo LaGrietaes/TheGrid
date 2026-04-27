@@ -1,18 +1,18 @@
-﻿// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-// views/dashboard.rs â€” Main Application Dashboard  [v0.2 â€” Phase 2]
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// views/dashboard.rs -- Main Application Dashboard  [v0.2 -- Phase 2]
 //
 // FIXES from v0.1:
 //   âœ“ render_actions/files/clipboard_tab now take `s: &mut DetailState`
-//     (was `&DetailState` â€” can't get &mut String fields through & reference)
+//     (was `&DetailState` -- can't get &mut String fields through & reference)
 //   âœ“ egui::ComboBox::from_id_source â†’ from_id_source  (egui 0.27 deprecation)
 //   âœ“ FileTransferStatus::Failed(e) â†’ Failed(_)  (unused variable warning)
 //   âœ“ DetailActions::download_file: Option<String> for per-file downloads
 //   âœ“ id_source â†’ id_source on all ScrollAreas
 //
 // NEW in v0.2:
-//   + SettingsState + render_settings_modal  â€” in-app config modal
-//   + watch_paths field in DetailState       â€” Phase 2 watcher UI
-//   + Refresh button moved into device panel â€” removes it from &self titlebar
+//   + SettingsState + render_settings_modal  -- in-app config modal
+//   + watch_paths field in DetailState       -- Phase 2 watcher UI
+//   + Refresh button moved into device panel -- removes it from &self titlebar
 //   + Remote file list: each â†“ button returns the filename via DetailActions
 //   + Clipboard inbox items: click to populate clip_out for inspection
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -33,7 +33,7 @@ pub enum DashTab {
     #[default] Actions,
     Files,
     Clipboard,
-    /// Phase 3: The Flow â€” temporal file activity view
+    /// Phase 3: The Flow -- temporal file activity view
     Timeline,
     /// New in Node Enhancement: Remote Terminal
     Terminal,
@@ -44,7 +44,7 @@ pub enum DashTab {
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// DetailState â€” all mutable references the detail panel needs
+// DetailState -- all mutable references the detail panel needs
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 pub struct DetailState<'a> {
@@ -94,7 +94,7 @@ pub struct DetailState<'a> {
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// DetailActions â€” returned from render_detail_panel each frame
+// DetailActions -- returned from render_detail_panel each frame
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[derive(Default)]
@@ -138,10 +138,12 @@ pub struct DetailActions {
     pub run_cross_source_scan: bool,
     pub export_drive_buffer:  bool,
     pub upload_drive_buffer:  bool,
-    #[allow(dead_code)]
-    pub _fm_rename:            Option<(String, String)>,
-    #[allow(dead_code)]
-    pub _fm_move:              Option<(Vec<String>, std::path::PathBuf)>,
+    /// Timeline: user clicked a file entry — navigate to its owning device for preview
+    pub open_timeline_entry: Option<thegrid_core::models::TemporalEntry>,
+    /// File manager: rename single selected file (old_name, new_name)
+    pub fm_rename: Option<(String, String)>,
+    /// File manager: move selected files to a destination directory
+    pub fm_move:   Option<(Vec<String>, std::path::PathBuf)>,
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -188,6 +190,9 @@ pub fn render_device_panel(
 ) -> NavPanelResult {
     let mut result = NavPanelResult::default();
 
+    // Clamp layout width so nothing inside can push the panel wider
+    ui.set_max_width(ui.available_width());
+
     fn is_local_device(device: &TailscaleDevice, local_device_name: &str) -> bool {
         device.hostname.eq_ignore_ascii_case(local_device_name)
             || device.name.eq_ignore_ascii_case(local_device_name)
@@ -198,13 +203,13 @@ pub fn render_device_panel(
     // -- Logo header --
     egui::Frame::none()
         .fill(Color32::from_rgb(0, 8, 2))
-        .inner_margin(egui::Margin::symmetric(0.0, 8.0))
+        .inner_margin(egui::Margin::symmetric(0.0, 4.0))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.vertical_centered(|ui| {
                 ui.add(
                     egui::Image::new(egui::include_image!("../../assets/TheGridLogo.svg"))
-                        .fit_to_exact_size(egui::vec2(80.0, 80.0))
+                        .fit_to_exact_size(egui::vec2(48.0, 48.0))
                         .maintain_aspect_ratio(true),
                 );
             });
@@ -351,9 +356,9 @@ pub fn render_device_panel(
                                     }
                                     if is_ai {
                                         let ai_lbl = if let Some(m) = ai_model {
-                                            format!("âŸ{}", m)
+                                            format!("{} {}", egui_phosphor::regular::BRAIN, m)
                                         } else {
-                                            "âŸAI".to_string()
+                                            format!("{} AI", egui_phosphor::regular::BRAIN)
                                         };
                                         ui.label(RichText::new(ai_lbl).color(Colors::STATE_COMPUTE_PROVIDE).size(6.5));
                                     }
@@ -368,18 +373,19 @@ pub fn render_device_panel(
                                             ).sense(egui::Sense::click())
                                         );
                                         if ip_resp.clicked() { copy_ts_ip = true; }
-                                        ip_resp.on_hover_text(format!("{ts_name}  â€”  click to copy IP"));
+                                        ip_resp.on_hover_text(format!("{ts_name}  --  click to copy IP"));
                                     }
-                                    let (badge_text, badge_color) = match status {
-                                        crate::app::NodeStatus::GridActive => ("â¬¡ ONLINE", Colors::GREEN),
-                                        crate::app::NodeStatus::Reachable  => ("â—Œ UP",     Colors::AMBER),
-                                        crate::app::NodeStatus::Offline    => ("â—¯ OFF",    Colors::TEXT_MUTED),
+                                    let (badge_icon, badge_label, badge_color) = match status {
+                                        crate::app::NodeStatus::GridActive => (egui_phosphor::regular::CHECK_CIRCLE, "ONLINE", Colors::GREEN),
+                                        crate::app::NodeStatus::Reachable  => (egui_phosphor::regular::WIFI_HIGH,    "UP",     Colors::AMBER),
+                                        crate::app::NodeStatus::Offline    => (egui_phosphor::regular::CIRCLE,       "OFF",    Colors::TEXT_MUTED),
                                     };
-                                    ui.label(RichText::new(badge_text).color(badge_color).size(7.0));
+                                    let badge_text = format!("{} {}", badge_icon, badge_label);
+                                    ui.label(RichText::new(&badge_text).color(badge_color).size(7.0));
                                 });
                             });
 
-                            // Cluster indicator dot (far right) â€” Ctrl+click card to toggle
+                            // Cluster indicator dot (far right) -- Ctrl+click card to toggle
                             if is_in_cluster {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -544,10 +550,11 @@ pub fn render_device_panel(
     ui.add(egui::Separator::default().spacing(0.0));
 
     // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-    // WORKSPACE â€” unified Projects + Quick View + Planner preview block
+    // WORKSPACE -- unified Projects + Quick View + Planner preview block
     // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     ScrollArea::vertical()
         .id_source("nav_workspace_scroll")
+        .max_height(ui.available_height())
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
@@ -679,9 +686,10 @@ pub fn render_device_panel(
                 .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 5.0, bottom: 6.0 })
                 .show(ui, |ui| {
                     let avail = ui.available_width();
-                    // slot_inner_w: accounts for 4px gap, 2Ã—4px inner_margin, 2Ã—1px border per slot
-                    let slot_inner_w = ((avail - 4.0) / 2.0 - 10.0).max(10.0);
-                    let slot_h = 40.0;
+                    ui.set_max_width(avail);
+                    // slot_inner_w: accounts for 4px gap, 2×4px inner_margin per slot
+                    let slot_inner_w = ((avail - 4.0) / 2.0 - 8.0).max(10.0);
+                    let slot_h = 36.0;
 
                     for row in 0..2usize {
                         ui.horizontal(|ui| {
@@ -697,6 +705,7 @@ pub fn render_device_panel(
                                     .inner_margin(egui::Margin::symmetric(4.0, 3.0))
                                     .show(ui, |ui| {
                                         ui.set_min_size(egui::vec2(slot_inner_w, slot_h));
+                                        ui.set_max_width(slot_inner_w);
                                         if let Some(proj) = slot_proj {
                                             let eff_status = project_statuses.get(&proj.id).cloned()
                                                 .unwrap_or(crate::app::ProjectStatus::Planned);
@@ -769,7 +778,7 @@ pub fn render_device_panel(
                                 let is_active = *active_rule == Some(rule.id.clone());
                                 let color = if is_active { Colors::GREEN } else { Colors::TEXT_MUTED };
                                 let btn = egui::Button::new(
-                                    RichText::new(format!("â­ {}", rule.name.to_uppercase())).color(color).size(8.0)
+                                    RichText::new(format!("{} {}", egui_phosphor::regular::LIGHTNING, rule.name.to_uppercase())).color(color).size(8.0)
                                 ).fill(Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
                                  .min_size(egui::vec2(0.0, 16.0));
                                 if ui.add(btn).clicked() {
@@ -786,7 +795,7 @@ pub fn render_device_panel(
                 .fill(Colors::BG_PANEL)
                 .inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 7.0, bottom: 8.0 })
                 .show(ui, |ui| {
-                    // Section header â€” navigates to Planner screen
+                    // Section header -- navigates to Planner screen
                     ui.horizontal(|ui| {
                         let plan_active = active_screen == crate::app::Screen::Planner;
                         let hdr_btn = egui::Button::new(
@@ -853,10 +862,10 @@ pub fn render_device_panel(
                                     .inner_margin(egui::Margin::symmetric(2.0, 1.0))
                                     .show(ui, |ui| {
                                         let s = match task.status {
-                                            crate::app::PlannerTaskStatus::Todo       => "Â·",
-                                            crate::app::PlannerTaskStatus::InProgress => "â–¶",
-                                            crate::app::PlannerTaskStatus::Done       => "âœ“",
-                                            crate::app::PlannerTaskStatus::Blocked    => "âœ•",
+                                            crate::app::PlannerTaskStatus::Todo       => egui_phosphor::regular::CIRCLE,
+                                            crate::app::PlannerTaskStatus::InProgress => egui_phosphor::regular::PLAY,
+                                            crate::app::PlannerTaskStatus::Done       => egui_phosphor::regular::CHECK,
+                                            crate::app::PlannerTaskStatus::Blocked    => egui_phosphor::regular::X,
                                         };
                                         ui.label(RichText::new(s).color(col).size(7.5));
                                     });
@@ -867,7 +876,7 @@ pub fn render_device_panel(
                                 } else { task.title.clone() };
                                 ui.label(RichText::new(title_short).color(Colors::TEXT).size(8.5));
                                 if task.ai_suggested {
-                                    ui.label(RichText::new("âŸ").color(Colors::STATE_COMPUTE_PROVIDE).size(7.5));
+                                    ui.label(RichText::new(egui_phosphor::regular::BRAIN).color(Colors::STATE_COMPUTE_PROVIDE).size(7.5));
                                 }
                             });
                             ui.add_space(2.0);
@@ -875,7 +884,7 @@ pub fn render_device_panel(
                         if preview_tasks.len() > 5 {
                             ui.horizontal(|ui| {
                                 ui.add_space(8.0);
-                                ui.label(RichText::new(format!("â€¦+{} more", preview_tasks.len() - 5))
+                                ui.label(RichText::new(format!("+{} more", preview_tasks.len() - 5))
                                     .color(Colors::TEXT_MUTED).size(7.5).italics());
                             });
                         }
@@ -890,7 +899,7 @@ pub fn render_device_panel(
 // ACTIONS tab
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-// FIX: was `fn render_actions_tab(ui, s: &DetailState, ...)` â€” &DetailState
+// FIX: was `fn render_actions_tab(ui, s: &DetailState, ...)` -- &DetailState
 // cannot hand out &mut to its inner &'a mut String fields.
 // All three tab functions now take `s: &mut DetailState`.
 fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActions) {
@@ -937,7 +946,7 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
             .inner_margin(egui::Margin::symmetric(16.0, 12.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("âš ").color(Colors::AMBER).size(14.0));
+                    ui.label(RichText::new(egui_phosphor::regular::WARNING).color(Colors::AMBER).size(14.0));
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
                         ui.label(RichText::new("AGENT UNREACHABLE").color(Colors::TEXT).size(10.0).strong());
@@ -969,7 +978,7 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
             .inner_margin(egui::Margin::symmetric(16.0, 12.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("âš ").color(Colors::AMBER).size(14.0));
+                    ui.label(RichText::new(egui_phosphor::regular::WARNING).color(Colors::AMBER).size(14.0));
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
                         ui.label(RichText::new("REMOTE DESKTOP IS DISABLED").color(Colors::TEXT).size(10.0).strong());
@@ -1017,7 +1026,7 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
                         .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
                 )
                 .show_ui(&mut cols[1], |ui| {
-                    for opt in ["FULLSCREEN", "1920Ã—1080", "2560Ã—1440", "1280Ã—800"] {
+                    for opt in ["FULLSCREEN", "1920x1080", "2560x1440", "1280x800"] {
                         ui.selectable_value(s.rdp_resolution, opt.to_string(), opt);
                     }
                 });
@@ -1125,7 +1134,7 @@ fn render_node_info_section(ui: &mut Ui, device: &TailscaleDevice) {
         .show(ui, |ui| {
             for (k, v) in [
                 ("HOSTNAME", device.hostname.as_str()),
-                ("IP", device.primary_ip().unwrap_or("â€”")),
+                ("IP", device.primary_ip().unwrap_or("-")),
                 ("OS", device.os.as_str()),
                 ("CLIENT", device.client_version.as_str()),
                 ("USER", device.user.as_str()),
@@ -1142,7 +1151,7 @@ fn render_node_info_section(ui: &mut Ui, device: &TailscaleDevice) {
                     device
                         .last_seen
                         .map(|t| t.with_timezone(&chrono::Local).format("%d/%m/%y %H:%M").to_string())
-                        .unwrap_or_else(|| "â€”".into())
+                        .unwrap_or_else(|| "-".into())
                 )
                 .color(Colors::TEXT)
                 .size(MainScreenUiRules::INFO_VALUE_SIZE)
@@ -1161,7 +1170,7 @@ fn render_watched_paths_section(ui: &mut Ui, watch_paths: &[PathBuf], actions: &
     } else {
         for path in watch_paths {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("â—ˆ").color(Colors::GREEN).size(9.0));
+                ui.label(RichText::new(egui_phosphor::regular::CIRCLE).color(Colors::GREEN).size(9.0));
                 ui.add_space(4.0);
                 ui.label(RichText::new(path.display().to_string()).color(Colors::TEXT_DIM).size(9.0));
             });
@@ -1279,8 +1288,8 @@ fn render_files_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAction
                 let (label, color) = match &item.status {
                     FileTransferStatus::Pending   => ("PENDING", Colors::TEXT_MUTED),
                     FileTransferStatus::Sending   => ("SENDING", Colors::AMBER),
-                    FileTransferStatus::Done      => ("âœ“ DONE",  Colors::GREEN),
-                    FileTransferStatus::Failed(_) => ("âœ— FAIL",  Colors::RED),
+                    FileTransferStatus::Done      => ("\u{2713} DONE",  Colors::GREEN),
+                    FileTransferStatus::Failed(_) => ("\u{2717} FAIL",  Colors::RED),
                 };
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&item.name).color(Colors::TEXT).size(9.0));
@@ -1371,12 +1380,12 @@ fn render_clipboard_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailAc
 
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        if theme::secondary_button(ui, "â†‘ LOAD MY CLIPBOARD").clicked() {
+        if theme::secondary_button(ui, "<- LOAD MY CLIPBOARD").clicked() {
             actions.load_clipboard = true;
         }
         ui.add_space(8.0);
         ui.set_enabled(!s.clip_out.trim().is_empty());
-        if theme::primary_button(ui, "â‡’ TRANSMIT").clicked() {
+        if theme::primary_button(ui, "=> TRANSMIT").clicked() {
             actions.send_clipboard = true;
         }
     });
@@ -1567,7 +1576,7 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
                             |ui| {
                                 if ui.add(
                                     egui::Button::new(
-                                        RichText::new("âœ•").color(Colors::TEXT_DIM)
+                                        RichText::new(egui_phosphor::regular::X).color(Colors::TEXT_DIM)
                                     )
                                     .fill(Color32::TRANSPARENT)
                                     .frame(false)
@@ -1634,7 +1643,7 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
                     for (i, path) in s.watch_paths.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(path).desired_width(ui.available_width() - 30.0));
-                            if ui.button("âœ•").clicked() {
+                            if ui.button(egui_phosphor::regular::X).clicked() {
                                 to_remove = Some(i);
                             }
                         });
@@ -1878,7 +1887,7 @@ fn render_section_header_bar(ui: &mut Ui, title: &str, pct: f32, value: &str) {
 }
 
 fn render_telemetry_card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    // No fill/background â€” keeps the strip flat. Padding gives breathing room.
+    // No fill/background -- keeps the strip flat. Padding gives breathing room.
     // A bottom hairline acts as the section separator instead of a full box.
     egui::Frame::none().show(ui, |ui| {
         let card_target_h = ui.available_height().max(TelemetryUiRules::CARD_MIN_HEIGHT);
@@ -2185,7 +2194,7 @@ fn perf_scores(telem: &NodeTelemetry) -> (f32, f32, f32) {
 
 fn render_perf_hex(ui: &mut Ui, telem: &NodeTelemetry) {
     let (img, txt, code) = perf_scores(telem);
-    // No outer frame â€” sits flat inside the right panel column.
+    // No outer frame -- sits flat inside the right panel column.
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 36.0), egui::Sense::hover());
         let c = rect.center();
@@ -2225,7 +2234,7 @@ fn render_cpu_section(ui: &mut Ui, telem: &NodeTelemetry) {
         };
         render_section_header_bar(ui, "// CPU", cpu, &cpu_value);
 
-        // Temperature only â€” LP count is shown inside the core strip label
+        // Temperature only -- LP count is shown inside the core strip label
         if let Some(temp) = telem.cpu_temp {
             ui.label(RichText::new(format!("TEMP {:.0}C", temp)).color(Colors::TEXT_DIM).size(TelemetryUiRules::META_TEXT_SIZE));
         }
@@ -2340,7 +2349,7 @@ fn render_ram_gpu_section(ui: &mut Ui, telem: &NodeTelemetry) {
         }
         if let Some(mhz) = telem.ram_speed_mhz { ram_meta.push(format!("{}MHz", mhz)); }
         if !ram_meta.is_empty() {
-            ui.label(RichText::new(ram_meta.join("  â€¢  ")).color(Colors::TEXT_DIM).size(TelemetryUiRules::META_TEXT_SIZE));
+            ui.label(RichText::new(ram_meta.join("  |  ")).color(Colors::TEXT_DIM).size(TelemetryUiRules::META_TEXT_SIZE));
         }
 
         render_section_divider(ui);
@@ -2380,7 +2389,7 @@ fn render_ram_gpu_section(ui: &mut Ui, telem: &NodeTelemetry) {
             if dev.ai_capable { gpu_meta.push("AI".to_string()); }
             if let Some(bus) = &dev.bus_type { gpu_meta.push(bus.clone()); }
             if !gpu_meta.is_empty() {
-                ui.label(RichText::new(gpu_meta.join("  â€¢  ")).color(Colors::TEXT_DIM).size(TelemetryUiRules::META_TEXT_SIZE));
+                ui.label(RichText::new(gpu_meta.join("  |  ")).color(Colors::TEXT_DIM).size(TelemetryUiRules::META_TEXT_SIZE));
             }
         } else {
             ui.label(RichText::new("// GPU").color(Colors::GREEN).size(TelemetryUiRules::HEADER_TITLE_SIZE).strong());
@@ -2593,7 +2602,7 @@ fn render_ai_section(ui: &mut Ui, telem: &NodeTelemetry) {
     if telem.capabilities.has_rdp       { io_caps.push("RDP");   }
     if telem.capabilities.has_file_access { io_caps.push("FILES"); }
     if !io_caps.is_empty() {
-        ui.label(RichText::new(io_caps.join(" â€¢ ")).color(Colors::TEXT_MUTED).size(8.0));
+        ui.label(RichText::new(io_caps.join(" | ")).color(Colors::TEXT_MUTED).size(8.0));
     }
 }
 
@@ -2673,7 +2682,7 @@ fn render_identity_section(
                     .color(Colors::GREEN).size(10.5)
             );
             ui.label(
-                RichText::new(format!("{} Â· {}", s.device.os.to_uppercase(), s.device.client_version))
+                RichText::new(format!("{} / {}", s.device.os.to_uppercase(), s.device.client_version))
                     .color(Colors::TEXT_DIM).size(9.0)
             );
         });
@@ -2683,7 +2692,7 @@ fn render_identity_section(
     let seen_txt    = s.device.last_seen
         .map(|t| t.with_timezone(&chrono::Local).format("%d/%m/%y %H:%M").to_string())
         .unwrap_or_else(|| "N/A".to_string());
-    ui.label(RichText::new(format!("{} â€¢ INBOUND {}", auth_txt, inbound_txt)).color(Colors::TEXT_MUTED).size(8.0));
+    ui.label(RichText::new(format!("{} | INBOUND {}", auth_txt, inbound_txt)).color(Colors::TEXT_MUTED).size(8.0));
     ui.label(RichText::new(format!("SEEN {}  {}", seen_txt, s.device.user)).color(Colors::TEXT_MUTED).size(8.0));
     ui.horizontal(|ui| {
         let (dot_r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -2878,7 +2887,7 @@ fn fill_telemetry_columns_compact(cols: &mut [Ui], telem: &NodeTelemetry) {
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-// render_detail_panel_with_timeline â€” Phase 3 entry point
+// render_detail_panel_with_timeline -- Phase 3 entry point
 //
 // Extends render_detail_panel with the Timeline tab and telemetry gauges.
 // Called from app.rs instead of render_detail_panel when Phase 3 is active.
@@ -3102,9 +3111,8 @@ pub fn render_detail_panel_with_timeline(
                             }
                             let tl_action = crate::views::timeline::render(ui, timeline);
                             if tl_action.refresh { actions.load_timeline = true; }
-                            if tl_action.open_entry.is_some() {
-                                // Navigation handled in app.rs via actions
-                                // For now just show a toast â€” Phase 4 can deep-link to the file
+                            if let Some(entry) = tl_action.open_entry {
+                                actions.open_timeline_entry = Some(entry);
                             }
                         }
                         DashTab::Terminal  => render_terminal_tab(ui, s, &mut actions),
@@ -3468,7 +3476,7 @@ fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
                 let pct = (hashed as f32 / hash_total as f32 * 100.0).min(100.0);
                 ui.label(
                     RichText::new(format!(
-                        "âš   Hashing in progress: {}/{} files ({:.1}%) â€” {} still pending. Scan now for partial results or wait for completion.",
+                        "\u{26A0}  Hashing in progress: {}/{} files ({:.1}%) -- {} still pending. Scan now for partial results or wait for completion.",
                         hashed, hash_total, pct, remaining
                     ))
                     .color(Colors::AMBER).size(8.0)
@@ -3563,7 +3571,7 @@ fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
                 let (hashed, total) = s.hashing_progress;
                 if total > 0 && hashed < total {
                     format!(
-                        "No duplicates found in last scan. Note: {}/{} files still unhashed â€” more duplicates may appear once hashing is complete.",
+                        "No duplicates found in last scan. Note: {}/{} files still unhashed -- more duplicates may appear once hashing is complete.",
                         total - hashed, total
                     )
                 } else {
@@ -3574,7 +3582,7 @@ fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
             ui.add_space(6.0);
             ui.label(RichText::new(msg).color(Colors::TEXT_MUTED).size(8.0).italics());
         } else {
-            ui.label(RichText::new("DUPLICATE GROUPS â€” SELECT FILES TO DELETE").color(Colors::TEXT_DIM).size(8.0).strong());
+            ui.label(RichText::new("DUPLICATE GROUPS -- SELECT FILES TO DELETE").color(Colors::TEXT_DIM).size(8.0).strong());
                 ui.add_space(6.0);
 
                 // Snapshot display data so closures below don't borrow s
@@ -3633,7 +3641,7 @@ fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
                     for g in &display {
                         // Header row: expand arrow + summary
                         let arrow_clicked = ui.horizontal(|ui| {
-                            let arrow = if g.expanded { "â–¼" } else { "â–¶" };
+                            let arrow = if g.expanded { egui_phosphor::regular::CARET_DOWN } else { egui_phosphor::regular::PLAY };
                             let clicked = theme::micro_button(ui, arrow).clicked();
                             let header = format!(
                                 "[{}]  {} copies  |  {} each  |  wasted {:.1} MB",
@@ -3777,7 +3785,7 @@ fn render_storage_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
                             );
 
                             ui.add_space(8.0);
-                            if theme::secondary_button(ui, "â¬¡ SCAN DRIVE").clicked() {
+                            if theme::secondary_button(ui, "SCAN DRIVE").clicked() {
                                 actions.scan_remote = true;
                             }
                         });

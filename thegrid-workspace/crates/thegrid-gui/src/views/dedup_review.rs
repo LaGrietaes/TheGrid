@@ -8,9 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, RichText, ScrollArea, Ui};
-
 use thegrid_core::models::{DuplicateGroup, FileSearchResult, SourceType};
-
 use crate::theme::{Colors, danger_button, micro_button, primary_button, section_title};
 
 // ── Action per file ────────────────────────────────────────────────────────────
@@ -20,6 +18,22 @@ pub enum FileAction {
     Keep,
     Delete,
     Undecided,
+}
+
+// ── Sort field ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupSortField {
+    /// Wasted bytes = (copies - 1) × size_per_copy
+    Waste,
+    Name,
+    Type,
+    Size,
+    Date,
+}
+
+impl Default for DedupSortField {
+    fn default() -> Self { DedupSortField::Waste }
 }
 
 // ── Review state ───────────────────────────────────────────────────────────────
@@ -35,6 +49,22 @@ pub struct DedupReviewState {
     pub scanning:    bool,
     /// Last scan timestamp
     pub last_scan:   Option<std::time::Instant>,
+    // ── Filters ──────────────────────────────────────────────────────────────
+    /// Filename / path substring filter
+    pub filter_name:        String,
+    /// Comma-separated extension filter, e.g. "rs, py, png"
+    pub filter_type:        String,
+    /// Minimum file size (KB text input)
+    pub filter_min_size_kb: String,
+    /// Maximum file size (KB text input)
+    pub filter_max_size_kb: String,
+    /// Modified-after date "YYYY-MM-DD"
+    pub filter_date_after:  String,
+    /// Modified-before date "YYYY-MM-DD"
+    pub filter_date_before: String,
+    // ── Sort ─────────────────────────────────────────────────────────────────
+    pub sort_field: DedupSortField,
+    pub sort_asc:   bool,
 }
 
 impl Default for DedupReviewState {
@@ -45,6 +75,14 @@ impl Default for DedupReviewState {
             confirming: false,
             scanning:   false,
             last_scan:  None,
+            filter_name:        String::new(),
+            filter_type:        String::new(),
+            filter_min_size_kb: String::new(),
+            filter_max_size_kb: String::new(),
+            filter_date_after:  String::new(),
+            filter_date_before: String::new(),
+            sort_field: DedupSortField::Waste,
+            sort_asc:   false,  // biggest waste first by default
         }
     }
 }
@@ -145,6 +183,126 @@ pub fn render_dedup_review(
 
     ui.add(egui::Separator::default().spacing(0.0));
 
+    // ── Filter strip ──────────────────────────────────────────────────────────
+    egui::Frame::none()
+        .fill(Colors::BG_PANEL.gamma_multiply(0.85))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .inner_margin(egui::Margin::symmetric(10.0, 5.0))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+
+                // ── WASTE ────────────────────────────────────────────────────
+                let waste_active = state.sort_field == DedupSortField::Waste;
+                let waste_arrow  = if waste_active { if state.sort_asc { " ▲" } else { " ▼" } } else { " ·" };
+                let waste_lbl    = RichText::new(format!("WASTE{}", waste_arrow))
+                    .size(7.5).strong()
+                    .color(if waste_active { Colors::AMBER } else { Colors::TEXT_DIM });
+                if ui.add(egui::Label::new(waste_lbl).sense(egui::Sense::click())).clicked() {
+                    if waste_active { state.sort_asc = !state.sort_asc; }
+                    else { state.sort_field = DedupSortField::Waste; state.sort_asc = false; }
+                }
+
+                ui.separator();
+
+                // ── NAME ─────────────────────────────────────────────────────
+                let name_active = state.sort_field == DedupSortField::Name;
+                let name_arrow  = if name_active { if state.sort_asc { " ▲" } else { " ▼" } } else { " ·" };
+                let name_lbl    = RichText::new(format!("NAME{}", name_arrow))
+                    .size(7.5).strong()
+                    .color(if name_active { Colors::AMBER } else { Colors::TEXT_DIM });
+                if ui.add(egui::Label::new(name_lbl).sense(egui::Sense::click())).clicked() {
+                    if name_active { state.sort_asc = !state.sort_asc; }
+                    else { state.sort_field = DedupSortField::Name; state.sort_asc = true; }
+                }
+                ui.add(egui::TextEdit::singleline(&mut state.filter_name)
+                    .desired_width(90.0)
+                    .hint_text("path / filename…")
+                    .font(egui::FontId::new(8.5, egui::FontFamily::Monospace)));
+
+                ui.separator();
+
+                // ── TYPE ─────────────────────────────────────────────────────
+                let type_active = state.sort_field == DedupSortField::Type;
+                let type_arrow  = if type_active { if state.sort_asc { " ▲" } else { " ▼" } } else { " ·" };
+                let type_lbl    = RichText::new(format!("TYPE{}", type_arrow))
+                    .size(7.5).strong()
+                    .color(if type_active { Colors::AMBER } else { Colors::TEXT_DIM });
+                if ui.add(egui::Label::new(type_lbl).sense(egui::Sense::click())).clicked() {
+                    if type_active { state.sort_asc = !state.sort_asc; }
+                    else { state.sort_field = DedupSortField::Type; state.sort_asc = true; }
+                }
+                ui.add(egui::TextEdit::singleline(&mut state.filter_type)
+                    .desired_width(70.0)
+                    .hint_text("rs, py, png…")
+                    .font(egui::FontId::new(8.5, egui::FontFamily::Monospace)));
+
+                ui.separator();
+
+                // ── SIZE ─────────────────────────────────────────────────────
+                let size_active = state.sort_field == DedupSortField::Size;
+                let size_arrow  = if size_active { if state.sort_asc { " ▲" } else { " ▼" } } else { " ·" };
+                let size_lbl    = RichText::new(format!("SIZE{}", size_arrow))
+                    .size(7.5).strong()
+                    .color(if size_active { Colors::AMBER } else { Colors::TEXT_DIM });
+                if ui.add(egui::Label::new(size_lbl).sense(egui::Sense::click())).clicked() {
+                    if size_active { state.sort_asc = !state.sort_asc; }
+                    else { state.sort_field = DedupSortField::Size; state.sort_asc = true; }
+                }
+                ui.add(egui::TextEdit::singleline(&mut state.filter_min_size_kb)
+                    .desired_width(50.0)
+                    .hint_text("min KB")
+                    .font(egui::FontId::new(8.5, egui::FontFamily::Monospace)));
+                ui.label(RichText::new("–").color(Colors::TEXT_DIM).size(8.0));
+                ui.add(egui::TextEdit::singleline(&mut state.filter_max_size_kb)
+                    .desired_width(50.0)
+                    .hint_text("max KB")
+                    .font(egui::FontId::new(8.5, egui::FontFamily::Monospace)));
+
+                ui.separator();
+
+                // ── DATE ─────────────────────────────────────────────────────
+                let date_active = state.sort_field == DedupSortField::Date;
+                let date_arrow  = if date_active { if state.sort_asc { " ▲" } else { " ▼" } } else { " ·" };
+                let date_lbl    = RichText::new(format!("DATE{}", date_arrow))
+                    .size(7.5).strong()
+                    .color(if date_active { Colors::AMBER } else { Colors::TEXT_DIM });
+                if ui.add(egui::Label::new(date_lbl).sense(egui::Sense::click())).clicked() {
+                    if date_active { state.sort_asc = !state.sort_asc; }
+                    else { state.sort_field = DedupSortField::Date; state.sort_asc = true; }
+                }
+                ui.add(egui::TextEdit::singleline(&mut state.filter_date_after)
+                    .desired_width(72.0)
+                    .hint_text("YYYY-MM-DD")
+                    .font(egui::FontId::new(8.5, egui::FontFamily::Monospace)));
+                ui.label(RichText::new("→").color(Colors::TEXT_DIM).size(8.0));
+                ui.add(egui::TextEdit::singleline(&mut state.filter_date_before)
+                    .desired_width(72.0)
+                    .hint_text("YYYY-MM-DD")
+                    .font(egui::FontId::new(8.5, egui::FontFamily::Monospace)));
+
+                let any_active = !state.filter_name.is_empty()
+                    || !state.filter_type.is_empty()
+                    || !state.filter_min_size_kb.is_empty()
+                    || !state.filter_max_size_kb.is_empty()
+                    || !state.filter_date_after.is_empty()
+                    || !state.filter_date_before.is_empty();
+                if any_active {
+                    ui.add_space(4.0);
+                    if ui.button(RichText::new("✕ CLEAR").color(Colors::RED).size(8.0)).clicked() {
+                        state.filter_name.clear();
+                        state.filter_type.clear();
+                        state.filter_min_size_kb.clear();
+                        state.filter_max_size_kb.clear();
+                        state.filter_date_after.clear();
+                        state.filter_date_before.clear();
+                    }
+                }
+            });
+        });
+
+    ui.add(egui::Separator::default().spacing(0.0));
+
     if groups.is_empty() {
         egui::Frame::none()
             .fill(Colors::BG_PANEL)
@@ -155,16 +313,114 @@ pub fn render_dedup_review(
         return None;
     }
 
-    // ── Group list ────────────────────────────────────────────────────────────
+    // ── Parse filter values once ──────────────────────────────────────────────
+    let f_name  = state.filter_name.to_lowercase();
+    let f_exts: Vec<String> = state.filter_type
+        .split(',').map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty()).collect();
+    let f_min_bytes: Option<u64> = state.filter_min_size_kb
+        .trim().parse::<u64>().ok().map(|kb| kb * 1024);
+    let f_max_bytes: Option<u64> = state.filter_max_size_kb
+        .trim().parse::<u64>().ok().map(|kb| kb * 1024);
+    let f_after = chrono::NaiveDate::parse_from_str(
+        state.filter_date_after.trim(), "%Y-%m-%d").ok()
+        .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp());
+    let f_before = chrono::NaiveDate::parse_from_str(
+        state.filter_date_before.trim(), "%Y-%m-%d").ok()
+        .map(|d| d.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp());
+
+    let any_filter = !f_name.is_empty() || !f_exts.is_empty()
+        || f_min_bytes.is_some() || f_max_bytes.is_some()
+        || f_after.is_some() || f_before.is_some();
+
+    // Filter groups: a group passes if at least one of its files matches all
+    // active criteria.
+    let filtered_groups: Vec<&DuplicateGroup> = groups.iter().filter(|g| {
+        if !any_filter { return true; }
+        g.files.iter().any(|file| {
+            let path_lower = file.path.to_string_lossy().to_lowercase();
+            // Name filter — match against full path
+            if !f_name.is_empty() && !path_lower.contains(&f_name) { return false; }
+            // Type / extension filter
+            if !f_exts.is_empty() {
+                let ext = file.path.extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if !f_exts.iter().any(|e| e == &ext) { return false; }
+            }
+            // Size filter (group.size is the per-copy size)
+            if let Some(min) = f_min_bytes { if g.size < min { return false; } }
+            if let Some(max) = f_max_bytes { if g.size > max { return false; } }
+            // Date filter — match against file.modified (Option<i64> unix ts)
+            if let Some(after)  = f_after  {
+                match file.modified { Some(m) if m >= after  => {}, _ => { return false; } }
+            }
+            if let Some(before) = f_before {
+                match file.modified { Some(m) if m <= before => {}, _ => { return false; } }
+            }
+            true
+        })
+    }).collect();
+
+    // ── Sort filtered groups ──────────────────────────────────────────────────
+    let sort_field = state.sort_field;
+    let sort_asc   = state.sort_asc;
+    let mut filtered_groups = filtered_groups;
+    filtered_groups.sort_by(|a, b| {
+        let ord = match sort_field {
+            DedupSortField::Waste => {
+                let wa = (a.file_count.saturating_sub(1) as u64) * a.size;
+                let wb = (b.file_count.saturating_sub(1) as u64) * b.size;
+                wa.cmp(&wb)
+            }
+            DedupSortField::Size  => a.size.cmp(&b.size),
+            DedupSortField::Name  => {
+                let na = a.files.first().map(|f| f.path.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let nb = b.files.first().map(|f| f.path.to_string_lossy().to_lowercase()).unwrap_or_default();
+                na.cmp(&nb)
+            }
+            DedupSortField::Type  => {
+                let ea = a.files.first().and_then(|f| f.path.extension())
+                    .map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+                let eb = b.files.first().and_then(|f| f.path.extension())
+                    .map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+                ea.cmp(&eb)
+            }
+            DedupSortField::Date  => {
+                let da = a.files.first().and_then(|f| f.modified).unwrap_or(0);
+                let db = b.files.first().and_then(|f| f.modified).unwrap_or(0);
+                da.cmp(&db)
+            }
+        };
+        if sort_asc { ord } else { ord.reverse() }
+    });
+
+
     ScrollArea::vertical()
         .id_source("dedup_review_scroll")
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.add_space(4.0);
 
-            for group in groups {
-                render_group(ui, group, state, local_device);
-                ui.add_space(2.0);
+            if filtered_groups.is_empty() && any_filter {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(RichText::new("NO GROUPS MATCH CURRENT FILTERS")
+                        .color(Colors::TEXT_DIM).size(9.0).italics());
+                });
+            } else {
+                let visible = filtered_groups.len();
+                let total   = groups.len();
+                if any_filter {
+                    ui.label(RichText::new(
+                        format!("showing {} of {} groups", visible, total))
+                        .color(Colors::TEXT_DIM).size(8.0).italics());
+                    ui.add_space(4.0);
+                }
+                for group in filtered_groups {
+                    render_group(ui, group, state, local_device);
+                    ui.add_space(2.0);
+                }
             }
         });
 

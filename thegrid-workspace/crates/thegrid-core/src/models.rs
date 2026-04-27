@@ -558,6 +558,7 @@ pub enum PreviewKind {
     None,
     Text,
     Image,
+    Psd,
     Pdf,
     UnSupported,
 }

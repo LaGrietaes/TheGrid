@@ -8,48 +8,59 @@
 use egui::Color32;
 use crate::theme::Colors;
 
-/// Standard Glyph Set
+// Re-export phosphor for convenience in other modules
+pub use egui_phosphor::regular as ph;
+
+/// Standard Glyph Set — backed by Phosphor icon font.
+/// All constants are Unicode chars from the Phosphor Private-Use-Area font
+/// embedded via `egui_phosphor`. They render correctly once the font is
+/// registered in `theme::configure_fonts`.
 #[allow(dead_code)]
 pub struct Glyphs;
 
 #[allow(dead_code)]
 impl Glyphs {
     // Brand
-    pub const BRAND_HEX:    &'static str = "⬡";    // Hexagon (logo)
-    pub const BRAND_HEX_F:  &'static str = "⬢";    // Filled Hexagon (AI)
-
+    pub const BRAND_HEX:    &'static str = ph::HEXAGON;            // hexagon outline
+    pub const BRAND_HEX_F:  &'static str = ph::HEXAGON;            // (phosphor has one weight per variant)
 
     // UI Elements
-    pub const DELETE:       &'static str = "✕";
-    pub const CLOSE:        &'static str = "✕";
-    pub const MAXIMIZE:     &'static str = "□";
-    pub const MINIMIZE:     &'static str = "─";
-    pub const SEARCH:       &'static str = "⌕";
-    pub const REFRESH:      &'static str = "↻";
-    pub const SCAN:         &'static str = "⚭";
-    pub const DOWNLOAD:     &'static str = "↓";
-    pub const SEND:         &'static str = "↑";
-    pub const LOCK:         &'static str = "⬖";
-    pub const UNLOCK:       &'static str = "⬗";
+    pub const DELETE:       &'static str = ph::X;
+    pub const CLOSE:        &'static str = ph::X;
+    pub const MAXIMIZE:     &'static str = ph::ARROWS_OUT;
+    pub const MINIMIZE:     &'static str = ph::MINUS;
+    pub const SEARCH:       &'static str = ph::MAGNIFYING_GLASS;
+    pub const REFRESH:      &'static str = ph::ARROW_CLOCKWISE;
+    pub const SCAN:         &'static str = ph::SCAN;
+    pub const DOWNLOAD:     &'static str = ph::ARROW_DOWN;
+    pub const SEND:         &'static str = ph::ARROW_UP;
+    pub const LOCK:         &'static str = ph::LOCK_SIMPLE;
+    pub const UNLOCK:       &'static str = ph::LOCK_SIMPLE_OPEN;
 
     // Flow Markers
-    pub const CREATED:      &'static str = "⊕";    // Circled Plus
-    pub const MODIFIED:     &'static str = "⊙";    // Circled Dot
-    pub const DELETED:      &'static str = "⊘";    // Circled Slash
+    pub const CREATED:      &'static str = ph::PLUS_CIRCLE;
+    pub const MODIFIED:     &'static str = ph::PENCIL_SIMPLE;
+    pub const DELETED:      &'static str = ph::X_CIRCLE;
+
+    // Status (for inline badge text)
+    pub const STATUS_ONLINE:  &'static str = ph::CHECK_CIRCLE;
+    pub const STATUS_UP:      &'static str = ph::WIFI_HIGH;
+    pub const STATUS_OFFLINE: &'static str = ph::CIRCLE;
+    pub const STATUS_AI:      &'static str = ph::BRAIN;
 
     // File Types
-    pub const FILE_CODE:    &'static str = "◈";    // Code (Black Rhombus)
-    pub const FILE_DOC:     &'static str = "⊟";    // Document (Minus in Box)
-    pub const FILE_IMG:     &'static str = "⊡";    // Image (Dot in Box)
-    pub const FILE_VIDEO:   &'static str = "▷";    // Video (Triangle)
-    pub const FILE_AUDIO:   &'static str = "♫";    // Audio (Notes)
-    pub const FILE_ZIP:     &'static str = "⊛";    // Archive (Circled Asterisk)
-    pub const FILE_TEXT:    &'static str = "≡";    // Text (Identical To)
-    pub const FILE_EXE:     &'static str = "⊕";    // Executable
-    pub const FILE_DEF:     &'static str = "◻";    // Default (Square)
+    pub const FILE_CODE:    &'static str = ph::FILE_CODE;
+    pub const FILE_DOC:     &'static str = ph::FILE_DOC;
+    pub const FILE_IMG:     &'static str = ph::IMAGE;
+    pub const FILE_VIDEO:   &'static str = ph::VIDEO;
+    pub const FILE_AUDIO:   &'static str = ph::FILE_AUDIO;
+    pub const FILE_ZIP:     &'static str = ph::FILE_ZIP;
+    pub const FILE_TEXT:    &'static str = ph::FILE;
+    pub const FILE_EXE:     &'static str = ph::TERMINAL_WINDOW;
+    pub const FILE_DEF:     &'static str = ph::FILE;
 
-    // Arrows
-    pub const ARROW_L:      &'static str = "↳";
+    // Arrows / Nav
+    pub const ARROW_L:      &'static str = ph::ARROW_ELBOW_DOWN_RIGHT;
 }
 
 /// Map file extension to a brutalist glyph.
