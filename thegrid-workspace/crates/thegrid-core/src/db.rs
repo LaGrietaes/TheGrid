@@ -53,7 +53,6 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_files_device  ON files(device_id);
             CREATE INDEX IF NOT EXISTS idx_files_ext     ON files(ext);
-            CREATE INDEX IF NOT EXISTS idx_files_quick_hash ON files(quick_hash);
             CREATE INDEX IF NOT EXISTS idx_files_modified ON files(modified DESC);
 
             CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
@@ -160,7 +159,6 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag);
-            CREATE INDEX IF NOT EXISTS idx_file_tags_project ON file_tags(project);
 
             CREATE TABLE IF NOT EXISTS media_review (
                 file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
@@ -246,11 +244,32 @@ impl Database {
 
         // Migrate existing DBs: add new columns if missing
         self.add_column_if_missing("ALTER TABLE files ADD COLUMN quick_hash TEXT")?;
+        self.add_column_if_missing("ALTER TABLE files ADD COLUMN ai_metadata TEXT")?;
         self.add_column_if_missing("ALTER TABLE files ADD COLUMN detected_by TEXT NOT NULL DEFAULT 'full_scan'")?;
         self.add_column_if_missing("ALTER TABLE files ADD COLUMN source_type TEXT NOT NULL DEFAULT 'Local'")?;
         self.add_column_if_missing("ALTER TABLE files ADD COLUMN github_backed INTEGER NOT NULL DEFAULT 0")?;
         self.add_column_if_missing("ALTER TABLE files ADD COLUMN indexing_tier TEXT NOT NULL DEFAULT 'FullIndex'")?;
         self.add_column_if_missing("ALTER TABLE files ADD COLUMN md5_hash TEXT")?;
+
+        // Create indexes that depend on migrated columns after add-column passes.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_quick_hash ON files(quick_hash)",
+            [],
+        )?;
+
+        // Legacy migration: older DBs may have file_tags without project/is_manual.
+        // Add them before creating project index to prevent startup fallback to in-memory DB.
+        self.add_column_if_missing("ALTER TABLE file_tags ADD COLUMN project TEXT")?;
+        self.add_column_if_missing("ALTER TABLE file_tags ADD COLUMN is_manual INTEGER DEFAULT 0")?;
+
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_tags_project ON file_tags(project)",
+            [],
+        )?;
         log::info!("[DB] Schema ready");
         Ok(())
     }
@@ -1256,7 +1275,7 @@ impl Database {
                 "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
                  FROM files
                  WHERE device_id = ?1
-                   AND ai_metadata IS NOT NULL AND ai_metadata != ''
+                                     AND LOWER(COALESCE(ext, '')) IN ('jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','raw','cr2','nef','arw','dng','mp4','mkv','mov','avi')
                    AND (?2 IS NULL OR CAST(json_extract(ai_metadata, '$.in_focus') AS INTEGER) = ?2)
                    AND (?3 IS NULL OR CAST(json_extract(ai_metadata, '$.quality_score') AS REAL) >= ?3)
                    AND (?4 IS NULL OR CAST(json_extract(ai_metadata, '$.focus_score') AS REAL) >= ?4)
@@ -1279,7 +1298,7 @@ impl Database {
             } else {
                 "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
                  FROM files
-                 WHERE ai_metadata IS NOT NULL AND ai_metadata != ''
+                                 WHERE LOWER(COALESCE(ext, '')) IN ('jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','raw','cr2','nef','arw','dng','mp4','mkv','mov','avi')
                    AND (?1 IS NULL OR CAST(json_extract(ai_metadata, '$.in_focus') AS INTEGER) = ?1)
                    AND (?2 IS NULL OR CAST(json_extract(ai_metadata, '$.quality_score') AS REAL) >= ?2)
                    AND (?3 IS NULL OR CAST(json_extract(ai_metadata, '$.focus_score') AS REAL) >= ?3)
@@ -1369,7 +1388,7 @@ impl Database {
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
                AND f.device_id = ?2
-               AND f.ai_metadata IS NOT NULL AND f.ai_metadata != ''
+             AND LOWER(COALESCE(f.ext, '')) IN ('jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','raw','cr2','nef','arw','dng','mp4','mkv','mov','avi')
                AND (?3 IS NULL OR CAST(json_extract(f.ai_metadata, '$.in_focus') AS INTEGER) = ?3)
                AND (?4 IS NULL OR CAST(json_extract(f.ai_metadata, '$.quality_score') AS REAL) >= ?4)
                AND (?5 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focus_score') AS REAL) >= ?5)
@@ -1395,7 +1414,7 @@ impl Database {
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
-               AND f.ai_metadata IS NOT NULL AND f.ai_metadata != ''
+             AND LOWER(COALESCE(f.ext, '')) IN ('jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','raw','cr2','nef','arw','dng','mp4','mkv','mov','avi')
                AND (?2 IS NULL OR CAST(json_extract(f.ai_metadata, '$.in_focus') AS INTEGER) = ?2)
                AND (?3 IS NULL OR CAST(json_extract(f.ai_metadata, '$.quality_score') AS REAL) >= ?3)
                AND (?4 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focus_score') AS REAL) >= ?4)
