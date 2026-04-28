@@ -1,6 +1,8 @@
 use anyhow::Result;
 use sysinfo::System;
 use std::sync::Arc;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 /// Capability trait for any embedding model.
 pub trait EmbeddingProvider: Send + Sync {
@@ -10,28 +12,94 @@ pub trait EmbeddingProvider: Send + Sync {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 }
 
-/// Mock implementation of EmbeddingProvider.
+/// Local deterministic embedding provider.
+///
+/// This is not a transformer model, but it generates stable semantic-ish vectors
+/// using token hashing, weighting, and normalization so semantic search remains
+/// functional even without a remote AI server.
 pub struct FastEmbedProvider {
     model_name: String,
 }
 
 impl FastEmbedProvider {
     pub fn new() -> Result<Self> {
-        log::info!("[AI] Using local FastEmbed (stubbed for now).");
+        log::info!("[AI] Using local deterministic embedding provider.");
         Ok(Self {
-            model_name: "mock-MiniLM-L12-v2".to_string(),
+            model_name: "local-hash-embed-v1".to_string(),
         })
+    }
+
+    fn tokenize(text: &str) -> Vec<String> {
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string())
+            .collect()
+    }
+
+    fn hash_to_index(token: &str, salt: u64, dims: usize) -> (usize, f32) {
+        let mut h = DefaultHasher::new();
+        token.hash(&mut h);
+        salt.hash(&mut h);
+        let value = h.finish();
+        let idx = (value as usize) % dims;
+        let sign = if (value & (1 << 63)) != 0 { -1.0 } else { 1.0 };
+        (idx, sign)
+    }
+
+    fn normalize(v: &mut [f32]) {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-8 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        }
+    }
+
+    fn embed_one(text: &str, dims: usize) -> Vec<f32> {
+        let tokens = Self::tokenize(text);
+        let mut vec = vec![0.0f32; dims];
+
+        if tokens.is_empty() {
+            return vec;
+        }
+
+        // Multi-hash feature projection with position decay and token-length boost.
+        for (i, tok) in tokens.iter().enumerate() {
+            let pos_weight = 1.0 / ((i + 1) as f32).sqrt();
+            let len_weight = ((tok.len().min(12) as f32) / 12.0).max(0.25);
+            let w = pos_weight * len_weight;
+
+            let (a, sa) = Self::hash_to_index(tok, 0x9E3779B185EBCA87, dims);
+            let (b, sb) = Self::hash_to_index(tok, 0xC2B2AE3D27D4EB4F, dims);
+            let (c, sc) = Self::hash_to_index(tok, 0x165667B19E3779F9, dims);
+
+            vec[a] += sa * w;
+            vec[b] += sb * w * 0.7;
+            vec[c] += sc * w * 0.4;
+
+            // Character bigram projection to improve partial-context matching.
+            let chars: Vec<char> = tok.chars().collect();
+            for bg in chars.windows(2) {
+                let bg_s: String = bg.iter().collect();
+                let (idx, sgn) = Self::hash_to_index(&bg_s, 0xA24BAED4963EE407, dims);
+                vec[idx] += sgn * 0.08;
+            }
+        }
+
+        Self::normalize(&mut vec);
+        vec
     }
 }
 
 impl EmbeddingProvider for FastEmbedProvider {
     fn dimensions(&self) -> usize { 384 }
     fn model_id(&self) -> &str { &self.model_name }
-    fn embed(&self, _text: &str) -> Result<Vec<f32>> {
-        Ok(vec![0.0; 384])
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        Ok(Self::embed_one(text, self.dimensions()))
     }
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        Ok(vec![vec![0.0; 384]; texts.len()])
+        Ok(texts.iter().map(|t| Self::embed_one(t, self.dimensions())).collect())
     }
 }
 
@@ -372,6 +440,14 @@ pub struct MediaMetadata {
     pub dominant_colors: Vec<String>,
     pub face_count: usize,
     pub ocr_text: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub megapixels: Option<f32>,
+    pub focus_score: Option<f32>,
+    pub quality_score: Option<f32>,
+    pub brightness: Option<f32>,
+    pub contrast: Option<f32>,
+    pub in_focus: Option<bool>,
 }
 
 /// Trait for analyzing media files.
@@ -379,7 +455,8 @@ pub trait MediaAnalyzer: Send + Sync {
     fn analyze(&self, path: &std::path::Path) -> Result<MediaMetadata>;
 }
 
-/// GPU-accelerated media analyzer (placeholder for actual CUDA/cuDNN logic).
+/// Media analyzer that runs locally. If NVIDIA is present it reports the GPU
+/// in telemetry, but analysis itself is CPU-based for portability.
 pub struct CudaMediaAnalyzer {
     gpu_name: String,
 }
@@ -387,11 +464,119 @@ pub struct CudaMediaAnalyzer {
 impl CudaMediaAnalyzer {
     pub fn new() -> Result<Self> {
         let detector = AiNodeDetector::new();
-        if let Some(gpu) = detector.gpu_info() {
-            log::info!("[AI] Initializing CUDA Media Analyzer on {}", gpu);
-            Ok(Self { gpu_name: gpu })
+        let gpu = detector.gpu_info().unwrap_or_else(|| "cpu".to_string());
+        log::info!("[AI] Initializing Media Analyzer backend={}", gpu);
+        Ok(Self { gpu_name: gpu })
+    }
+
+    fn dominant_colors(img: &image::RgbImage, top_k: usize) -> Vec<String> {
+        let mut bins = std::collections::HashMap::<u16, u32>::new();
+        for p in img.pixels() {
+            // 4-bit/channel quantization => 4096 bins
+            let r = (p[0] >> 4) as u16;
+            let g = (p[1] >> 4) as u16;
+            let b = (p[2] >> 4) as u16;
+            let key = (r << 8) | (g << 4) | b;
+            *bins.entry(key).or_insert(0) += 1;
+        }
+
+        let mut sorted: Vec<(u16, u32)> = bins.into_iter().collect();
+        sorted.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        sorted.truncate(top_k);
+
+        sorted
+            .into_iter()
+            .map(|(k, _)| {
+                let r = (((k >> 8) & 0x0F) as u8) * 17;
+                let g = (((k >> 4) & 0x0F) as u8) * 17;
+                let b = ((k & 0x0F) as u8) * 17;
+                format!("#{:02X}{:02X}{:02X}", r, g, b)
+            })
+            .collect()
+    }
+
+    fn grayscale_stats(gray: &image::GrayImage) -> (f32, f32) {
+        let n = (gray.width() as f32) * (gray.height() as f32);
+        if n <= 1.0 {
+            return (0.0, 0.0);
+        }
+        let mean = gray.pixels().map(|p| p[0] as f32).sum::<f32>() / n;
+        let var = gray
+            .pixels()
+            .map(|p| {
+                let d = (p[0] as f32) - mean;
+                d * d
+            })
+            .sum::<f32>()
+            / (n - 1.0);
+        (mean / 255.0, var.sqrt() / 255.0)
+    }
+
+    fn focus_score(gray: &image::GrayImage) -> f32 {
+        let (w, h) = gray.dimensions();
+        if w < 3 || h < 3 {
+            return 0.0;
+        }
+
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        let mut count = 0.0f64;
+
+        for y in 1..(h - 1) {
+            for x in 1..(w - 1) {
+                let c = gray.get_pixel(x, y)[0] as f64;
+                let l = gray.get_pixel(x - 1, y)[0] as f64;
+                let r = gray.get_pixel(x + 1, y)[0] as f64;
+                let u = gray.get_pixel(x, y - 1)[0] as f64;
+                let d = gray.get_pixel(x, y + 1)[0] as f64;
+                let lap = 4.0 * c - l - r - u - d;
+                sum += lap;
+                sum_sq += lap * lap;
+                count += 1.0;
+            }
+        }
+
+        if count <= 1.0 {
+            return 0.0;
+        }
+
+        let mean = sum / count;
+        let var = (sum_sq / count) - (mean * mean);
+        // Normalize empirically; clamp to [0, 1].
+        (var as f32 / 1200.0).clamp(0.0, 1.0)
+    }
+
+    fn estimate_noise(gray: &image::GrayImage) -> f32 {
+        let (w, h) = gray.dimensions();
+        if w < 2 || h < 2 {
+            return 0.0;
+        }
+
+        let mut acc = 0.0f32;
+        let mut count = 0.0f32;
+        for y in 0..(h - 1) {
+            for x in 0..(w - 1) {
+                let p = gray.get_pixel(x, y)[0] as f32;
+                let px = gray.get_pixel(x + 1, y)[0] as f32;
+                let py = gray.get_pixel(x, y + 1)[0] as f32;
+                acc += (p - px).abs() + (p - py).abs();
+                count += 2.0;
+            }
+        }
+        if count <= 0.0 {
+            0.0
         } else {
-            Err(anyhow::anyhow!("No CUDA-capable GPU found for high-performance indexing."))
+            (acc / count / 255.0).clamp(0.0, 1.0)
+        }
+    }
+
+    fn classify_exposure(brightness: f32) -> &'static str {
+        if brightness < 0.25 {
+            "underexposed"
+        } else if brightness > 0.82 {
+            "overexposed"
+        } else {
+            "well-exposed"
         }
     }
 }
@@ -403,29 +588,87 @@ impl MediaAnalyzer for CudaMediaAnalyzer {
 
         match ext.as_str() {
             "jpg" | "jpeg" | "png" | "webp" => {
-                // Real image metadata via the `image` crate — no GPU needed for this layer.
-                match image::image_dimensions(path) {
-                    Ok((w, h)) => {
-                        let mp = (w as f64 * h as f64) / 1_000_000.0;
-                        meta.description = format!("{}x{} ({:.1}MP)", w, h, mp);
-                        meta.tags = vec![
-                            ext.to_string(),
-                            format!("{}x{}", w, h),
-                            if mp >= 8.0 { "high-res".into() } else if mp >= 2.0 { "mid-res".into() } else { "low-res".into() },
-                        ];
-                    }
-                    Err(e) => {
-                        log::warn!("[AI] Could not read image dimensions for {:?}: {}", path, e);
-                        meta.description = format!("{} (unreadable)", ext);
-                        meta.tags = vec![ext.to_string()];
-                    }
+                let dyn_img = image::open(path)?;
+                let rgb = dyn_img.to_rgb8();
+                let (w, h) = rgb.dimensions();
+                let mp = (w as f32 * h as f32) / 1_000_000.0;
+
+                // Downsample for stable fast metrics on large inputs.
+                let down = image::imageops::thumbnail(&rgb, 960, 960);
+                let gray = image::DynamicImage::ImageRgb8(down).to_luma8();
+
+                let (brightness, contrast) = Self::grayscale_stats(&gray);
+                let focus_score = Self::focus_score(&gray);
+                let noise_score = Self::estimate_noise(&gray);
+                let in_focus = focus_score >= 0.30;
+                let quality_score = (
+                    (focus_score * 0.50)
+                    + (contrast * 0.20)
+                    + ((1.0 - (brightness - 0.50).abs() * 2.0).clamp(0.0, 1.0) * 0.20)
+                    + ((1.0 - noise_score).clamp(0.0, 1.0) * 0.10)
+                ).clamp(0.0, 1.0);
+
+                meta.width = Some(w);
+                meta.height = Some(h);
+                meta.megapixels = Some(mp);
+                meta.focus_score = Some(focus_score);
+                meta.quality_score = Some(quality_score);
+                meta.brightness = Some(brightness);
+                meta.contrast = Some(contrast);
+                meta.in_focus = Some(in_focus);
+                meta.dominant_colors = Self::dominant_colors(&rgb, 4);
+
+                meta.tags.push(ext.to_string());
+                meta.tags.push(format!("{}x{}", w, h));
+                meta.tags.push(if mp >= 24.0 {
+                    "ultra-res".into()
+                } else if mp >= 8.0 {
+                    "high-res".into()
+                } else if mp >= 2.0 {
+                    "mid-res".into()
+                } else {
+                    "low-res".into()
+                });
+
+                meta.tags.push(if in_focus { "in-focus".into() } else { "out-of-focus".into() });
+                meta.tags.push(Self::classify_exposure(brightness).to_string());
+
+                if w >= h {
+                    meta.tags.push("landscape".into());
+                } else {
+                    meta.tags.push("portrait".into());
                 }
+
+                if contrast < 0.18 {
+                    meta.tags.push("low-contrast".into());
+                } else if contrast > 0.40 {
+                    meta.tags.push("high-contrast".into());
+                }
+
+                if noise_score > 0.30 {
+                    meta.tags.push("noisy".into());
+                } else {
+                    meta.tags.push("clean".into());
+                }
+
+                meta.description = format!(
+                    "{}x{} ({:.1}MP), focus {:.2}, quality {:.2}",
+                    w,
+                    h,
+                    mp,
+                    focus_score,
+                    quality_score
+                );
             }
             "mp4" | "mkv" | "mov" | "avi" => {
-                // No GPU video decode yet — record container format and file size.
+                // Container-level analysis for video assets.
                 let size_mb = path.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
                 meta.description = format!("{} container, ~{}MB", ext.to_ascii_uppercase(), size_mb);
-                meta.tags = vec![ext.to_string(), "video".into()];
+                meta.tags = vec![
+                    ext.to_string(),
+                    "video".into(),
+                    "container-only-analysis".into(),
+                ];
             }
             _ => {
                 meta.description = format!("Unsupported media type: {}", ext);

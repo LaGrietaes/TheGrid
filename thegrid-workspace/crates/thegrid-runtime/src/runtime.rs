@@ -131,7 +131,90 @@ pub struct AppRuntime {
     pub compute_router: Arc<ComputeRouter>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SearchMediaFilters {
+    in_focus: Option<bool>,
+    min_quality: Option<f32>,
+    min_focus_score: Option<f32>,
+    min_megapixels: Option<f32>,
+}
+
+impl SearchMediaFilters {
+    fn any(&self) -> bool {
+        self.in_focus.is_some()
+            || self.min_quality.is_some()
+            || self.min_focus_score.is_some()
+            || self.min_megapixels.is_some()
+    }
+}
+
 impl AppRuntime {
+    fn parse_media_search_filters(raw_query: &str) -> (String, SearchMediaFilters) {
+        let mut filters = SearchMediaFilters::default();
+        let mut kept = Vec::new();
+
+        for token in raw_query.split_whitespace() {
+            let lower = token.to_ascii_lowercase();
+
+            if let Some(v) = lower.strip_prefix("focus:") {
+                match v {
+                    "in" | "true" | "sharp" => {
+                        filters.in_focus = Some(true);
+                        continue;
+                    }
+                    "out" | "false" | "blur" | "blurry" => {
+                        filters.in_focus = Some(false);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(v) = lower.strip_prefix("quality>=") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.min_quality = Some(n.clamp(0.0, 1.0));
+                    continue;
+                }
+            }
+            if let Some(v) = lower.strip_prefix("quality>") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.min_quality = Some(n.clamp(0.0, 1.0));
+                    continue;
+                }
+            }
+
+            if let Some(v) = lower.strip_prefix("focusscore>=") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.min_focus_score = Some(n.clamp(0.0, 1.0));
+                    continue;
+                }
+            }
+            if let Some(v) = lower.strip_prefix("focusscore>") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.min_focus_score = Some(n.clamp(0.0, 1.0));
+                    continue;
+                }
+            }
+
+            if let Some(v) = lower.strip_prefix("mp>=") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.min_megapixels = Some(n.max(0.0));
+                    continue;
+                }
+            }
+            if let Some(v) = lower.strip_prefix("mp>") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.min_megapixels = Some(n.max(0.0));
+                    continue;
+                }
+            }
+
+            kept.push(token.to_string());
+        }
+
+        (kept.join(" "), filters)
+    }
+
     fn parse_agent_target(endpoint: &str, fallback_port: u16) -> Option<(String, u16)> {
         let trimmed = endpoint.trim();
         let without_scheme = trimmed
@@ -223,7 +306,6 @@ impl AppRuntime {
     pub fn spawn_peer_refresh_loop(&self) {
         let api_key = self.config.lock().unwrap().api_key.clone();
         let peers_slot = Arc::clone(&self.tailscale_peers);
-        let tx = self.event_tx.clone();
         std::thread::Builder::new()
             .name("thegrid-peer-refresh".into())
             .spawn(move || {
@@ -313,32 +395,30 @@ impl AppRuntime {
             self.spawn_embedding_worker();
         }
 
-        // Phase 4: Media AI — GPU analyzer is opt-in to avoid native startup instability.
-        if self.is_ai_node {
-            let gpu_media_enabled = std::env::var("THEGRID_ENABLE_GPU_MEDIA")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
+        // Phase 4: Media AI — enabled by default and runs on CPU/GPU depending on host capabilities.
+        let media_ai_enabled = std::env::var("THEGRID_ENABLE_MEDIA_AI")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
 
-            if gpu_media_enabled {
-                match thegrid_ai::CudaMediaAnalyzer::new() {
-                    Ok(analyzer) => {
-                        let mut lock = self.media_analyzer.lock().unwrap();
-                        *lock = Some(Arc::new(analyzer));
-                        drop(lock);
-                        log::info!("[Runtime] GPU media analyzer ready — starting background worker");
-                        self.spawn_media_analyzer_worker();
-                    }
-                    Err(e) => {
-                        log::warn!("[Runtime] GPU media analyzer unavailable: {}", e);
-                        let _ = self.event_tx.send(AppEvent::Status(format!(
-                            "AI media analyzer unavailable: {}",
-                            e
-                        )));
-                    }
+        if media_ai_enabled {
+            match thegrid_ai::CudaMediaAnalyzer::new() {
+                Ok(analyzer) => {
+                    let mut lock = self.media_analyzer.lock().unwrap();
+                    *lock = Some(Arc::new(analyzer));
+                    drop(lock);
+                    log::info!("[Runtime] Media analyzer ready — starting background worker");
+                    self.spawn_media_analyzer_worker();
                 }
-            } else {
-                log::info!("[Runtime] GPU media analyzer disabled (set THEGRID_ENABLE_GPU_MEDIA=1 to enable)");
+                Err(e) => {
+                    log::warn!("[Runtime] Media analyzer unavailable: {}", e);
+                    let _ = self.event_tx.send(AppEvent::Status(format!(
+                        "Media analyzer unavailable: {}",
+                        e
+                    )));
+                }
             }
+        } else {
+            log::info!("[Runtime] Media analyzer disabled (set THEGRID_ENABLE_MEDIA_AI=0 to disable)");
         }
 
         // Background indexing helpers + peer discovery for compute delegation
@@ -1138,11 +1218,8 @@ impl AppRuntime {
                         match found_endpoint {
                             Some((url, model)) => (url, model),
                             None => {
-                                log::warn!("[AI] No AI provider found. Start Ollama locally or ensure tablet LocalAI is reachable.");
-                                let _ = event_tx.send(AppEvent::SemanticFailed(
-                                    "No AI provider: start Ollama locally (http://127.0.0.1:11434) or check tablet LocalAI at 100.67.58.127:8080".to_string()
-                                ));
-                                return;
+                                log::warn!("[AI] No remote AI provider found, falling back to local deterministic embeddings.");
+                                ("local://fastembed".to_string(), "local-hash-embed-v1".to_string())
                             }
                         }
                     }
@@ -1159,8 +1236,18 @@ impl AppRuntime {
             }
 
             log::info!("[AI] Initializing embedding provider: model={} url={}", resolved_model, resolved_url);
-            let provider_result = thegrid_ai::HttpEmbeddingProvider::new(resolved_model, resolved_url)
-                .map(|p| Arc::new(p) as Arc<dyn EmbeddingProvider>);
+            let provider_result: Result<Arc<dyn EmbeddingProvider>, anyhow::Error> =
+                if resolved_url.starts_with("local://") {
+                    thegrid_ai::FastEmbedProvider::new().map(|p| Arc::new(p) as Arc<dyn EmbeddingProvider>)
+                } else {
+                    match thegrid_ai::HttpEmbeddingProvider::new(resolved_model.clone(), resolved_url.clone()) {
+                        Ok(p) => Ok(Arc::new(p) as Arc<dyn EmbeddingProvider>),
+                        Err(e) => {
+                            log::warn!("[AI] Remote provider init failed ({}), falling back to local deterministic embeddings", e);
+                            thegrid_ai::FastEmbedProvider::new().map(|p| Arc::new(p) as Arc<dyn EmbeddingProvider>)
+                        }
+                    }
+                };
 
             match provider_result {
                 Ok(p) => {
@@ -1707,7 +1794,7 @@ impl AppRuntime {
                     }
 
                     if analyzed_count % 5 == 0 {
-                        let _ = event_tx.send(AppEvent::Status(format!("Analyzed {} media files with GPU", analyzed_count)));
+                        let _ = event_tx.send(AppEvent::Status(format!("Analyzed {} media files", analyzed_count)));
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1726,9 +1813,12 @@ impl AppRuntime {
         };
 
         std::thread::spawn(move || {
+            let (clean_query, media_filters) = AppRuntime::parse_media_search_filters(&query);
+            let effective_query = clean_query;
+            let force_filtered_search = media_filters.any();
             let mut results = vec![];
             
-            if semantic_enabled {
+            if semantic_enabled && !force_filtered_search {
                 let has_local = {
                     let lock = semantic_search.lock().unwrap();
                     lock.is_some()
@@ -1737,7 +1827,7 @@ impl AppRuntime {
                 if has_local {
                     if let Ok(mut lock) = semantic_search.lock() {
                         if let Some(engine) = &mut *lock {
-                            if let Ok(hits) = engine.search(&query, 50) {
+                            if let Ok(hits) = engine.search(&effective_query, 50) {
                                 let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
                                 results = db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default();
                             }
@@ -1752,7 +1842,7 @@ impl AppRuntime {
 
                     if let Some(ip) = remote_node {
                         if let Ok(client) = AgentClient::new(&ip, port, api_key) {
-                            if let Ok(hits) = client.remote_search(&query, 50) {
+                            if let Ok(hits) = client.remote_search(&effective_query, 50) {
                                 let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
                                 results = db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default();
                             }
@@ -1761,7 +1851,19 @@ impl AppRuntime {
                 }
             } else {
                 results = db.lock().ok().and_then(|guard| {
-                    guard.search_fts(&query, 50, device_filter.as_deref()).ok()
+                    if force_filtered_search {
+                        guard.search_fts_with_media_filters(
+                            &effective_query,
+                            50,
+                            device_filter.as_deref(),
+                            media_filters.in_focus,
+                            media_filters.min_quality,
+                            media_filters.min_focus_score,
+                            media_filters.min_megapixels,
+                        ).ok()
+                    } else {
+                        guard.search_fts(&effective_query, 50, device_filter.as_deref()).ok()
+                    }
                 }).unwrap_or_default();
             }
 
@@ -1837,6 +1939,13 @@ impl AppRuntime {
             };
 
             if let Ok(provider) = thegrid_ai::HttpEmbeddingProvider::new(model_name, provider_url) {
+                if let Ok(v) = provider.embed(&text) {
+                    let _ = response_tx.send(v);
+                    return;
+                }
+            }
+
+            if let Ok(provider) = thegrid_ai::FastEmbedProvider::new() {
                 if let Ok(v) = provider.embed(&text) {
                     let _ = response_tx.send(v);
                 }

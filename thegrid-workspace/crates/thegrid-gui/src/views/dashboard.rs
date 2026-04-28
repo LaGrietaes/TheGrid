@@ -1,4 +1,4 @@
-// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+﻿// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // views/dashboard.rs -- Main Application Dashboard  [v0.2 -- Phase 2]
 //
 // FIXES from v0.1:
@@ -258,6 +258,27 @@ pub fn render_device_panel(
 
     ui.add(egui::Separator::default().spacing(0.0));
 
+    // ── NODES section header (navigates to Dashboard screen) ─────────────
+    egui::Frame::none()
+        .fill(Colors::BG_PANEL)
+        .inner_margin(egui::Margin { left: 10.0, right: 8.0, top: 5.0, bottom: 3.0 })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let nodes_active = active_screen == crate::app::Screen::Dashboard;
+                let hdr_btn = egui::Button::new(
+                    RichText::new("// NODES").color(
+                        if nodes_active { Colors::GREEN } else { Colors::TEXT_DIM }
+                    ).size(9.0).strong()
+                )
+                .fill(Color32::TRANSPARENT)
+                .stroke(egui::Stroke::NONE)
+                .min_size(egui::vec2(0.0, 14.0));
+                if ui.add(hdr_btn).clicked() && !nodes_active {
+                    result.navigate_to = Some(crate::app::Screen::Dashboard);
+                }
+            });
+        });
+
     let filter_lower = filter.to_lowercase();
     ScrollArea::vertical()
         .id_source("device_list_scroll")
@@ -265,7 +286,6 @@ pub fn render_device_panel(
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
-            // â”€â”€ Nodes Section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ui.add_space(4.0);
             for (idx, (device, status)) in devices_with_status.iter().enumerate() {
                 let matches = filter_lower.is_empty()

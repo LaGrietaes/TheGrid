@@ -422,7 +422,9 @@ pub struct NodeCrosscheckSummary {
 
 pub struct TheGridApp {
     // ── State machine ─────────────────────────────────────────────────────────
-    screen: Screen,
+    screen:      Screen,
+    nav_history: Vec<Screen>,
+    nav_future:  Vec<Screen>,
     boot_start: std::time::Instant,
 
     // ── Config ────────────────────────────────────────────────────────────────
@@ -795,6 +797,8 @@ impl TheGridApp {
 
         Self {
             screen:      Screen::Boot,
+            nav_history: Vec::new(),
+            nav_future:  Vec::new(),
             boot_start:  std::time::Instant::now(),
             config: config.clone(),
             setup,
@@ -2991,84 +2995,7 @@ impl TheGridApp {
         });
     }
 
-    /// Render the nav tab strip below the title bar (Nodes / Projects / Planner).
-    fn render_navtabs(&mut self, ctx: &egui::Context) {
-        let current = self.screen.clone();
-        let mut next: Option<Screen> = None;
 
-        egui::TopBottomPanel::top("navtabs")
-            .exact_height(32.0)
-            .frame(egui::Frame::none()
-                .fill(Colors::BG_PANEL)
-                .stroke(egui::Stroke::new(1.0, Colors::BORDER))
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.add_space(8.0);
-                    for (tab_screen, label, hotkey_n) in [
-                        (Screen::Dashboard, "NODES",    "1"),
-                        (Screen::Projects,  "PROJECTS", "2"),
-                        (Screen::Planner,   "PLANNER",  "3"),
-                    ] {
-                        let active = current == tab_screen;
-                        let color  = if active { Colors::GREEN } else { Colors::TEXT_DIM };
-                        let fill   = if active { Color32::from_rgb(0, 24, 8) } else { Color32::TRANSPARENT };
-                        let border = if active { Colors::GREEN_DIM } else { Color32::from_rgb(30, 30, 30) };
-
-                        // Compose label with superscript-style hotkey number
-                        let rich = egui::WidgetText::LayoutJob({
-                            let mut job = egui::text::LayoutJob::default();
-                            job.append(
-                                label,
-                                0.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::new(9.5, egui::FontFamily::Monospace),
-                                    color,
-                                    ..Default::default()
-                                },
-                            );
-                            job.append(
-                                hotkey_n,
-                                3.0,
-                                egui::TextFormat {
-                                    font_id: egui::FontId::new(7.0, egui::FontFamily::Monospace),
-                                    color: if active { Colors::GREEN_DIM } else { Color32::from_rgb(50, 50, 50) },
-                                    valign: egui::Align::Min,
-                                    ..Default::default()
-                                },
-                            );
-                            job
-                        });
-
-                        let resp = ui.add(
-                            egui::Button::new(rich)
-                                .fill(fill)
-                                .stroke(egui::Stroke::new(1.0, border))
-                                .min_size(egui::vec2(76.0, 22.0))
-                        );
-
-                        // Active tab: draw 2px bottom accent line
-                        if active {
-                            let r = resp.rect;
-                            ui.painter().line_segment(
-                                [egui::pos2(r.min.x + 2.0, r.max.y - 1.0),
-                                 egui::pos2(r.max.x - 2.0, r.max.y - 1.0)],
-                                egui::Stroke::new(2.0, Colors::GREEN),
-                            );
-                        }
-
-                        if resp.on_hover_text(format!("F{hotkey_n}")).clicked() {
-                            next = Some(tab_screen);
-                        }
-                        ui.add_space(4.0);
-                    }
-                });
-            });
-
-        if let Some(s) = next {
-            self.screen = s;
-        }
-    }
 
     fn render_viewport_panel(&mut self, ctx: &egui::Context) {
 
@@ -3089,6 +3016,31 @@ impl TheGridApp {
                     ui.add_space(8.0);
                     crate::views::viewport::show_viewport(ui, &mut self.viewport);
                 });
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Navigation history
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn navigate_to(&mut self, screen: Screen) {
+        if screen == self.screen { return; }
+        self.nav_history.push(self.screen.clone());
+        self.nav_future.clear();
+        self.screen = screen;
+    }
+
+    fn navigate_back(&mut self) {
+        if let Some(prev) = self.nav_history.pop() {
+            self.nav_future.push(self.screen.clone());
+            self.screen = prev;
+        }
+    }
+
+    fn navigate_forward(&mut self) {
+        if let Some(next) = self.nav_future.pop() {
+            self.nav_history.push(self.screen.clone());
+            self.screen = next;
         }
     }
 
@@ -3214,7 +3166,26 @@ impl TheGridApp {
     // Titlebar
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn render_titlebar(&self, ctx: &Context) {
+    fn render_titlebar(&mut self, ctx: &Context) {
+        let can_back  = !self.nav_history.is_empty();
+        let can_fwd   = !self.nav_future.is_empty();
+
+        let (dot_color, status_text) = if self.tailscale_connected {
+            (Colors::GREEN, "CONNECTED")
+        } else if self.devices_loading {
+            (Colors::AMBER, "CONNECTING")
+        } else {
+            (Colors::TEXT_MUTED, "OFFLINE")
+        };
+        let total_files  = self.index_stats.total_files;
+        let scanning     = self.index_stats.scanning;
+        let device_name  = self.config.device_name.clone();
+
+        let mut go_back     = false;
+        let mut go_fwd      = false;
+        let mut go_home     = false;
+        let mut nav_open_settings = false;
+
         egui::TopBottomPanel::top("titlebar")
             .exact_height(36.0)
             .frame(egui::Frame::none()
@@ -3223,45 +3194,102 @@ impl TheGridApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(12.0);
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                    let c = rect.center();
-                    let r = 6.0;
-                    let mut points = vec![];
-                    for i in 0..6 {
-                        let angle = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
-                        points.push(c + egui::vec2(r * angle.cos(), r * angle.sin()));
-                    }
-                    ui.painter().add(egui::Shape::convex_polygon(points, Color32::TRANSPARENT, egui::Stroke::new(1.5, Colors::GREEN)));
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("THE GRID").color(Colors::GREEN).size(11.0).strong());
+                    ui.add_space(8.0);
 
-                    ui.add_space(12.0);
-                    let (dot_color, status_text) = if self.tailscale_connected {
-                        (Colors::GREEN, "TAILSCALE CONNECTED")
-                    } else if self.devices_loading {
-                        (Colors::AMBER, "CONNECTING...")
-                    } else {
-                        (Colors::TEXT_MUTED, "DISCONNECTED")
-                    };
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(r.center(), 3.0, dot_color);
+                    // ── Logo (clickable → Dashboard) ──────────────────────────
+                    let (logo_rect, logo_resp) = ui.allocate_exact_size(
+                        egui::vec2(80.0, 28.0), egui::Sense::click()
+                    );
+                    let logo_hovered = logo_resp.hovered();
+                    if logo_hovered {
+                        ui.painter().rect_filled(
+                            logo_rect, egui::Rounding::same(2.0),
+                            Color32::from_rgba_premultiplied(0, 255, 80, 12)
+                        );
+                    }
+                    let hex_c = logo_rect.left_center() + egui::vec2(9.0, 0.0);
+                    let hex_r = 6.0;
+                    let mut hex_pts = vec![];
+                    for i in 0..6 {
+                        let a = std::f32::consts::PI / 3.0 * i as f32 + std::f32::consts::PI / 2.0;
+                        hex_pts.push(hex_c + egui::vec2(hex_r * a.cos(), hex_r * a.sin()));
+                    }
+                    let hex_color = if logo_hovered { Colors::GREEN } else { Colors::GREEN_DIM };
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        hex_pts, Color32::TRANSPARENT, egui::Stroke::new(1.5, hex_color)
+                    ));
+                    ui.painter().text(
+                        logo_rect.left_center() + egui::vec2(22.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "THE GRID",
+                        egui::FontId::new(10.5, egui::FontFamily::Monospace),
+                        if logo_hovered { Colors::GREEN } else { Colors::GREEN_DIM },
+                    );
+                    if logo_resp.on_hover_text("Home (Dashboard)").clicked() {
+                        go_home = true;
+                    }
+
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("│").color(Colors::BORDER2).size(10.0));
+                    ui.add_space(4.0);
+
+                    // ── Back button (drawn arrow) ─────────────────────────────
+                    let back_color = if can_back { Colors::TEXT_DIM } else { Color32::from_gray(38) };
+                    let (back_rect, back_resp) = ui.allocate_exact_size(
+                        egui::vec2(22.0, 22.0),
+                        if can_back { egui::Sense::click() } else { egui::Sense::hover() },
+                    );
+                    if back_resp.hovered() && can_back {
+                        ui.painter().rect_filled(back_rect, egui::Rounding::same(2.0),
+                            Color32::from_rgba_premultiplied(255, 255, 255, 8));
+                    }
+                    {
+                        let c = back_rect.center();
+                        let s = egui::Stroke::new(1.4, back_color);
+                        ui.painter().line_segment([c + egui::vec2(2.5, -4.0), c + egui::vec2(-2.5, 0.0)], s);
+                        ui.painter().line_segment([c + egui::vec2(-2.5, 0.0), c + egui::vec2(2.5, 4.0)], s);
+                        ui.painter().line_segment([c + egui::vec2(-2.5, 0.0), c + egui::vec2(5.0, 0.0)], s);
+                    }
+                    if back_resp.on_hover_text("Back  (Alt+Left or Mouse Btn 4)").clicked() {
+                        go_back = true;
+                    }
+
+                    // ── Forward button (drawn arrow) ──────────────────────────
+                    let fwd_color = if can_fwd { Colors::TEXT_DIM } else { Color32::from_gray(38) };
+                    let (fwd_rect, fwd_resp) = ui.allocate_exact_size(
+                        egui::vec2(22.0, 22.0),
+                        if can_fwd { egui::Sense::click() } else { egui::Sense::hover() },
+                    );
+                    if fwd_resp.hovered() && can_fwd {
+                        ui.painter().rect_filled(fwd_rect, egui::Rounding::same(2.0),
+                            Color32::from_rgba_premultiplied(255, 255, 255, 8));
+                    }
+                    {
+                        let c = fwd_rect.center();
+                        let s = egui::Stroke::new(1.4, fwd_color);
+                        ui.painter().line_segment([c + egui::vec2(-2.5, -4.0), c + egui::vec2(2.5, 0.0)], s);
+                        ui.painter().line_segment([c + egui::vec2(2.5, 0.0), c + egui::vec2(-2.5, 4.0)], s);
+                        ui.painter().line_segment([c + egui::vec2(2.5, 0.0), c + egui::vec2(-5.0, 0.0)], s);
+                    }
+                    if fwd_resp.on_hover_text("Forward  (Alt+Right or Mouse Btn 5)").clicked() {
+                        go_fwd = true;
+                    }
+
+                    // ── Status dot ────────────────────────────────────────────
+                    let (dot_r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot_r.center(), 3.0, dot_color);
                     ui.label(RichText::new(status_text).color(Colors::TEXT_DIM).size(9.0));
 
-                    // Show index count in titlebar
-                    if self.index_stats.total_files > 0 {
-                        ui.add_space(12.0);
+                    if total_files > 0 {
+                        ui.add_space(8.0);
                         ui.label(
-                            RichText::new(format!("{} indexed", self.index_stats.total_files))
+                            RichText::new(format!("{} indexed", total_files))
                                 .color(Colors::TEXT_MUTED).size(9.0)
                         );
                     }
-                    if self.index_stats.scanning {
-                        ui.add_space(4.0);
-                        ui.spinner();
-                    }
+                    if scanning { ui.add_space(4.0); ui.spinner(); }
 
-                    // Draggable region
+                    // ── Draggable fill ────────────────────────────────────────
                     let drag = ui.interact(
                         ui.available_rect_before_wrap(),
                         egui::Id::new("titlebar_drag"),
@@ -3312,11 +3340,10 @@ impl TheGridApp {
 
                         ui.add_space(8.0);
 
-                        // Settings Gear (Vector)
+                        // Settings Gear
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
                         let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
                         let c = rect.center();
-                        // Draw gear
                         ui.painter().circle_stroke(c, 4.0, egui::Stroke::new(1.2, color));
                         for i in 0..8 {
                             let angle = std::f32::consts::PI / 4.0 * i as f32;
@@ -3324,11 +3351,11 @@ impl TheGridApp {
                             let p2 = c + egui::vec2(7.0 * angle.cos(), 7.0 * angle.sin());
                             ui.painter().line_segment([p1, p2], egui::Stroke::new(1.2, color));
                         }
-                        if resp.clicked() { let _ = self.event_tx.send(AppEvent::OpenSettings); }
+                        if resp.on_hover_text("Settings").clicked() { nav_open_settings = true; }
 
                         ui.add_space(4.0);
 
-                        // Search Magnifier (Vector)
+                        // Search Magnifier
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
                         let color = if resp.hovered() { Colors::TEXT } else { Colors::TEXT_DIM };
                         let c = rect.center() - egui::vec2(1.0, 1.0);
@@ -3337,15 +3364,18 @@ impl TheGridApp {
                             [c + egui::vec2(3.0, 3.0), c + egui::vec2(6.0, 6.0)],
                             egui::Stroke::new(1.5, color)
                         );
-                        if resp.clicked() { 
-                            // Handled via keyboard / event logic
-                        }
+                        let _ = resp;
 
                         ui.add_space(8.0);
-                        ui.label(RichText::new(&self.config.device_name).color(Colors::TEXT_MUTED).size(9.0));
+                        ui.label(RichText::new(&device_name).color(Colors::TEXT_MUTED).size(9.0));
                     });
                 });
             });
+
+        if go_back  { self.navigate_back(); }
+        if go_fwd   { self.navigate_forward(); }
+        if go_home  { self.navigate_to(Screen::Dashboard); }
+        if nav_open_settings { let _ = self.event_tx.send(AppEvent::OpenSettings); }
     }
 
     fn render_statusbar(&self, ctx: &Context) {
@@ -3875,9 +3905,17 @@ impl eframe::App for TheGridApp {
         let f2_press     = ctx.input(|i| i.key_pressed(egui::Key::F2));
         let f3_press     = ctx.input(|i| i.key_pressed(egui::Key::F3));
 
-        if f1_press { self.screen = Screen::Dashboard; }
-        if f2_press { self.screen = Screen::Projects; }
-        if f3_press { self.screen = Screen::Planner; }
+        if f1_press { self.navigate_to(Screen::Dashboard); }
+        if f2_press { self.navigate_to(Screen::Projects); }
+        if f3_press { self.navigate_to(Screen::Planner); }
+
+        // Mouse back/forward (buttons 4 & 5) + Alt+Arrow navigation
+        let mouse_back = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1));
+        let mouse_fwd  = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra2));
+        let alt_left   = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft));
+        let alt_right  = ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight));
+        if mouse_back || alt_left  { self.navigate_back(); }
+        if mouse_fwd  || alt_right { self.navigate_forward(); }
 
         if ctrl_f && self.screen == Screen::Dashboard {
             self.search.open = !self.search.open;
@@ -4080,7 +4118,7 @@ impl eframe::App for TheGridApp {
                         );
                         device_clicked = result.clicked_device;
                         if let Some(nav) = result.navigate_to {
-                            self.screen = nav;
+                            self.navigate_to(nav);
                         }
                         if result.open_planner_add {
                             self.planner_add.open = true;
@@ -4462,7 +4500,7 @@ impl eframe::App for TheGridApp {
                             &mut self.ai_panel,
                         );
                         _device_clicked = result.clicked_device;
-                        if let Some(nav) = result.navigate_to { self.screen = nav; }
+                        if let Some(nav) = result.navigate_to { self.navigate_to(nav); }
                         if result.open_planner_add { self.planner_add.open = true; }
                         if result.open_project_add { self.project_add.open = true; }
                         if let Some(m) = result.ai_load_model { let _ = self.event_tx.send(AppEvent::OllamaLoadModel(m)); }
@@ -4500,7 +4538,7 @@ impl eframe::App for TheGridApp {
 
                 if let Some(proj_id) = goto_planner {
                     self.planner_selected = Some(proj_id);
-                    self.screen = Screen::Planner;
+                    self.navigate_to(Screen::Planner);
                 }
                 self.render_toasts(ctx);
             }
@@ -4555,7 +4593,7 @@ impl eframe::App for TheGridApp {
                             &mut self.ai_panel,
                         );
                         _device_clicked = result.clicked_device;
-                        if let Some(nav) = result.navigate_to { self.screen = nav; }
+                        if let Some(nav) = result.navigate_to { self.navigate_to(nav); }
                         if result.open_planner_add { self.planner_add.open = true; }
                         if result.open_project_add { self.project_add.open = true; }
                         if let Some(m) = result.ai_load_model { let _ = self.event_tx.send(AppEvent::OllamaLoadModel(m)); }

@@ -2,7 +2,7 @@
 name        = "thegrid-ai"
 version     = "0.1.0"
 edition     = "2021"
-description = "Semantic vector indexing for THE GRID (Phase 4 — stubs only)"
+description = "Semantic vector indexing and media analysis for THE GRID"
 
 [dependencies]
 thegrid-core = { path = "../thegrid-core" }

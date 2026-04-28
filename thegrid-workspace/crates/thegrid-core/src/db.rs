@@ -713,7 +713,7 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, path FROM files 
              WHERE (ai_metadata IS NULL OR ai_metadata = '')
-               AND (ext IN ('jpg', 'jpeg', 'png', 'webp', 'mp4', 'mkv', 'mov', 'avi'))
+                             AND (ext IN ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'mp4', 'mkv', 'mov', 'avi'))
              LIMIT ?1"
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
@@ -1146,6 +1146,116 @@ impl Database {
         };
 
         Ok(results)
+    }
+
+    pub fn search_fts_with_media_filters(
+        &self,
+        query: &str,
+        limit: usize,
+        device_filter: Option<&str>,
+        in_focus: Option<bool>,
+        min_quality: Option<f32>,
+        min_focus_score: Option<f32>,
+        min_megapixels: Option<f32>,
+    ) -> Result<Vec<FileSearchResult>> {
+        let focus_param: Option<i64> = in_focus.map(|v| if v { 1 } else { 0 });
+
+        let mut out = Vec::new();
+        if query.trim().is_empty() {
+            // Filter-only mode: no FTS text query required.
+            let sql = if device_filter.is_some() {
+                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
+                 FROM files
+                 WHERE device_id = ?1
+                   AND ai_metadata IS NOT NULL AND ai_metadata != ''
+                   AND (?2 IS NULL OR CAST(json_extract(ai_metadata, '$.in_focus') AS INTEGER) = ?2)
+                   AND (?3 IS NULL OR CAST(json_extract(ai_metadata, '$.quality_score') AS REAL) >= ?3)
+                   AND (?4 IS NULL OR CAST(json_extract(ai_metadata, '$.focus_score') AS REAL) >= ?4)
+                   AND (?5 IS NULL OR CAST(json_extract(ai_metadata, '$.megapixels') AS REAL) >= ?5)
+                 ORDER BY indexed_at DESC
+                 LIMIT ?6"
+            } else {
+                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
+                 FROM files
+                 WHERE ai_metadata IS NOT NULL AND ai_metadata != ''
+                   AND (?1 IS NULL OR CAST(json_extract(ai_metadata, '$.in_focus') AS INTEGER) = ?1)
+                   AND (?2 IS NULL OR CAST(json_extract(ai_metadata, '$.quality_score') AS REAL) >= ?2)
+                   AND (?3 IS NULL OR CAST(json_extract(ai_metadata, '$.focus_score') AS REAL) >= ?3)
+                   AND (?4 IS NULL OR CAST(json_extract(ai_metadata, '$.megapixels') AS REAL) >= ?4)
+                 ORDER BY indexed_at DESC
+                 LIMIT ?5"
+            };
+
+            let mut stmt = self.conn.prepare(sql)?;
+            if let Some(dev) = device_filter {
+                let rows = stmt.query_map(
+                    params![dev, focus_param, min_quality, min_focus_score, min_megapixels, limit as i64],
+                    |row| self.map_search_result(row),
+                )?;
+                for r in rows {
+                    out.push(r?);
+                }
+            } else {
+                let rows = stmt.query_map(
+                    params![focus_param, min_quality, min_focus_score, min_megapixels, limit as i64],
+                    |row| self.map_search_result(row),
+                )?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            return Ok(out);
+        }
+
+        let safe_query = sanitize_fts_query(query);
+        let sql = if device_filter.is_some() {
+            "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
+                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
+             FROM files_fts fts
+             JOIN files f ON f.id = fts.rowid
+             WHERE files_fts MATCH ?1
+               AND f.device_id = ?2
+               AND f.ai_metadata IS NOT NULL AND f.ai_metadata != ''
+               AND (?3 IS NULL OR CAST(json_extract(f.ai_metadata, '$.in_focus') AS INTEGER) = ?3)
+               AND (?4 IS NULL OR CAST(json_extract(f.ai_metadata, '$.quality_score') AS REAL) >= ?4)
+               AND (?5 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focus_score') AS REAL) >= ?5)
+               AND (?6 IS NULL OR CAST(json_extract(f.ai_metadata, '$.megapixels') AS REAL) >= ?6)
+             ORDER BY fts.rank
+             LIMIT ?7"
+        } else {
+            "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
+                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
+             FROM files_fts fts
+             JOIN files f ON f.id = fts.rowid
+             WHERE files_fts MATCH ?1
+               AND f.ai_metadata IS NOT NULL AND f.ai_metadata != ''
+               AND (?2 IS NULL OR CAST(json_extract(f.ai_metadata, '$.in_focus') AS INTEGER) = ?2)
+               AND (?3 IS NULL OR CAST(json_extract(f.ai_metadata, '$.quality_score') AS REAL) >= ?3)
+               AND (?4 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focus_score') AS REAL) >= ?4)
+               AND (?5 IS NULL OR CAST(json_extract(f.ai_metadata, '$.megapixels') AS REAL) >= ?5)
+             ORDER BY fts.rank
+             LIMIT ?6"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        if let Some(dev) = device_filter {
+            let rows = stmt.query_map(
+                params![safe_query, dev, focus_param, min_quality, min_focus_score, min_megapixels, limit as i64],
+                |row| self.map_search_result(row),
+            )?;
+            for r in rows {
+                out.push(r?);
+            }
+        } else {
+            let rows = stmt.query_map(
+                params![safe_query, focus_param, min_quality, min_focus_score, min_megapixels, limit as i64],
+                |row| self.map_search_result(row),
+            )?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
     }
 
     // ── Temporal View ─────────────────────────────────────────────────────
