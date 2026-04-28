@@ -2,6 +2,7 @@
 use chrono::Local;
 use semver::Version;
 use serde::Deserialize;
+use sysinfo::System;
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -349,6 +350,10 @@ struct TuiState {
     /// Last known ping result per IP: true = ok, false = failed, absent = untested.
     node_status: std::collections::HashMap<String, bool>,
     dirty: bool,
+    // ── system metrics (sysinfo) ──────────────────────────────────────────────
+    cpu_pct: f32,
+    ram_used_mb: u64,
+    ram_total_mb: u64,
     // ── ratatui input & scroll state ─────────────────────────────────────────
     /// Current text being typed in the input bar.
     input_buf: String,
@@ -371,6 +376,9 @@ impl TuiState {
             sync_health: std::collections::HashMap::new(),
             node_status: std::collections::HashMap::new(),
             dirty: true,
+            cpu_pct: 0.0,
+            ram_used_mb: 0,
+            ram_total_mb: 0,
             input_buf: String::new(),
             log_scroll: 0,
             history_cursor: None,
@@ -546,74 +554,7 @@ fn draw_commands_panel(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
     frame.render_widget(para, area);
 }
 
-fn draw_devices_panel(
-    frame: &mut ratatui::Frame,
-    area: ratatui::layout::Rect,
-    state: &TuiState,
-) {
-    let cyan = Style::default().fg(Color::Green);
-    let cyan_bold = cyan.add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(Color::DarkGray);
-    let green_bright = Style::default().fg(Color::LightGreen);
-    let red = Style::default().fg(Color::Red);
-    let white = Style::default().fg(Color::White);
-
-    let rows: Vec<Row> = if state.devices.is_empty() {
-        vec![Row::new(vec![
-            Cell::from(Span::styled("  \u{25C8}", dim)),
-            Cell::from(""),
-            Cell::from(Span::styled("none — run: devices", dim)),
-            Cell::from(""),
-        ])]
-    } else {
-        state
-            .devices
-            .iter()
-            .enumerate()
-            .map(|(idx, (name, ip))| {
-                let (dot, dot_style) = match state.node_status.get(ip.as_str()) {
-                    Some(true) => ("\u{25C9}", green_bright),
-                    Some(false) => ("\u{25CC}", red),
-                    None => ("\u{25C8}", dim),
-                };
-                Row::new(vec![
-                    Cell::from(Span::styled(format!(" {} ", dot), dot_style)),
-                    Cell::from(Span::styled(format!("{}.", idx + 1), dim)),
-                    Cell::from(Span::styled(name.clone(), white)),
-                    Cell::from(Span::styled(ip.clone(), dim)),
-                ])
-            })
-            .collect()
-    };
-
-    let widths = [
-        Constraint::Length(4),
-        Constraint::Length(3),
-        Constraint::Fill(1),
-        Constraint::Length(16),
-    ];
-
-    let table = Table::new(rows, widths)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(cyan)
-                .title(Span::styled(" CONNECTED ", cyan_bold)),
-        )
-        .header(
-            Row::new(vec![
-                Cell::from(""),
-                Cell::from(Span::styled("#", dim)),
-                Cell::from(Span::styled("Name", dim)),
-                Cell::from(Span::styled("IP", dim)),
-            ])
-            .style(dim),
-        );
-
-    frame.render_widget(table, area);
-}
-
-fn draw_mesh_panel(
+fn draw_mesh_devices_panel(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     state: &TuiState,
@@ -624,37 +565,40 @@ fn draw_mesh_panel(
     let green_bright = Style::default().fg(Color::LightGreen);
     let red = Style::default().fg(Color::Red);
 
+    // Collect mesh entries keyed by device id
     let mut entries: Vec<(&String, &SyncHealthMetrics)> = state.sync_health.iter().collect();
     entries.sort_by_key(|(id, _)| id.as_str());
-
-    let mut rows: Vec<Row> = entries
-        .iter()
-        .take(8)
-        .map(|(id, h)| {
-            let age = h.sync_age_secs
-                .map(|s| format!("{}s", s))
-                .unwrap_or_else(|| "\u{2014}".to_string());
-            let is_live = h.sync_age_secs.map(|s| s < 120).unwrap_or(false);
-            let (dot, live_txt, dot_style) = if is_live {
-                ("\u{25C9}", "LIVE ", green_bright)
-            } else {
-                ("\u{25CC}", "STALE", dim)
-            };
-            Row::new(vec![
-                Cell::from(Span::styled(format!(" {} ", dot), dot_style)),
-                Cell::from(Span::styled(id.as_str().to_string(), Style::default().fg(Color::Green))),
-                Cell::from(Span::styled(format!("age {}", age), dim)),
-                Cell::from(Span::styled(format!("tombs {:>3}", h.tombstone_count), dim)),
-                Cell::from(Span::styled(format!("fail {:>2}", h.sync_failures), dim)),
-                Cell::from(Span::styled(live_txt.to_string(), dot_style)),
-            ])
-        })
-        .collect();
-
-    let known: std::collections::HashSet<&str> =
+    let mesh_ids: std::collections::HashSet<&str> =
         entries.iter().map(|(id, _)| id.as_str()).collect();
+
+    let mut rows: Vec<Row> = Vec::new();
+
+    // --- Devices WITH mesh health ---
+    for (id, h) in entries.iter().take(8) {
+        let age = h.sync_age_secs
+            .map(|s| format!("{}s", s))
+            .unwrap_or_else(|| "\u{2014}".to_string());
+        let is_live = h.sync_age_secs.map(|s| s < 120).unwrap_or(false);
+        let (dot, ping_style) = match state.node_status.get(*id) {
+            Some(true) => ("\u{25C9}", green_bright),
+            Some(false) => ("\u{25CC}", red),
+            None => if is_live { ("\u{25C9}", green_bright) } else { ("\u{25C8}", dim) },
+        };
+        let state_str = if is_live { "LIVE " } else { "STALE" };
+        let state_style = if is_live { green_bright } else { dim };
+        rows.push(Row::new(vec![
+            Cell::from(Span::styled(format!(" {} ", dot), ping_style)),
+            Cell::from(Span::styled(id.as_str().to_string(), Style::default().fg(Color::Green))),
+            Cell::from(Span::styled(format!("age {}", age), dim)),
+            Cell::from(Span::styled(format!("tombs {:>3}", h.tombstone_count), dim)),
+            Cell::from(Span::styled(format!("fail {:>2}", h.sync_failures), dim)),
+            Cell::from(Span::styled(state_str.to_string(), state_style)),
+        ]));
+    }
+
+    // --- Connected devices NOT yet in mesh ---
     for (name, ip) in state.devices.iter().take(8) {
-        if known.contains(name.as_str()) {
+        if mesh_ids.contains(name.as_str()) {
             continue;
         }
         let (dot, dot_style) = match state.node_status.get(ip.as_str()) {
@@ -667,6 +611,17 @@ fn draw_mesh_panel(
             Cell::from(Span::styled(name.clone(), dim)),
             Cell::from(Span::styled(format!("({})", ip), dim)),
             Cell::from(Span::styled("pending sync", dim)),
+            Cell::from(""),
+            Cell::from(""),
+        ]));
+    }
+
+    if rows.is_empty() {
+        rows.push(Row::new(vec![
+            Cell::from(Span::styled("  \u{25C8}", dim)),
+            Cell::from(Span::styled("none — run: devices", dim)),
+            Cell::from(""),
+            Cell::from(""),
             Cell::from(""),
             Cell::from(""),
         ]));
@@ -686,7 +641,7 @@ fn draw_mesh_panel(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(cyan)
-                .title(Span::styled(" MESH ", cyan_bold)),
+                .title(Span::styled(" MESH & DEVICES ", cyan_bold)),
         )
         .header(
             Row::new(vec![
@@ -769,6 +724,47 @@ fn draw_input_bar(
     }
 }
 
+fn draw_sysinfo_bar(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, state: &TuiState) {
+    let cyan = Style::default().fg(Color::Green);
+    let cyan_bold = cyan.add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let white = Style::default().fg(Color::White);
+    let bar_width = (area.width.saturating_sub(4)) as usize;
+
+    fn filled_bar(pct: f32, width: usize) -> String {
+        let filled = ((pct / 100.0) * width as f32).round() as usize;
+        let filled = filled.min(width);
+        format!("{}{}", "\u{2588}".repeat(filled), "\u{2591}".repeat(width - filled))
+    }
+
+    let ram_pct = if state.ram_total_mb > 0 {
+        state.ram_used_mb as f32 / state.ram_total_mb as f32 * 100.0
+    } else {
+        0.0
+    };
+
+    let cpu_bar = filled_bar(state.cpu_pct, (bar_width / 2).saturating_sub(12));
+    let ram_bar = filled_bar(ram_pct, (bar_width / 2).saturating_sub(12));
+
+    let line = TuiLine::from(vec![
+        Span::styled("  CPU ", dim),
+        Span::styled(format!("{:5.1}% ", state.cpu_pct), white),
+        Span::styled(cpu_bar, Style::default().fg(Color::Cyan)),
+        Span::styled("   RAM ", dim),
+        Span::styled(format!("{:5.1}% ", ram_pct), white),
+        Span::styled(ram_bar, Style::default().fg(Color::Blue)),
+        Span::styled(format!("  {}/{}MB", state.ram_used_mb, state.ram_total_mb), dim),
+    ]);
+
+    let para = Paragraph::new(vec![line]).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(cyan)
+            .title(Span::styled(" SYSTEM ", cyan_bold)),
+    );
+    frame.render_widget(para, area);
+}
+
 fn draw_tui(frame: &mut ratatui::Frame, state: &TuiState, device_name: &str, port: u16) {
     let area = frame.area();
     let has_mesh = !state.sync_health.is_empty() || !state.devices.is_empty();
@@ -778,37 +774,31 @@ fn draw_tui(frame: &mut ratatui::Frame, state: &TuiState, device_name: &str, por
         0
     };
 
-    // Outer vertical chunks: top panel | mesh | log | input
+    // Outer vertical chunks: sysinfo | top panel | mesh+devices | log | input
     let outer = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(mesh_h),
-        Constraint::Length(13),
-        Constraint::Length(3),
+        Constraint::Length(3),   // CPU/RAM bar
+        Constraint::Fill(1),     // top: left info + commands
+        Constraint::Length(mesh_h), // merged mesh & devices panel
+        Constraint::Length(13),  // log
+        Constraint::Length(3),   // input bar
     ])
     .split(area);
 
-    // Top: left info | right (commands + devices)
+    // Top: left info | commands
     let top = Layout::horizontal([
         Constraint::Percentage(32),
         Constraint::Fill(1),
     ])
-    .split(outer[0]);
+    .split(outer[1]);
 
-    // Right: commands | devices
-    let right = Layout::horizontal([
-        Constraint::Percentage(52),
-        Constraint::Fill(1),
-    ])
-    .split(top[1]);
-
+    draw_sysinfo_bar(frame, outer[0], state);
     draw_left_panel(frame, top[0], state, device_name, port);
-    draw_commands_panel(frame, right[0]);
-    draw_devices_panel(frame, right[1], state);
+    draw_commands_panel(frame, top[1]);
     if has_mesh {
-        draw_mesh_panel(frame, outer[1], state);
+        draw_mesh_devices_panel(frame, outer[2], state);
     }
-    draw_log_panel(frame, outer[2], state);
-    draw_input_bar(frame, outer[3], state);
+    draw_log_panel(frame, outer[3], state);
+    draw_input_bar(frame, outer[4], state);
 }
 
 fn emit(state: &Arc<Mutex<TuiState>>, tui_mode: bool, icon: &str, label: &str, message: impl AsRef<str>) {
@@ -1452,6 +1442,37 @@ fn main() -> Result<()> {
     }
 
     let mut last_render = Instant::now();
+
+    // ── sysinfo: background thread updates CPU/RAM every ~2 seconds ──────────
+    {
+        let ui_state_sys = Arc::clone(&ui_state);
+        let running_sys = Arc::clone(&running);
+        std::thread::spawn(move || {
+            let mut sys = System::new_all();
+            // First refresh to seed CPU baseline (sysinfo needs two reads for CPU %)
+            sys.refresh_cpu_all();
+            std::thread::sleep(Duration::from_millis(500));
+            while running_sys.load(Ordering::Relaxed) {
+                sys.refresh_cpu_all();
+                sys.refresh_memory();
+                let cpu: f32 = {
+                    let cpus = sys.cpus();
+                    if cpus.is_empty() { 0.0 } else {
+                        cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32
+                    }
+                };
+                let ram_used = sys.used_memory() / 1_048_576;
+                let ram_total = sys.total_memory() / 1_048_576;
+                if let Ok(mut s) = ui_state_sys.lock() {
+                    s.cpu_pct = cpu;
+                    s.ram_used_mb = ram_used;
+                    s.ram_total_mb = ram_total;
+                    s.dirty = true;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+    }
 
     // Main event loop
     while running.load(Ordering::Relaxed) {

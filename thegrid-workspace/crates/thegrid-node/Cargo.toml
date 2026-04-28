@@ -29,3 +29,6 @@ semver     = "1"
 # TUI — ratatui for the interactive dashboard, crossterm as the backend
 ratatui    = "0.28"
 crossterm  = "0.28"
+
+# System metrics — CPU / RAM readings (used by `bottom` internally, same source)
+sysinfo    = { version = "0.33", default-features = false, features = ["system"] }

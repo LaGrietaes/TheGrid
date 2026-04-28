@@ -4544,6 +4544,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sysinfo 0.33.1",
  "thegrid-core",
  "thegrid-net",
  "thegrid-runtime",
