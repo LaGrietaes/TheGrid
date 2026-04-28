@@ -18,3 +18,4 @@ reqwest       = { workspace = true }
 sysinfo     = "0.33"
 # Basic image metadata extraction (no GPU required)
 image       = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+kamadak-exif = "0.6"

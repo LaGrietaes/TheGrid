@@ -18,6 +18,7 @@ chrono     = { workspace = true }
 tokio      = { workspace = true }
 reqwest    = { workspace = true }
 jwalk      = { workspace = true }
+base64     = { workspace = true }
 hostname   = "0.3"
 dirs       = "5"
 uuid       = { version = "1.7", features = ["v4"] }

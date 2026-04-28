@@ -25,6 +25,7 @@ Source: "launch_thegrid.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "launch_thegrid_node.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "SETUP.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "scripts\install_explorer_context_menu.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\The Grid"; Filename: "{app}\launch_thegrid.cmd"
@@ -32,7 +33,11 @@ Name: "{group}\The Grid Node (Headless)"; Filename: "{app}\launch_thegrid_node.c
 Name: "{commondesktop}\The Grid"; Filename: "{app}\launch_thegrid.cmd"
 
 [Run]
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\install_explorer_context_menu.ps1"" -Action install -ExePath ""{app}\thegrid.exe"""; Flags: runhidden postinstall
 Filename: "{app}\launch_thegrid.cmd"; Description: "Launch The Grid"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\install_explorer_context_menu.ps1"" -Action uninstall"; Flags: runhidden
 
 [UninstallDelete]
 ; Keep user data (config/index DB) under AppData intact across uninstall/update.

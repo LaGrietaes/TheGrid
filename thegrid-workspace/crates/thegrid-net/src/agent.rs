@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use reqwest::blocking::Client;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -13,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thegrid_core::{AppEvent, models::*, Config};
 use ascii::AsciiStr;
+use thegrid_ai::MediaAnalyzer;
 
 const AGENT_VERSION: &str = "0.3.0";
 
@@ -1053,11 +1055,100 @@ impl AgentServer {
                                             )
                                         }
                                     }
-                                    _ => (
-                                        thegrid_core::models::ComputeTaskState::Failed,
-                                        None,
-                                        Some("unsupported task type".to_string()),
-                                    ),
+                                    thegrid_core::models::ComputePayload::ImageEmbed { file_url } => {
+                                        // Supports either:
+                                        // 1) Local filesystem path
+                                        // 2) data:*;base64,<bytes> inline payload
+                                        let decode_data_url = |input: &str| -> Result<Vec<u8>> {
+                                            let marker = ";base64,";
+                                            let pos = input.find(marker)
+                                                .ok_or_else(|| anyhow::anyhow!("invalid data URL"))?;
+                                            let b64 = &input[(pos + marker.len())..];
+                                            let bytes = base64::engine::general_purpose::STANDARD
+                                                .decode(b64)
+                                                .context("decode base64 image payload")?;
+                                            Ok(bytes)
+                                        };
+
+                                        let mut temp_path: Option<std::path::PathBuf> = None;
+                                        let path = if file_url.starts_with("data:") {
+                                            match decode_data_url(file_url) {
+                                                Ok(bytes) => {
+                                                    let p = std::env::temp_dir().join(format!(
+                                                        "thegrid-compute-img-{}.bin",
+                                                        task_id
+                                                    ));
+                                                    if let Err(e) = std::fs::write(&p, &bytes) {
+                                                        (
+                                                            thegrid_core::models::ComputeTaskState::Failed,
+                                                            None,
+                                                            Some(format!("failed writing temp image payload: {}", e)),
+                                                        )
+                                                    } else {
+                                                        temp_path = Some(p.clone());
+                                                        let mode = thegrid_ai::MediaProcessingMode::Auto;
+                                                        match thegrid_ai::CudaMediaAnalyzer::new_with_mode(mode)
+                                                            .and_then(|az| az.analyze(&p))
+                                                        {
+                                                            Ok(meta) => {
+                                                                let payload = serde_json::to_string(&meta)
+                                                                    .unwrap_or_else(|_| "{}".to_string());
+                                                                (
+                                                                    thegrid_core::models::ComputeTaskState::Done,
+                                                                    Some(payload),
+                                                                    None,
+                                                                )
+                                                            }
+                                                            Err(e) => (
+                                                                thegrid_core::models::ComputeTaskState::Failed,
+                                                                None,
+                                                                Some(e.to_string()),
+                                                            ),
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => (
+                                                    thegrid_core::models::ComputeTaskState::Failed,
+                                                    None,
+                                                    Some(e.to_string()),
+                                                ),
+                                            }
+                                        } else {
+                                            let p = std::path::PathBuf::from(file_url);
+                                            if p.exists() && p.is_file() {
+                                                let mode = thegrid_ai::MediaProcessingMode::Auto;
+                                                match thegrid_ai::CudaMediaAnalyzer::new_with_mode(mode)
+                                                    .and_then(|az| az.analyze(&p))
+                                                {
+                                                    Ok(meta) => {
+                                                        let payload = serde_json::to_string(&meta)
+                                                            .unwrap_or_else(|_| "{}".to_string());
+                                                        (
+                                                            thegrid_core::models::ComputeTaskState::Done,
+                                                            Some(payload),
+                                                            None,
+                                                        )
+                                                    }
+                                                    Err(e) => (
+                                                        thegrid_core::models::ComputeTaskState::Failed,
+                                                        None,
+                                                        Some(e.to_string()),
+                                                    ),
+                                                }
+                                            } else {
+                                                (
+                                                    thegrid_core::models::ComputeTaskState::Failed,
+                                                    None,
+                                                    Some("image file not found on this node".to_string()),
+                                                )
+                                            }
+                                        };
+
+                                        if let Some(p) = temp_path {
+                                            let _ = std::fs::remove_file(p);
+                                        }
+                                        path
+                                    }
                                 };
 
                                 // Write final state

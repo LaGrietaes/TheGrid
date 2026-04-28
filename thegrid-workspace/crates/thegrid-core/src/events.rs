@@ -298,4 +298,25 @@ pub enum AppEvent {
 
     /// User clicked "Start Agent" — spawn/resume the local AI agent worker.
     OllamaStartAgent { model: String },
+
+    // ── Media Review / Culling ─────────────────────────────────────────────
+    /// Set rating/pick/color for a file (fire-and-forget from GUI).
+    SetMediaReview {
+        file_id:     i64,
+        rating:      Option<u8>,
+        pick_flag:   Option<String>,
+        color_label: Option<String>,
+    },
+
+    /// Response after loading review state for a file.
+    MediaReviewLoaded {
+        file_id:     i64,
+        rating:      Option<u8>,
+        pick_flag:   String,
+        color_label: Option<String>,
+        reviewed_at: i64,
+    },
+
+    /// Bulk review state loaded for multiple files (file_id → (rating, pick_flag, color_label)).
+    MediaReviewBulkLoaded(std::collections::HashMap<i64, (Option<u8>, String, Option<String>)>),
 }

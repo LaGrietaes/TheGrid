@@ -41,6 +41,11 @@ pub struct Config {
     #[serde(default)]
     pub ai_provider_url: Option<String>,
 
+    /// Media processing mode: "auto" | "cpu" | "dedicated_gpu".
+    /// Auto picks dedicated GPU when available, otherwise CPU.
+    #[serde(default = "Config::default_media_processing_mode")]
+    pub media_processing_mode: String,
+
     /// Use tablet offload as helper when tablet appears idle/low-usage.
     #[serde(default = "Config::default_true")]
     pub ai_tablet_assist: bool,
@@ -138,6 +143,7 @@ impl Default for Config {
             transfers_dir: None,
             ai_model: None,
             ai_provider_url: None,
+            media_processing_mode: Self::default_media_processing_mode(),
             ai_tablet_assist: true,
             ai_tablet_assist_cpu_max_pct: Self::default_tablet_cpu_max_pct(),
             ai_tablet_assist_gpu_max_pct: Self::default_tablet_gpu_max_pct(),
@@ -184,6 +190,9 @@ impl Config {
     }
     fn default_embedding_parallel_requests() -> usize {
         3
+    }
+    fn default_media_processing_mode() -> String {
+        "auto".to_string()
     }
     fn default_drive_buffer_quota_tb() -> u32 {
         15

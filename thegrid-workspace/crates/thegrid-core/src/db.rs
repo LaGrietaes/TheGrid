@@ -162,6 +162,16 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag);
             CREATE INDEX IF NOT EXISTS idx_file_tags_project ON file_tags(project);
 
+            CREATE TABLE IF NOT EXISTS media_review (
+                file_id      INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                rating       INTEGER,
+                pick_flag    TEXT    NOT NULL DEFAULT 'none',
+                color_label  TEXT,
+                reviewed_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_review_rating ON media_review(rating);
+            CREATE INDEX IF NOT EXISTS idx_media_review_pick ON media_review(pick_flag);
+
             CREATE TABLE IF NOT EXISTS known_devices (
                 device_id   TEXT PRIMARY KEY,
                 device_name TEXT NOT NULL,
@@ -519,6 +529,56 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_media_review(
+        &self,
+        file_id: i64,
+        rating: Option<u8>,
+        pick_flag: Option<&str>,
+        color_label: Option<&str>,
+    ) -> Result<()> {
+        let normalized_pick = pick_flag
+            .map(|p| p.to_ascii_lowercase())
+            .filter(|p| p == "pick" || p == "reject" || p == "none")
+            .unwrap_or_else(|| "none".to_string());
+
+        self.conn.execute(
+            "INSERT INTO media_review (file_id, rating, pick_flag, color_label, reviewed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(file_id) DO UPDATE
+               SET rating = excluded.rating,
+                   pick_flag = excluded.pick_flag,
+                   color_label = excluded.color_label,
+                   reviewed_at = excluded.reviewed_at",
+            params![
+                file_id,
+                rating.map(|r| r as i64),
+                normalized_pick,
+                color_label,
+                unix_now(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_media_review(&self, file_id: i64) -> Result<Option<(Option<u8>, String, Option<String>, i64)>> {
+        let row = self.conn.query_row(
+            "SELECT rating, pick_flag, color_label, reviewed_at
+             FROM media_review
+             WHERE file_id = ?1",
+            params![file_id],
+            |r| {
+                let rating_i: Option<i64> = r.get(0)?;
+                Ok((
+                    rating_i.and_then(|v| u8::try_from(v).ok()),
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
+        ).optional()?;
+        Ok(row)
+    }
+
     pub fn get_file_id_by_path(&self, device_id: &str, path: &Path) -> Result<Option<i64>> {
         let path_str = path.to_string_lossy().to_string();
         let id = self.conn.query_row(
@@ -725,6 +785,17 @@ impl Database {
         let mut out = Vec::new();
         for r in rows { out.push(r?); }
         Ok(out)
+    }
+
+    pub fn count_files_needing_media_ai(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files
+             WHERE (ai_metadata IS NULL OR ai_metadata = '')
+               AND (ext IN ('jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp', 'tif', 'tiff', 'mp4', 'mkv', 'mov', 'avi'))",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as usize)
     }
 
     pub fn save_embedding(&self, file_id: i64, model: &str, vector: &[f32]) -> Result<()> {
@@ -1157,8 +1228,26 @@ impl Database {
         min_quality: Option<f32>,
         min_focus_score: Option<f32>,
         min_megapixels: Option<f32>,
+        camera_contains: Option<&str>,
+        lens_contains: Option<&str>,
+        min_iso: Option<u32>,
+        max_iso: Option<u32>,
+        min_aperture: Option<f32>,
+        max_aperture: Option<f32>,
+        min_focal_mm: Option<f32>,
+        max_focal_mm: Option<f32>,
+        captured_after: Option<&str>,
+        captured_before: Option<&str>,
+        require_gps: Option<bool>,
+        min_rating: Option<u8>,
+        pick_flag: Option<&str>,
     ) -> Result<Vec<FileSearchResult>> {
         let focus_param: Option<i64> = in_focus.map(|v| if v { 1 } else { 0 });
+        let camera_like: Option<String> = camera_contains.map(|s| format!("%{}%", s.to_ascii_lowercase()));
+        let lens_like: Option<String> = lens_contains.map(|s| format!("%{}%", s.to_ascii_lowercase()));
+        let gps_param: Option<i64> = require_gps.map(|v| if v { 1 } else { 0 });
+        let min_rating_param: Option<i64> = min_rating.map(|r| r as i64);
+        let pick_flag_param: Option<String> = pick_flag.map(|p| p.to_ascii_lowercase());
 
         let mut out = Vec::new();
         if query.trim().is_empty() {
@@ -1172,8 +1261,21 @@ impl Database {
                    AND (?3 IS NULL OR CAST(json_extract(ai_metadata, '$.quality_score') AS REAL) >= ?3)
                    AND (?4 IS NULL OR CAST(json_extract(ai_metadata, '$.focus_score') AS REAL) >= ?4)
                    AND (?5 IS NULL OR CAST(json_extract(ai_metadata, '$.megapixels') AS REAL) >= ?5)
+                   AND (?6 IS NULL OR LOWER(CAST(json_extract(ai_metadata, '$.camera_model') AS TEXT)) LIKE ?6)
+                   AND (?7 IS NULL OR LOWER(CAST(json_extract(ai_metadata, '$.lens_model') AS TEXT)) LIKE ?7)
+                   AND (?8 IS NULL OR CAST(json_extract(ai_metadata, '$.iso') AS INTEGER) >= ?8)
+                   AND (?9 IS NULL OR CAST(json_extract(ai_metadata, '$.iso') AS INTEGER) <= ?9)
+                   AND (?10 IS NULL OR CAST(json_extract(ai_metadata, '$.aperture') AS REAL) >= ?10)
+                   AND (?11 IS NULL OR CAST(json_extract(ai_metadata, '$.aperture') AS REAL) <= ?11)
+                   AND (?12 IS NULL OR CAST(json_extract(ai_metadata, '$.focal_length_mm') AS REAL) >= ?12)
+                   AND (?13 IS NULL OR CAST(json_extract(ai_metadata, '$.focal_length_mm') AS REAL) <= ?13)
+                   AND (?14 IS NULL OR CAST(json_extract(ai_metadata, '$.captured_at') AS TEXT) >= ?14)
+                   AND (?15 IS NULL OR CAST(json_extract(ai_metadata, '$.captured_at') AS TEXT) <= ?15)
+                   AND (?16 IS NULL OR ((json_extract(ai_metadata, '$.gps_lat') IS NOT NULL AND json_extract(ai_metadata, '$.gps_lon') IS NOT NULL) = ?16))
+                                     AND (?17 IS NULL OR COALESCE((SELECT mr.rating FROM media_review mr WHERE mr.file_id = files.id), 0) >= ?17)
+                                     AND (?18 IS NULL OR COALESCE((SELECT mr.pick_flag FROM media_review mr WHERE mr.file_id = files.id), 'none') = ?18)
                  ORDER BY indexed_at DESC
-                 LIMIT ?6"
+                                 LIMIT ?19"
             } else {
                 "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
                  FROM files
@@ -1182,14 +1284,47 @@ impl Database {
                    AND (?2 IS NULL OR CAST(json_extract(ai_metadata, '$.quality_score') AS REAL) >= ?2)
                    AND (?3 IS NULL OR CAST(json_extract(ai_metadata, '$.focus_score') AS REAL) >= ?3)
                    AND (?4 IS NULL OR CAST(json_extract(ai_metadata, '$.megapixels') AS REAL) >= ?4)
+                   AND (?5 IS NULL OR LOWER(CAST(json_extract(ai_metadata, '$.camera_model') AS TEXT)) LIKE ?5)
+                   AND (?6 IS NULL OR LOWER(CAST(json_extract(ai_metadata, '$.lens_model') AS TEXT)) LIKE ?6)
+                   AND (?7 IS NULL OR CAST(json_extract(ai_metadata, '$.iso') AS INTEGER) >= ?7)
+                   AND (?8 IS NULL OR CAST(json_extract(ai_metadata, '$.iso') AS INTEGER) <= ?8)
+                   AND (?9 IS NULL OR CAST(json_extract(ai_metadata, '$.aperture') AS REAL) >= ?9)
+                   AND (?10 IS NULL OR CAST(json_extract(ai_metadata, '$.aperture') AS REAL) <= ?10)
+                   AND (?11 IS NULL OR CAST(json_extract(ai_metadata, '$.focal_length_mm') AS REAL) >= ?11)
+                   AND (?12 IS NULL OR CAST(json_extract(ai_metadata, '$.focal_length_mm') AS REAL) <= ?12)
+                   AND (?13 IS NULL OR CAST(json_extract(ai_metadata, '$.captured_at') AS TEXT) >= ?13)
+                   AND (?14 IS NULL OR CAST(json_extract(ai_metadata, '$.captured_at') AS TEXT) <= ?14)
+                   AND (?15 IS NULL OR ((json_extract(ai_metadata, '$.gps_lat') IS NOT NULL AND json_extract(ai_metadata, '$.gps_lon') IS NOT NULL) = ?15))
+                                     AND (?16 IS NULL OR COALESCE((SELECT mr.rating FROM media_review mr WHERE mr.file_id = files.id), 0) >= ?16)
+                                     AND (?17 IS NULL OR COALESCE((SELECT mr.pick_flag FROM media_review mr WHERE mr.file_id = files.id), 'none') = ?17)
                  ORDER BY indexed_at DESC
-                 LIMIT ?5"
+                                 LIMIT ?18"
             };
 
             let mut stmt = self.conn.prepare(sql)?;
             if let Some(dev) = device_filter {
                 let rows = stmt.query_map(
-                    params![dev, focus_param, min_quality, min_focus_score, min_megapixels, limit as i64],
+                    params![
+                        dev,
+                        focus_param,
+                        min_quality,
+                        min_focus_score,
+                        min_megapixels,
+                        camera_like,
+                        lens_like,
+                        min_iso,
+                        max_iso,
+                        min_aperture,
+                        max_aperture,
+                        min_focal_mm,
+                        max_focal_mm,
+                        captured_after,
+                        captured_before,
+                        gps_param,
+                        min_rating_param,
+                        pick_flag_param,
+                        limit as i64,
+                    ],
                     |row| self.map_search_result(row),
                 )?;
                 for r in rows {
@@ -1197,7 +1332,26 @@ impl Database {
                 }
             } else {
                 let rows = stmt.query_map(
-                    params![focus_param, min_quality, min_focus_score, min_megapixels, limit as i64],
+                    params![
+                        focus_param,
+                        min_quality,
+                        min_focus_score,
+                        min_megapixels,
+                        camera_like,
+                        lens_like,
+                        min_iso,
+                        max_iso,
+                        min_aperture,
+                        max_aperture,
+                        min_focal_mm,
+                        max_focal_mm,
+                        captured_after,
+                        captured_before,
+                        gps_param,
+                        min_rating_param,
+                        pick_flag_param,
+                        limit as i64,
+                    ],
                     |row| self.map_search_result(row),
                 )?;
                 for r in rows {
@@ -1220,8 +1374,21 @@ impl Database {
                AND (?4 IS NULL OR CAST(json_extract(f.ai_metadata, '$.quality_score') AS REAL) >= ?4)
                AND (?5 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focus_score') AS REAL) >= ?5)
                AND (?6 IS NULL OR CAST(json_extract(f.ai_metadata, '$.megapixels') AS REAL) >= ?6)
+                             AND (?7 IS NULL OR LOWER(CAST(json_extract(f.ai_metadata, '$.camera_model') AS TEXT)) LIKE ?7)
+                             AND (?8 IS NULL OR LOWER(CAST(json_extract(f.ai_metadata, '$.lens_model') AS TEXT)) LIKE ?8)
+                             AND (?9 IS NULL OR CAST(json_extract(f.ai_metadata, '$.iso') AS INTEGER) >= ?9)
+                             AND (?10 IS NULL OR CAST(json_extract(f.ai_metadata, '$.iso') AS INTEGER) <= ?10)
+                             AND (?11 IS NULL OR CAST(json_extract(f.ai_metadata, '$.aperture') AS REAL) >= ?11)
+                             AND (?12 IS NULL OR CAST(json_extract(f.ai_metadata, '$.aperture') AS REAL) <= ?12)
+                             AND (?13 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focal_length_mm') AS REAL) >= ?13)
+                             AND (?14 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focal_length_mm') AS REAL) <= ?14)
+                             AND (?15 IS NULL OR CAST(json_extract(f.ai_metadata, '$.captured_at') AS TEXT) >= ?15)
+                             AND (?16 IS NULL OR CAST(json_extract(f.ai_metadata, '$.captured_at') AS TEXT) <= ?16)
+                             AND (?17 IS NULL OR ((json_extract(f.ai_metadata, '$.gps_lat') IS NOT NULL AND json_extract(f.ai_metadata, '$.gps_lon') IS NOT NULL) = ?17))
+                             AND (?18 IS NULL OR COALESCE((SELECT mr.rating FROM media_review mr WHERE mr.file_id = f.id), 0) >= ?18)
+                             AND (?19 IS NULL OR COALESCE((SELECT mr.pick_flag FROM media_review mr WHERE mr.file_id = f.id), 'none') = ?19)
              ORDER BY fts.rank
-             LIMIT ?7"
+                         LIMIT ?20"
         } else {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
                     f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
@@ -1233,14 +1400,48 @@ impl Database {
                AND (?3 IS NULL OR CAST(json_extract(f.ai_metadata, '$.quality_score') AS REAL) >= ?3)
                AND (?4 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focus_score') AS REAL) >= ?4)
                AND (?5 IS NULL OR CAST(json_extract(f.ai_metadata, '$.megapixels') AS REAL) >= ?5)
+                             AND (?6 IS NULL OR LOWER(CAST(json_extract(f.ai_metadata, '$.camera_model') AS TEXT)) LIKE ?6)
+                             AND (?7 IS NULL OR LOWER(CAST(json_extract(f.ai_metadata, '$.lens_model') AS TEXT)) LIKE ?7)
+                             AND (?8 IS NULL OR CAST(json_extract(f.ai_metadata, '$.iso') AS INTEGER) >= ?8)
+                             AND (?9 IS NULL OR CAST(json_extract(f.ai_metadata, '$.iso') AS INTEGER) <= ?9)
+                             AND (?10 IS NULL OR CAST(json_extract(f.ai_metadata, '$.aperture') AS REAL) >= ?10)
+                             AND (?11 IS NULL OR CAST(json_extract(f.ai_metadata, '$.aperture') AS REAL) <= ?11)
+                             AND (?12 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focal_length_mm') AS REAL) >= ?12)
+                             AND (?13 IS NULL OR CAST(json_extract(f.ai_metadata, '$.focal_length_mm') AS REAL) <= ?13)
+                             AND (?14 IS NULL OR CAST(json_extract(f.ai_metadata, '$.captured_at') AS TEXT) >= ?14)
+                             AND (?15 IS NULL OR CAST(json_extract(f.ai_metadata, '$.captured_at') AS TEXT) <= ?15)
+                             AND (?16 IS NULL OR ((json_extract(f.ai_metadata, '$.gps_lat') IS NOT NULL AND json_extract(f.ai_metadata, '$.gps_lon') IS NOT NULL) = ?16))
+                             AND (?17 IS NULL OR COALESCE((SELECT mr.rating FROM media_review mr WHERE mr.file_id = f.id), 0) >= ?17)
+                             AND (?18 IS NULL OR COALESCE((SELECT mr.pick_flag FROM media_review mr WHERE mr.file_id = f.id), 'none') = ?18)
              ORDER BY fts.rank
-             LIMIT ?6"
+                         LIMIT ?19"
         };
 
         let mut stmt = self.conn.prepare(sql)?;
         if let Some(dev) = device_filter {
             let rows = stmt.query_map(
-                params![safe_query, dev, focus_param, min_quality, min_focus_score, min_megapixels, limit as i64],
+                params![
+                    safe_query,
+                    dev,
+                    focus_param,
+                    min_quality,
+                    min_focus_score,
+                    min_megapixels,
+                    camera_like,
+                    lens_like,
+                    min_iso,
+                    max_iso,
+                    min_aperture,
+                    max_aperture,
+                    min_focal_mm,
+                    max_focal_mm,
+                    captured_after,
+                    captured_before,
+                    gps_param,
+                    min_rating_param,
+                    pick_flag_param,
+                    limit as i64,
+                ],
                 |row| self.map_search_result(row),
             )?;
             for r in rows {
@@ -1248,7 +1449,27 @@ impl Database {
             }
         } else {
             let rows = stmt.query_map(
-                params![safe_query, focus_param, min_quality, min_focus_score, min_megapixels, limit as i64],
+                params![
+                    safe_query,
+                    focus_param,
+                    min_quality,
+                    min_focus_score,
+                    min_megapixels,
+                    camera_like,
+                    lens_like,
+                    min_iso,
+                    max_iso,
+                    min_aperture,
+                    max_aperture,
+                    min_focal_mm,
+                    max_focal_mm,
+                    captured_after,
+                    captured_before,
+                    gps_param,
+                    min_rating_param,
+                    pick_flag_param,
+                    limit as i64,
+                ],
                 |row| self.map_search_result(row),
             )?;
             for r in rows {

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::collections::HashSet;
+use base64::Engine;
 use anyhow::Result;
 use rusqlite::params;
 
@@ -137,6 +138,19 @@ struct SearchMediaFilters {
     min_quality: Option<f32>,
     min_focus_score: Option<f32>,
     min_megapixels: Option<f32>,
+    camera_contains: Option<String>,
+    lens_contains: Option<String>,
+    min_iso: Option<u32>,
+    max_iso: Option<u32>,
+    min_aperture: Option<f32>,
+    max_aperture: Option<f32>,
+    min_focal_mm: Option<f32>,
+    max_focal_mm: Option<f32>,
+    captured_after: Option<String>,
+    captured_before: Option<String>,
+    require_gps: Option<bool>,
+    min_rating: Option<u8>,
+    pick_flag: Option<String>,
 }
 
 impl SearchMediaFilters {
@@ -145,10 +159,33 @@ impl SearchMediaFilters {
             || self.min_quality.is_some()
             || self.min_focus_score.is_some()
             || self.min_megapixels.is_some()
+            || self.camera_contains.is_some()
+            || self.lens_contains.is_some()
+            || self.min_iso.is_some()
+            || self.max_iso.is_some()
+            || self.min_aperture.is_some()
+            || self.max_aperture.is_some()
+            || self.min_focal_mm.is_some()
+            || self.max_focal_mm.is_some()
+            || self.captured_after.is_some()
+            || self.captured_before.is_some()
+            || self.require_gps.is_some()
+            || self.min_rating.is_some()
+            || self.pick_flag.is_some()
     }
 }
 
 impl AppRuntime {
+    fn parse_media_processing_mode(raw: &str) -> thegrid_ai::MediaProcessingMode {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "cpu" => thegrid_ai::MediaProcessingMode::Cpu,
+            "gpu" | "dedicated_gpu" | "dedicated-gpu" | "nvidia" => {
+                thegrid_ai::MediaProcessingMode::DedicatedGpu
+            }
+            _ => thegrid_ai::MediaProcessingMode::Auto,
+        }
+    }
+
     fn parse_media_search_filters(raw_query: &str) -> (String, SearchMediaFilters) {
         let mut filters = SearchMediaFilters::default();
         let mut kept = Vec::new();
@@ -209,6 +246,110 @@ impl AppRuntime {
                 }
             }
 
+            if let Some(v) = token.strip_prefix("camera:") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    filters.camera_contains = Some(v.to_string());
+                    continue;
+                }
+            }
+
+            if let Some(v) = token.strip_prefix("lens:") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    filters.lens_contains = Some(v.to_string());
+                    continue;
+                }
+            }
+
+            if let Some(v) = lower.strip_prefix("iso>=") {
+                if let Ok(n) = v.parse::<u32>() {
+                    filters.min_iso = Some(n);
+                    continue;
+                }
+            }
+            if let Some(v) = lower.strip_prefix("iso<=") {
+                if let Ok(n) = v.parse::<u32>() {
+                    filters.max_iso = Some(n);
+                    continue;
+                }
+            }
+
+            if let Some(v) = lower.strip_prefix("aperture>=") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.min_aperture = Some(n.max(0.0));
+                    continue;
+                }
+            }
+            if let Some(v) = lower.strip_prefix("aperture<=") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.max_aperture = Some(n.max(0.0));
+                    continue;
+                }
+            }
+
+            if let Some(v) = lower.strip_prefix("focal>=") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.min_focal_mm = Some(n.max(0.0));
+                    continue;
+                }
+            }
+            if let Some(v) = lower.strip_prefix("focal<=") {
+                if let Ok(n) = v.parse::<f32>() {
+                    filters.max_focal_mm = Some(n.max(0.0));
+                    continue;
+                }
+            }
+
+            if let Some(v) = token.strip_prefix("captured>=") {
+                let val = v.trim();
+                if !val.is_empty() {
+                    filters.captured_after = Some(val.to_string());
+                    continue;
+                }
+            }
+            if let Some(v) = token.strip_prefix("captured<=") {
+                let val = v.trim();
+                if !val.is_empty() {
+                    filters.captured_before = Some(val.to_string());
+                    continue;
+                }
+            }
+
+            if lower == "gps:true" || lower == "gps:yes" || lower == "gps:on" {
+                filters.require_gps = Some(true);
+                continue;
+            }
+            if lower == "gps:false" || lower == "gps:no" || lower == "gps:off" {
+                filters.require_gps = Some(false);
+                continue;
+            }
+
+            if let Some(v) = lower.strip_prefix("rating>=") {
+                if let Ok(n) = v.parse::<u8>() {
+                    filters.min_rating = Some(n.min(5));
+                    continue;
+                }
+            }
+
+            if let Some(v) = lower.strip_prefix("pick:") {
+                match v {
+                    "keep" | "pick" | "selected" => {
+                        filters.pick_flag = Some("pick".to_string());
+                        continue;
+                    }
+                    "reject" | "discard" | "drop" => {
+                        filters.pick_flag = Some("reject".to_string());
+                        continue;
+                    }
+                    "none" | "unreviewed" => {
+                        filters.pick_flag = Some("none".to_string());
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
             kept.push(token.to_string());
         }
 
@@ -232,6 +373,80 @@ impl AppRuntime {
         } else {
             Some((host_port.to_string(), fallback_port))
         }
+    }
+
+    fn is_offloadable_image(path: &std::path::Path) -> bool {
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tif" | "tiff")
+    }
+
+    fn encode_image_as_data_url(path: &std::path::Path, max_bytes: usize) -> Option<String> {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.is_empty() || bytes.len() > max_bytes {
+            return None;
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Some(format!("data:application/octet-stream;base64,{}", b64))
+    }
+
+    fn request_remote_image_analysis(
+        api_key: &str,
+        ip: &str,
+        port: u16,
+        file_id: i64,
+        path: &std::path::Path,
+        urgent: bool,
+    ) -> Option<String> {
+        if !Self::is_offloadable_image(path) {
+            return None;
+        }
+
+        // Keep request payload bounded for responsiveness over mesh links.
+        let payload_url = Self::encode_image_as_data_url(path, 8 * 1024 * 1024)?;
+        let client = AgentClient::new(ip, port, api_key.to_string()).ok()?;
+
+        let task_id = format!(
+            "media-{}-{}",
+            file_id,
+            chrono::Utc::now().timestamp_millis()
+        );
+
+        let req = thegrid_core::models::ComputeTaskRequest {
+            task_id: task_id.clone(),
+            task_type: thegrid_core::models::ComputeTaskType::ImageEmbedding,
+            requester_device_id: "thegrid-runtime".to_string(),
+            requester_callback_url: String::new(),
+            payload: thegrid_core::models::ComputePayload::ImageEmbed { file_url: payload_url },
+            priority: if urgent { 10 } else { 6 },
+            deadline_secs: Some(if urgent { 45 } else { 60 }),
+        };
+
+        let receipt = client.post_compute_request(&req).ok()?;
+        if !receipt.accepted {
+            return None;
+        }
+
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(50) {
+            let p = client.get_compute_progress(&task_id).ok()?;
+            match p.state {
+                thegrid_core::models::ComputeTaskState::Done => {
+                    let _ = client.ack_compute_result(&task_id);
+                    return p.result_uri;
+                }
+                thegrid_core::models::ComputeTaskState::Failed
+                | thegrid_core::models::ComputeTaskState::Cancelled => {
+                    return None;
+                }
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+        None
     }
 
     pub fn new(config: Config, event_tx: mpsc::Sender<AppEvent>) -> Result<Self> {
@@ -401,12 +616,23 @@ impl AppRuntime {
             .unwrap_or(true);
 
         if media_ai_enabled {
-            match thegrid_ai::CudaMediaAnalyzer::new() {
+            let mode_raw = std::env::var("THEGRID_MEDIA_MODE").ok().unwrap_or_else(|| {
+                self.config
+                    .lock()
+                    .map(|c| c.media_processing_mode.clone())
+                    .unwrap_or_else(|_| "auto".to_string())
+            });
+            let media_mode = Self::parse_media_processing_mode(&mode_raw);
+
+            match thegrid_ai::CudaMediaAnalyzer::new_with_mode(media_mode) {
                 Ok(analyzer) => {
                     let mut lock = self.media_analyzer.lock().unwrap();
                     *lock = Some(Arc::new(analyzer));
                     drop(lock);
-                    log::info!("[Runtime] Media analyzer ready — starting background worker");
+                    log::info!(
+                        "[Runtime] Media analyzer ready (mode={}) — starting background worker",
+                        media_mode.as_str()
+                    );
                     self.spawn_media_analyzer_worker();
                 }
                 Err(e) => {
@@ -1190,9 +1416,21 @@ impl AppRuntime {
                         for (url, label) in endpoints {
                             match thegrid_ai::probe_ollama_models(url) {
                                 Some(models) if !models.is_empty() => {
-                                    let best = thegrid_ai::pick_best_embed_model(&models)
-                                        .unwrap_or_else(|| "nomic-embed-text".to_string());
+                                    let best = if url == REMOTE_LOCALAI {
+                                        thegrid_ai::pick_tablet_embed_model(&models)
+                                            .or_else(|| thegrid_ai::pick_best_embed_model(&models))
+                                            .unwrap_or_else(|| "all-minilm".to_string())
+                                    } else {
+                                        thegrid_ai::pick_best_embed_model(&models)
+                                            .unwrap_or_else(|| "nomic-embed-text".to_string())
+                                    };
                                     log::info!("[AI] {} → {} model(s), selecting '{}'", label, models.len(), best);
+                                    if url == REMOTE_LOCALAI {
+                                        let _ = event_tx.send(AppEvent::Status(format!(
+                                            "tablet_model_selected:{}",
+                                            best
+                                        )));
+                                    }
                                     found_endpoint = Some((url.to_string(), best));
                                     break;
                                 }
@@ -1733,13 +1971,18 @@ impl AppRuntime {
 
     pub fn spawn_media_analyzer_worker(&self) {
         let db = Arc::clone(&self.db);
+        let cfg = Arc::clone(&self.config);
         let event_tx = self.event_tx.clone();
         let analyzer = Arc::clone(&self.media_analyzer);
+        let termux_agent = Arc::clone(&self.termux_agent);
 
         std::thread::spawn(move || {
             log::info!("[Runtime] Starting background media analyzer worker...");
-            let batch_size = 10;
+            let mut batch_size: usize;
             let mut analyzed_count = 0;
+            let mut last_tablet_probe = std::time::Instant::now() - std::time::Duration::from_secs(60);
+            let mut tablet_idle_for_assist = false;
+            let mut last_mode_status = std::time::Instant::now() - std::time::Duration::from_secs(15);
 
             loop {
                 let az = {
@@ -1752,6 +1995,91 @@ impl AppRuntime {
                     continue;
                 }
                 let az = az.unwrap();
+
+                let (mode_raw, api_key, agent_port, tablet_assist_enabled, tablet_cpu_max, tablet_gpu_max) = cfg
+                    .lock()
+                    .map(|c| {
+                        (
+                            c.media_processing_mode.clone(),
+                            c.api_key.clone(),
+                            c.agent_port,
+                            c.ai_tablet_assist,
+                            c.ai_tablet_assist_cpu_max_pct,
+                            c.ai_tablet_assist_gpu_max_pct,
+                        )
+                    })
+                    .unwrap_or_else(|_| ("auto".to_string(), String::new(), 5000, true, 55.0, 60.0));
+                let mode = AppRuntime::parse_media_processing_mode(&mode_raw);
+
+                if tablet_assist_enabled
+                    && last_tablet_probe.elapsed() >= std::time::Duration::from_secs(20)
+                {
+                    let termux_target = {
+                        let lock = termux_agent.lock().unwrap();
+                        lock.as_ref().and_then(|a| {
+                            AppRuntime::parse_agent_target(a.endpoint(), agent_port)
+                        })
+                    };
+
+                    tablet_idle_for_assist = termux_target
+                        .and_then(|(ip, port)| {
+                            AgentClient::new(&ip, port, api_key.clone())
+                                .ok()
+                                .and_then(|c| c.get_telemetry().ok())
+                        })
+                        .map(|t| {
+                            let ai_state = t.ai_status
+                                .unwrap_or_else(|| "idle".to_string())
+                                .to_ascii_lowercase();
+                            let ai_ok = ai_state.contains("idle") || ai_state.contains("ready");
+                            let cpu_ok = t.cpu_pct <= tablet_cpu_max;
+                            let gpu_ok = t.gpu_pct.unwrap_or(0.0) <= tablet_gpu_max;
+                            ai_ok && cpu_ok && gpu_ok
+                        })
+                        .unwrap_or(false);
+
+                    last_tablet_probe = std::time::Instant::now();
+                }
+
+                let remaining = db
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.count_files_needing_media_ai().ok())
+                    .unwrap_or(0);
+
+                let urgent_env = std::env::var("THEGRID_MEDIA_URGENT")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                let urgent = urgent_env || remaining >= 200;
+
+                let mut workers: usize = match mode {
+                    thegrid_ai::MediaProcessingMode::Cpu => 2,
+                    thegrid_ai::MediaProcessingMode::DedicatedGpu => 6,
+                    thegrid_ai::MediaProcessingMode::Auto => 3,
+                };
+                if urgent {
+                    workers += 2;
+                    batch_size = 32;
+                } else {
+                    batch_size = 12;
+                }
+                if tablet_assist_enabled && tablet_idle_for_assist {
+                    // If tablet is free, we can run media processing harder locally while
+                    // embedding load is likely shifted to tablet/offload lanes.
+                    workers += 1;
+                }
+                workers = workers.clamp(1, 8);
+
+                if last_mode_status.elapsed() >= std::time::Duration::from_secs(15) {
+                    let _ = event_tx.send(AppEvent::Status(format!(
+                        "media_mode:{} workers:{} backlog:{} tablet_assist:{}",
+                        mode.as_str(),
+                        workers,
+                        remaining,
+                        if tablet_idle_for_assist { "ready" } else { "off" }
+                    )));
+                    last_mode_status = std::time::Instant::now();
+                }
 
                 let batch = match db.lock() {
                     Ok(guard) => match guard.get_files_needing_media_ai(batch_size) {
@@ -1769,32 +2097,100 @@ impl AppRuntime {
                     continue;
                 }
 
-                for (fid, path) in batch {
-                    if path.exists() && path.is_file() {
-                        match az.analyze(&path) {
-                            Ok(meta) => {
-                                if let Ok(json) = serde_json::to_string(&meta) {
-                                    if let Ok(guard) = db.lock() {
-                                        let _ = guard.update_ai_metadata(fid, &json);
-                                        analyzed_count += 1;
+                let tablet_target = if tablet_assist_enabled
+                    && tablet_idle_for_assist
+                    && matches!(mode, thegrid_ai::MediaProcessingMode::DedicatedGpu)
+                    && urgent
+                {
+                    let lock = termux_agent.lock().unwrap();
+                    lock.as_ref()
+                        .and_then(|a| AppRuntime::parse_agent_target(a.endpoint(), agent_port))
+                } else {
+                    None
+                };
+
+                let work_items: Vec<(i64, std::path::PathBuf)> = batch;
+                let worker_count = workers.min(work_items.len().max(1));
+                let chunk_size = ((work_items.len() + worker_count - 1) / worker_count).max(1);
+                let mut handles = Vec::new();
+
+                for chunk in work_items.chunks(chunk_size) {
+                    let local_items = chunk.to_vec();
+                    let local_analyzer = Arc::clone(&az);
+                    let offload_target = tablet_target.clone();
+                    let offload_key = api_key.clone();
+                    let urgent_now = urgent;
+                    let handle = std::thread::spawn(move || {
+                        let mut out: Vec<(i64, Option<String>, Option<String>, bool)> = Vec::new();
+                        for (fid, path) in local_items {
+                            if let Some((ip, p)) = offload_target.as_ref() {
+                                if let Some(remote_json) = AppRuntime::request_remote_image_analysis(
+                                    &offload_key,
+                                    ip,
+                                    *p,
+                                    fid,
+                                    &path,
+                                    urgent_now,
+                                ) {
+                                    out.push((fid, Some(remote_json), None, false));
+                                    continue;
+                                }
+                            }
+
+                            if path.exists() && path.is_file() {
+                                match local_analyzer.analyze(&path) {
+                                    Ok(meta) => {
+                                        let json = serde_json::to_string(&meta).ok();
+                                        out.push((fid, json, None, false));
+                                    }
+                                    Err(e) => {
+                                        out.push((fid, None, Some(e.to_string()), false));
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                log::warn!("[Runtime] Failed to analyze media {:?}: {}", path, e);
-                                if let Ok(guard) = db.lock() {
-                                    let _ = guard.update_ai_metadata(fid, &format!("{{\"error\":\"{}\"}}", e));
-                                }
+                            } else {
+                                out.push((fid, None, None, true));
                             }
                         }
-                    } else {
+                        out
+                    });
+                    handles.push(handle);
+                }
+
+                let mut merged: Vec<(i64, Option<String>, Option<String>, bool)> = Vec::new();
+                for handle in handles {
+                    if let Ok(mut rows) = handle.join() {
+                        merged.append(&mut rows);
+                    }
+                }
+
+                for (fid, json, err, delete_missing) in merged {
+                    if delete_missing {
                         if let Ok(guard) = db.lock() {
                             let _ = guard.delete_file_by_id(fid);
+                        }
+                        continue;
+                    }
+
+                    if let Some(payload) = json {
+                        if let Ok(guard) = db.lock() {
+                            let _ = guard.update_ai_metadata(fid, &payload);
+                            analyzed_count += 1;
+                        }
+                    } else if let Some(e) = err {
+                        log::warn!("[Runtime] Failed to analyze media file_id={}: {}", fid, e);
+                        if let Ok(guard) = db.lock() {
+                            let safe = e.replace('"', "'");
+                            let _ = guard.update_ai_metadata(fid, &format!("{{\"error\":\"{}\"}}", safe));
                         }
                     }
 
                     if analyzed_count % 5 == 0 {
-                        let _ = event_tx.send(AppEvent::Status(format!("Analyzed {} media files", analyzed_count)));
+                        let _ = event_tx.send(AppEvent::Status(format!(
+                            "Analyzed {} media files (mode={}, workers={})",
+                            analyzed_count,
+                            mode.as_str(),
+                            workers
+                        )));
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1860,6 +2256,19 @@ impl AppRuntime {
                             media_filters.min_quality,
                             media_filters.min_focus_score,
                             media_filters.min_megapixels,
+                            media_filters.camera_contains.as_deref(),
+                            media_filters.lens_contains.as_deref(),
+                            media_filters.min_iso,
+                            media_filters.max_iso,
+                            media_filters.min_aperture,
+                            media_filters.max_aperture,
+                            media_filters.min_focal_mm,
+                            media_filters.max_focal_mm,
+                            media_filters.captured_after.as_deref(),
+                            media_filters.captured_before.as_deref(),
+                            media_filters.require_gps,
+                            media_filters.min_rating,
+                            media_filters.pick_flag.as_deref(),
                         ).ok()
                     } else {
                         guard.search_fts(&effective_query, 50, device_filter.as_deref()).ok()
@@ -2042,6 +2451,88 @@ impl AppRuntime {
             if let Err(e) = client.index_all_files(&tx) {
                 log::error!("[Runtime] Drive index error: {}", e);
                 let _ = tx.send(AppEvent::DriveIndexError(e.to_string()));
+            }
+        });
+    }
+}
+
+// ── Media Review helpers ───────────────────────────────────────────────────
+
+impl AppRuntime {
+    /// Persist rating/pick/color for one file. Fire-and-forget — emits Status on error.
+    pub fn spawn_set_media_review(
+        &self,
+        file_id:     i64,
+        rating:      Option<u8>,
+        pick_flag:   Option<String>,
+        color_label: Option<String>,
+    ) {
+        let db = Arc::clone(&self.db);
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match db.lock().map(|g| g.set_media_review(
+                file_id,
+                rating,
+                pick_flag.as_deref(),
+                color_label.as_deref(),
+            )) {
+                Ok(Ok(())) => {
+                    log::debug!("[Review] file {} rated={:?} pick={:?}", file_id, rating, pick_flag);
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(AppEvent::Status(format!("review_error:{}", e)));
+                }
+                Err(_) => {
+                    let _ = tx.send(AppEvent::Status("review_error:db_lock_poisoned".to_string()));
+                }
+            }
+        });
+    }
+
+    /// Load review state for one file and emit `MediaReviewLoaded`.
+    pub fn spawn_get_media_review(&self, file_id: i64) {
+        let db = Arc::clone(&self.db);
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match db.lock().map(|g| g.get_media_review(file_id)) {
+                Ok(Ok(Some((rating, pick_flag, color_label, reviewed_at)))) => {
+                    let _ = tx.send(AppEvent::MediaReviewLoaded {
+                        file_id, rating, pick_flag, color_label, reviewed_at,
+                    });
+                }
+                Ok(Ok(None)) => {
+                    let _ = tx.send(AppEvent::MediaReviewLoaded {
+                        file_id,
+                        rating: None,
+                        pick_flag: "none".to_string(),
+                        color_label: None,
+                        reviewed_at: 0,
+                    });
+                }
+                Ok(Err(e)) => {
+                    let _ = tx.send(AppEvent::Status(format!("review_load_error:{}", e)));
+                }
+                Err(_) => {}
+            }
+        });
+    }
+
+    /// Load review state for a list of file_ids and emit `MediaReviewBulkLoaded`.
+    pub fn spawn_load_media_review_bulk(&self, file_ids: Vec<i64>) {
+        let db = Arc::clone(&self.db);
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let result = db.lock().map(|g| {
+                let mut map = std::collections::HashMap::new();
+                for id in &file_ids {
+                    if let Ok(Some((rating, pick_flag, color_label, _))) = g.get_media_review(*id) {
+                        map.insert(*id, (rating, pick_flag, color_label));
+                    }
+                }
+                map
+            });
+            if let Ok(map) = result {
+                let _ = tx.send(AppEvent::MediaReviewBulkLoaded(map));
             }
         });
     }

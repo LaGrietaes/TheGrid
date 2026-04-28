@@ -65,3 +65,6 @@ glob        = "0.3"
 
 # Fast Directory Walking for Phase 4 Indexing
 jwalk       = "0.8"
+
+# Binary<->text transport helper (compute payloads, data URLs)
+base64      = "0.22"

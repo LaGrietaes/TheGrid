@@ -60,7 +60,7 @@ use std::sync::mpsc;
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Screen { Boot, Setup, Dashboard, Projects, Planner }
+pub enum Screen { Boot, Setup, Dashboard, Projects, Planner, MediaIngest }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Left nav project tab
@@ -567,6 +567,12 @@ pub struct TheGridApp {
     project_add:       ProjectAddState,
     // ── Local AI panel (Ollama) ───────────────────────────────────────────────
     ai_panel:          AiPanelState,
+
+    // ── Media Ingest / Culling ────────────────────────────────────────────────
+    media_ingest:      crate::views::media_ingest::MediaIngestState,
+
+    // ── Shell-launch args (processed once on first frame) ─────────────────────
+    shell_launch:      Option<crate::cli::LaunchArgs>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -774,7 +780,7 @@ impl TheGridApp {
         }
     }
 
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, launch_args: crate::cli::LaunchArgs) -> Self {
         let (tx, rx) = mpsc::channel::<AppEvent>();
         let config   = Config::load().unwrap_or_default();
 
@@ -898,6 +904,8 @@ impl TheGridApp {
             planner_add:         PlannerAddState::default(),
             project_add:         ProjectAddState::default(),
             ai_panel:            AiPanelState::default(),
+            media_ingest:        crate::views::media_ingest::MediaIngestState::default(),
+            shell_launch:        if launch_args.has_shell_args() { Some(launch_args) } else { None },
         }
     }
 
@@ -989,6 +997,51 @@ impl TheGridApp {
                 }
             }
         });
+    }
+
+    /// Process `--scan`, `--ingest`, `--open` CLI launch args once after boot.
+    /// Consumes self.shell_launch and returns the Screen to navigate to.
+    fn apply_shell_launch(&mut self) -> Option<Screen> {
+        let args = self.shell_launch.take()?;
+
+        // --ingest <path>  or  --open <file>  → Media Ingest view
+        if let Some(ref ingest_path) = args.ingest_path {
+            let dir = if ingest_path.is_dir() {
+                ingest_path.clone()
+            } else {
+                ingest_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| ingest_path.clone())
+            };
+            // Pre-fill the ingest search box with the path so the first search filters to it
+            self.media_ingest.pending_query = format!("path:\"{}\"", dir.display());
+            self.media_ingest.last_searched = None; // force search trigger
+            self.push_toast(Toast::info(format!("Media Ingest: {}", dir.display())));
+            return Some(Screen::MediaIngest);
+        }
+
+        if let Some(ref open_file) = args.open_file {
+            let dir = open_file.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| open_file.clone());
+            self.media_ingest.pending_query = format!("path:\"{}\"", dir.display());
+            self.media_ingest.last_searched = None;
+            self.push_toast(Toast::info(format!("Ingest: {}", open_file.display())));
+            return Some(Screen::MediaIngest);
+        }
+
+        // --scan <path>  → index then show Dashboard
+        if let Some(ref scan_path) = args.scan_path {
+            let path = scan_path.clone();
+            // Add to watch paths if not already present
+            {
+                let mut cfg = self.runtime.config.lock().unwrap();
+                if !cfg.watch_paths.contains(&path) {
+                    cfg.watch_paths.push(path.clone());
+                    let _ = cfg.save();
+                }
+            }
+            self.spawn_index_directory(path.clone(), self.config.device_name.clone(), self.local_hostname.clone());
+            self.push_toast(Toast::info(format!("Scanning: {}", path.display())));
+        }
+
+        Some(Screen::Dashboard)
     }
 
     fn start_initial_watch_scans(&mut self) {
@@ -2348,7 +2401,34 @@ impl TheGridApp {
                 AppEvent::SearchResults(results) => {
                     // Generation-tagged results arrive via Status("search_gen:N")
                     // before SearchResults — handled below. Accept all results for now.
-                    self.search.receive_results(self.search.query_gen, results);
+                    self.search.receive_results(self.search.query_gen, results.clone());
+
+                    // Also feed media ingest view when it's active
+                    if self.screen == Screen::MediaIngest {
+                        let ids: Vec<i64> = results.iter().map(|r| r.id).collect();
+                        self.media_ingest.results = results;
+                        self.media_ingest.loading  = false;
+                        // Bulk-load review state for these files
+                        if !ids.is_empty() {
+                            self.runtime.spawn_load_media_review_bulk(ids);
+                        }
+                    }
+                }
+
+                // ── Media Review ───────────────────────────────────────────────
+                AppEvent::MediaReviewBulkLoaded(map) => {
+                    for (file_id, (rating, pick_flag, color_label)) in map {
+                        let rev = self.media_ingest.review.entry(file_id).or_default();
+                        if let Some(r) = rating { rev.rating = Some(r); }
+                        rev.pick_flag = pick_flag;
+                        rev.color_label = color_label;
+                    }
+                }
+                AppEvent::MediaReviewLoaded { file_id, rating, pick_flag, color_label, .. } => {
+                    let rev = self.media_ingest.review.entry(file_id).or_default();
+                    rev.rating = rating;
+                    rev.pick_flag = pick_flag;
+                    rev.color_label = color_label;
                 }
 
                 AppEvent::DuplicatesFound(groups) => {
@@ -3904,10 +3984,12 @@ impl eframe::App for TheGridApp {
         let f1_press     = ctx.input(|i| i.key_pressed(egui::Key::F1));
         let f2_press     = ctx.input(|i| i.key_pressed(egui::Key::F2));
         let f3_press     = ctx.input(|i| i.key_pressed(egui::Key::F3));
+        let f4_press     = ctx.input(|i| i.key_pressed(egui::Key::F4));
 
         if f1_press { self.navigate_to(Screen::Dashboard); }
         if f2_press { self.navigate_to(Screen::Projects); }
         if f3_press { self.navigate_to(Screen::Planner); }
+        if f4_press { self.navigate_to(Screen::MediaIngest); }
 
         // Mouse back/forward (buttons 4 & 5) + Alt+Arrow navigation
         let mouse_back = ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Extra1));
@@ -4039,7 +4121,9 @@ impl eframe::App for TheGridApp {
                         let done = crate::views::boot::render(ui, elapsed);
                         if done {
                             if self.config.is_configured() {
-                                self.screen = Screen::Dashboard;
+                                // Check if shell-launch args should override the target screen
+                                let target = self.apply_shell_launch();
+                                self.screen = target.unwrap_or(Screen::Dashboard);
                                 self.spawn_load_devices();
                                 self.runtime.spawn_load_persisted_duplicate_groups();
                             } else {
@@ -4283,6 +4367,29 @@ impl eframe::App for TheGridApp {
                     new_config.rdp_username = self.settings.rdp_username.clone();
                     new_config.agent_port   = self.settings.agent_port.parse().unwrap_or(47731);
                     new_config.ai_model     = if self.settings.ai_model.trim().is_empty() { None } else { Some(self.settings.ai_model.clone()) };
+                    new_config.media_processing_mode = {
+                        let m = self.settings.media_processing_mode.trim().to_ascii_lowercase();
+                        match m.as_str() {
+                            "cpu" | "dedicated_gpu" | "auto" => m,
+                            "gpu" => "dedicated_gpu".to_string(),
+                            _ => "auto".to_string(),
+                        }
+                    };
+                    new_config.ai_tablet_assist = self.settings.ai_tablet_assist;
+                    new_config.ai_tablet_assist_cpu_max_pct = self.settings
+                        .ai_tablet_assist_cpu_max_pct
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(|v| v.clamp(5.0, 100.0))
+                        .unwrap_or(new_config.ai_tablet_assist_cpu_max_pct);
+                    new_config.ai_tablet_assist_gpu_max_pct = self.settings
+                        .ai_tablet_assist_gpu_max_pct
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .map(|v| v.clamp(5.0, 100.0))
+                        .unwrap_or(new_config.ai_tablet_assist_gpu_max_pct);
                     new_config.watch_paths  = self.settings.watch_paths.iter()
                         .map(|s| PathBuf::from(s))
                         .collect();
@@ -4613,6 +4720,54 @@ impl eframe::App for TheGridApp {
                             &mut self.planner_edit_idx,
                             &self.project_statuses,
                         );
+                    });
+
+                self.render_toasts(ctx);
+            }
+
+            // ── Media Ingest / Culling ────────────────────────────────────────
+            Screen::MediaIngest => {
+                self.start_initial_watch_scans();
+                self.start_release_check();
+                self.render_titlebar(ctx);
+                self.render_statusbar(ctx);
+
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none()
+                        .fill(Colors::BG)
+                        .inner_margin(egui::Margin::same(12.0))
+                    )
+                    .show(ctx, |ui| {
+                        let actions = crate::views::media_ingest::render_media_ingest(
+                            ui,
+                            &mut self.media_ingest,
+                        );
+
+                        // Trigger search if debounce fired or Enter pressed
+                        if actions.trigger_search {
+                            let q = self.media_ingest.query.clone();
+                            self.runtime.spawn_search(q, None, self.semantic_enabled);
+                        }
+
+                        // Route all fired events
+                        for ev in actions.events {
+                            match &ev {
+                                AppEvent::SetMediaReview { file_id, rating, pick_flag, color_label } => {
+                                    self.runtime.spawn_set_media_review(
+                                        *file_id,
+                                        *rating,
+                                        pick_flag.clone(),
+                                        color_label.clone(),
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        // Open preview if double-clicked
+                        if let Some(file) = actions.open_preview {
+                            let _ = self.event_tx.send(AppEvent::RequestFilePreview(file));
+                        }
                     });
 
                 self.render_toasts(ctx);

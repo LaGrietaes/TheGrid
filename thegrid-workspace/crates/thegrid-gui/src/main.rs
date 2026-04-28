@@ -15,6 +15,7 @@
 //   Remove this attribute during development so you can see RUST_LOG output.
 
 mod app;
+mod cli;
 mod theme;
 mod icons;
 mod telemetry;
@@ -26,6 +27,10 @@ use image;
 pub use app::TheGridApp;
 
 fn main() -> eframe::Result<()> {
+    // Parse CLI args early — before logging — so shell-integration paths are
+    // available when the app struct is constructed inside the eframe closure.
+    let launch_args = cli::LaunchArgs::parse();
+
     // Initialize logging. In debug builds defaults to 'info'; set RUST_LOG=debug
     // to see per-crate verbose output.
     env_logger::Builder::from_env(
@@ -77,14 +82,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "THE GRID",
         native_opts,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             // Install PNG/JPEG/SVG image loaders so egui::Image works
             egui_extras::install_image_loaders(&cc.egui_ctx);
             // Apply brutalist theme before the first frame renders
             theme::apply(&cc.egui_ctx);
             // Global readability bump for high-resolution displays
             cc.egui_ctx.set_pixels_per_point(1.12);
-            Box::new(TheGridApp::new(cc))
+            Box::new(TheGridApp::new(cc, launch_args))
         }),
     )
 }

@@ -3,6 +3,7 @@ use sysinfo::System;
 use std::sync::Arc;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::BufReader;
 
 /// Capability trait for any embedding model.
 pub trait EmbeddingProvider: Send + Sync {
@@ -267,6 +268,37 @@ pub fn pick_best_embed_model(models: &[String]) -> Option<String> {
         .or_else(|| models.first().cloned())
 }
 
+/// Pick an embedding model suitable for tablet/edge nodes where thermal and
+/// sustained power limits matter. Prefer compact models first.
+pub fn pick_tablet_embed_model(models: &[String]) -> Option<String> {
+    let lower: Vec<(String, String)> = models
+        .iter()
+        .map(|m| (m.clone(), m.to_ascii_lowercase()))
+        .collect();
+
+    // Preference order for tablet-class hardware.
+    let preferred_substrings = [
+        "all-minilm",
+        "bge-small",
+        "e5-small",
+        "nomic-embed-text",
+        "mxbai-embed-large",
+    ];
+
+    for p in preferred_substrings {
+        if let Some((orig, _)) = lower.iter().find(|(_, m)| m.contains(p)) {
+            return Some(orig.clone());
+        }
+    }
+
+    // Generic fallback: any embedding model id.
+    lower
+        .iter()
+        .find(|(_, m)| m.contains("embed"))
+        .map(|(orig, _)| orig.clone())
+        .or_else(|| models.first().cloned())
+}
+
 /// Pure-Rust in-memory vector index using pre-normalized cosine similarity.
 /// Suitable for local file indexes (up to ~1M vectors on a modern CPU).
 pub struct VectorIndex {
@@ -448,6 +480,16 @@ pub struct MediaMetadata {
     pub brightness: Option<f32>,
     pub contrast: Option<f32>,
     pub in_focus: Option<bool>,
+    pub camera_make: Option<String>,
+    pub camera_model: Option<String>,
+    pub lens_model: Option<String>,
+    pub iso: Option<u32>,
+    pub aperture: Option<f32>,
+    pub shutter_seconds: Option<f32>,
+    pub focal_length_mm: Option<f32>,
+    pub captured_at: Option<String>,
+    pub gps_lat: Option<f64>,
+    pub gps_lon: Option<f64>,
 }
 
 /// Trait for analyzing media files.
@@ -455,18 +497,90 @@ pub trait MediaAnalyzer: Send + Sync {
     fn analyze(&self, path: &std::path::Path) -> Result<MediaMetadata>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaProcessingMode {
+    Auto,
+    Cpu,
+    DedicatedGpu,
+}
+
+impl MediaProcessingMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::DedicatedGpu => "dedicated_gpu",
+        }
+    }
+}
+
 /// Media analyzer that runs locally. If NVIDIA is present it reports the GPU
 /// in telemetry, but analysis itself is CPU-based for portability.
 pub struct CudaMediaAnalyzer {
     gpu_name: String,
+    mode: MediaProcessingMode,
 }
 
 impl CudaMediaAnalyzer {
     pub fn new() -> Result<Self> {
+        Self::new_with_mode(MediaProcessingMode::Auto)
+    }
+
+    pub fn new_with_mode(mode: MediaProcessingMode) -> Result<Self> {
         let detector = AiNodeDetector::new();
-        let gpu = detector.gpu_info().unwrap_or_else(|| "cpu".to_string());
-        log::info!("[AI] Initializing Media Analyzer backend={}", gpu);
-        Ok(Self { gpu_name: gpu })
+        let gpu_info = detector.gpu_info();
+        let effective_mode = match mode {
+            MediaProcessingMode::Auto => {
+                if detector.has_nvidia_gpu() {
+                    MediaProcessingMode::DedicatedGpu
+                } else {
+                    MediaProcessingMode::Cpu
+                }
+            }
+            forced => forced,
+        };
+
+        let gpu = gpu_info.unwrap_or_else(|| "cpu".to_string());
+        log::info!(
+            "[AI] Initializing Media Analyzer backend={} mode={}",
+            gpu,
+            effective_mode.as_str()
+        );
+        Ok(Self { gpu_name: gpu, mode: effective_mode })
+    }
+
+    pub fn processing_mode(&self) -> MediaProcessingMode {
+        self.mode
+    }
+
+    fn try_cuda_python(path: &std::path::Path) -> Option<MediaMetadata> {
+        let script_path = std::env::var("THEGRID_CUDA_ANALYZER_SCRIPT")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join("..")
+                    .join("scripts")
+                    .join("cuda_media_analyze.py")
+            });
+
+        if !script_path.exists() {
+            return None;
+        }
+
+        let output = std::process::Command::new("python")
+            .arg(script_path)
+            .arg(path)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        serde_json::from_str::<MediaMetadata>(&stdout).ok()
     }
 
     fn dominant_colors(img: &image::RgbImage, top_k: usize) -> Vec<String> {
@@ -579,6 +693,200 @@ impl CudaMediaAnalyzer {
             "well-exposed"
         }
     }
+
+    fn exif_ascii(field: &exif::Field) -> Option<String> {
+        if let exif::Value::Ascii(parts) = &field.value {
+            let mut out = String::new();
+            for part in parts {
+                if let Ok(s) = std::str::from_utf8(part) {
+                    out.push_str(s);
+                }
+            }
+            let trimmed = out.trim_matches('\0').trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        } else {
+            None
+        }
+    }
+
+    fn exif_u32(field: &exif::Field) -> Option<u32> {
+        match &field.value {
+            exif::Value::Short(v) => v.first().copied().map(|n| n as u32),
+            exif::Value::Long(v) => v.first().copied(),
+            exif::Value::SLong(v) => v.first().copied().and_then(|n| u32::try_from(n).ok()),
+            exif::Value::Rational(v) => v.first().and_then(|r| {
+                if r.denom == 0 {
+                    None
+                } else {
+                    Some((r.num as f64 / r.denom as f64).round() as u32)
+                }
+            }),
+            _ => None,
+        }
+    }
+
+    fn exif_f32(field: &exif::Field) -> Option<f32> {
+        match &field.value {
+            exif::Value::Rational(v) => v.first().and_then(|r| {
+                if r.denom == 0 {
+                    None
+                } else {
+                    Some(r.num as f32 / r.denom as f32)
+                }
+            }),
+            exif::Value::SRational(v) => v.first().and_then(|r| {
+                if r.denom == 0 {
+                    None
+                } else {
+                    Some(r.num as f32 / r.denom as f32)
+                }
+            }),
+            exif::Value::Short(v) => v.first().copied().map(|n| n as f32),
+            exif::Value::Long(v) => v.first().copied().map(|n| n as f32),
+            _ => None,
+        }
+    }
+
+    fn parse_exif_datetime(raw: &str) -> String {
+        // EXIF typical: YYYY:MM:DD HH:MM:SS -> normalize to ISO-like string for lexical filtering.
+        let trimmed = raw.trim();
+        if trimmed.len() >= 19 {
+            let mut chars: Vec<char> = trimmed.chars().collect();
+            if chars.len() >= 19 {
+                chars[4] = '-';
+                chars[7] = '-';
+                chars[10] = 'T';
+                return chars.into_iter().collect();
+            }
+        }
+        trimmed.to_string()
+    }
+
+    fn gps_to_decimal(coord: &exif::Field, dir: Option<&exif::Field>) -> Option<f64> {
+        let values = match &coord.value {
+            exif::Value::Rational(v) => v,
+            _ => return None,
+        };
+
+        if values.len() < 3 {
+            return None;
+        }
+
+        let to_f64 = |r: exif::Rational| -> Option<f64> {
+            if r.denom == 0 { None } else { Some(r.num as f64 / r.denom as f64) }
+        };
+
+        let deg = to_f64(values[0])?;
+        let min = to_f64(values[1])?;
+        let sec = to_f64(values[2])?;
+        let mut dec = deg + (min / 60.0) + (sec / 3600.0);
+
+        if let Some(d) = dir.and_then(Self::exif_ascii) {
+            let d = d.to_ascii_uppercase();
+            if d == "S" || d == "W" {
+                dec = -dec;
+            }
+        }
+
+        Some(dec)
+    }
+
+    fn inject_exif(meta: &mut MediaMetadata, path: &std::path::Path) {
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let mut reader = BufReader::new(file);
+        let exif = match exif::Reader::new().read_from_container(&mut reader) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let make = exif
+            .get_field(exif::Tag::Make, exif::In::PRIMARY)
+            .and_then(Self::exif_ascii);
+        let model = exif
+            .get_field(exif::Tag::Model, exif::In::PRIMARY)
+            .and_then(Self::exif_ascii);
+        let lens = exif
+            .get_field(exif::Tag::LensModel, exif::In::PRIMARY)
+            .and_then(Self::exif_ascii);
+        let iso = exif
+            .get_field(exif::Tag::PhotographicSensitivity, exif::In::PRIMARY)
+            .and_then(Self::exif_u32)
+            .or_else(|| {
+                exif.get_field(exif::Tag::ISOSpeed, exif::In::PRIMARY)
+                    .and_then(Self::exif_u32)
+            });
+        let aperture = exif
+            .get_field(exif::Tag::FNumber, exif::In::PRIMARY)
+            .and_then(Self::exif_f32);
+        let shutter = exif
+            .get_field(exif::Tag::ExposureTime, exif::In::PRIMARY)
+            .and_then(Self::exif_f32);
+        let focal = exif
+            .get_field(exif::Tag::FocalLength, exif::In::PRIMARY)
+            .and_then(Self::exif_f32);
+        let captured = exif
+            .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
+            .and_then(Self::exif_ascii)
+            .map(|s| Self::parse_exif_datetime(&s));
+
+        let gps_lat = exif
+            .get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)
+            .and_then(|lat| {
+                Self::gps_to_decimal(
+                    lat,
+                    exif.get_field(exif::Tag::GPSLatitudeRef, exif::In::PRIMARY),
+                )
+            });
+        let gps_lon = exif
+            .get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)
+            .and_then(|lon| {
+                Self::gps_to_decimal(
+                    lon,
+                    exif.get_field(exif::Tag::GPSLongitudeRef, exif::In::PRIMARY),
+                )
+            });
+
+        meta.camera_make = make;
+        meta.camera_model = model;
+        meta.lens_model = lens;
+        meta.iso = iso;
+        meta.aperture = aperture;
+        meta.shutter_seconds = shutter;
+        meta.focal_length_mm = focal;
+        meta.captured_at = captured;
+        meta.gps_lat = gps_lat;
+        meta.gps_lon = gps_lon;
+
+        if let Some(make) = &meta.camera_make {
+            meta.tags.push(format!("make:{}", make.to_ascii_lowercase()));
+        }
+        if let Some(model) = &meta.camera_model {
+            meta.tags.push(format!("camera:{}", model.to_ascii_lowercase()));
+        }
+        if let Some(lens) = &meta.lens_model {
+            meta.tags.push(format!("lens:{}", lens.to_ascii_lowercase()));
+        }
+        if let Some(iso) = meta.iso {
+            meta.tags.push(format!("iso:{}", iso));
+        }
+        if let Some(ap) = meta.aperture {
+            meta.tags.push(format!("f/{:.1}", ap));
+        }
+        if let Some(fl) = meta.focal_length_mm {
+            meta.tags.push(format!("{}mm", fl.round() as i32));
+        }
+        if meta.gps_lat.is_some() && meta.gps_lon.is_some() {
+            meta.tags.push("geotagged".into());
+        }
+    }
 }
 
 impl MediaAnalyzer for CudaMediaAnalyzer {
@@ -588,13 +896,31 @@ impl MediaAnalyzer for CudaMediaAnalyzer {
 
         match ext.as_str() {
             "jpg" | "jpeg" | "png" | "webp" => {
+                if matches!(self.mode, MediaProcessingMode::DedicatedGpu) {
+                    if let Some(mut gpu_meta) = Self::try_cuda_python(path) {
+                        if gpu_meta.description.is_empty() {
+                            gpu_meta.description = "CUDA analyzer result".to_string();
+                        }
+                        if !gpu_meta.tags.iter().any(|t| t == "cuda") {
+                            gpu_meta.tags.push("cuda".to_string());
+                        }
+                        Self::inject_exif(&mut gpu_meta, path);
+                        return Ok(gpu_meta);
+                    }
+                }
+
                 let dyn_img = image::open(path)?;
                 let rgb = dyn_img.to_rgb8();
                 let (w, h) = rgb.dimensions();
                 let mp = (w as f32 * h as f32) / 1_000_000.0;
 
-                // Downsample for stable fast metrics on large inputs.
-                let down = image::imageops::thumbnail(&rgb, 960, 960);
+                // Downsample profile tuned by processing mode.
+                let thumb_edge = match self.mode {
+                    MediaProcessingMode::Cpu => 720,
+                    MediaProcessingMode::DedicatedGpu => 1280,
+                    MediaProcessingMode::Auto => 960,
+                };
+                let down = image::imageops::thumbnail(&rgb, thumb_edge, thumb_edge);
                 let gray = image::DynamicImage::ImageRgb8(down).to_luma8();
 
                 let (brightness, contrast) = Self::grayscale_stats(&gray);
@@ -652,13 +978,16 @@ impl MediaAnalyzer for CudaMediaAnalyzer {
                 }
 
                 meta.description = format!(
-                    "{}x{} ({:.1}MP), focus {:.2}, quality {:.2}",
+                    "{}x{} ({:.1}MP), focus {:.2}, quality {:.2}, mode {}",
                     w,
                     h,
                     mp,
                     focus_score,
-                    quality_score
+                    quality_score,
+                    self.mode.as_str()
                 );
+
+                Self::inject_exif(&mut meta, path);
             }
             "mp4" | "mkv" | "mov" | "avi" => {
                 // Container-level analysis for video assets.
@@ -675,7 +1004,13 @@ impl MediaAnalyzer for CudaMediaAnalyzer {
             }
         }
 
-        log::debug!("[AI] [{}] Analyzed {:?}: {}", self.gpu_name, path, meta.description);
+        log::debug!(
+            "[AI] [{}:{}] Analyzed {:?}: {}",
+            self.gpu_name,
+            self.mode.as_str(),
+            path,
+            meta.description
+        );
         Ok(meta)
     }
 }

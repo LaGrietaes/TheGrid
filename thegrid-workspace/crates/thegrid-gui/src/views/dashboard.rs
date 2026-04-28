@@ -1,4 +1,4 @@
-﻿// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+// â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // views/dashboard.rs -- Main Application Dashboard  [v0.2 -- Phase 2]
 //
 // FIXES from v0.1:
@@ -912,6 +912,27 @@ pub fn render_device_panel(
                 });
         }); // end nav workspace scroll
 
+        // ── Media Ingest nav button (below the scroll area) ──────────────────
+        ui.separator();
+        ui.add_space(4.0);
+        let ingest_active = active_screen == crate::app::Screen::MediaIngest;
+        let ingest_btn = egui::Button::new(
+            RichText::new("🖼 MEDIA INGEST")
+                .color(if ingest_active { Colors::GREEN } else { Colors::TEXT_DIM })
+                .size(9.0)
+                .strong()
+        )
+        .fill(if ingest_active {
+            Color32::from_rgba_premultiplied(60, 130, 255, 25)
+        } else {
+            Color32::TRANSPARENT
+        })
+        .stroke(egui::Stroke::NONE)
+        .min_size(egui::vec2(180.0, 20.0));
+        if ui.add(ingest_btn).on_hover_text("Media ingest, culling & tagging  (F4)").clicked() {
+            result.navigate_to = Some(crate::app::Screen::MediaIngest);
+        }
+        ui.add_space(4.0);
     result
 }
 
@@ -1505,6 +1526,10 @@ pub struct SettingsState {
     pub agent_port:   String,
     pub watch_paths:  Vec<String>,
     pub ai_model:     String,
+    pub media_processing_mode: String,
+    pub ai_tablet_assist: bool,
+    pub ai_tablet_assist_cpu_max_pct: String,
+    pub ai_tablet_assist_gpu_max_pct: String,
     pub device_type:  String,
     pub open:         bool,
     pub google_client_id:     String,
@@ -1530,6 +1555,10 @@ impl SettingsState {
             agent_port:   cfg.agent_port.to_string(),
             watch_paths:  cfg.watch_paths.iter().map(|p| p.to_string_lossy().to_string()).collect(),
             ai_model:     cfg.ai_model.clone().unwrap_or_default(),
+            media_processing_mode: cfg.media_processing_mode.clone(),
+            ai_tablet_assist: cfg.ai_tablet_assist,
+            ai_tablet_assist_cpu_max_pct: format!("{:.0}", cfg.ai_tablet_assist_cpu_max_pct),
+            ai_tablet_assist_gpu_max_pct: format!("{:.0}", cfg.ai_tablet_assist_gpu_max_pct),
             device_type:  cfg.device_type.clone(),
             open:         false,
             google_client_id:     cfg.google_client_id.clone().unwrap_or_default(),
@@ -1622,6 +1651,29 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
                     modal_field(ui, "AGENT PORT",           &mut s.agent_port,   false, "47731");
                     ui.add_space(14.0);
                     modal_field(ui, "LOCAL AI MODEL",       &mut s.ai_model,     false, "e.g. llama3:8b");
+
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("MEDIA PROCESSING MODE").color(Colors::TEXT_DIM).size(9.0).strong());
+                    ui.add_space(4.0);
+                    egui::ComboBox::from_id_source("media_processing_mode_combo")
+                        .width(ui.available_width())
+                        .selected_text(s.media_processing_mode.clone())
+                        .show_ui(ui, |ui| {
+                            for mode in ["auto", "cpu", "dedicated_gpu"] {
+                                ui.selectable_value(&mut s.media_processing_mode, mode.to_string(), mode);
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut s.ai_tablet_assist, "Enable tablet-assisted AI/Media offload");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Tablet CPU max %").color(Colors::TEXT_DIM).size(9.0));
+                        ui.add(egui::TextEdit::singleline(&mut s.ai_tablet_assist_cpu_max_pct).desired_width(80.0));
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("Tablet GPU max %").color(Colors::TEXT_DIM).size(9.0));
+                        ui.add(egui::TextEdit::singleline(&mut s.ai_tablet_assist_gpu_max_pct).desired_width(80.0));
+                    });
 
                     ui.add_space(14.0);
                     ui.label(RichText::new("DEVICE TYPE").color(Colors::TEXT_DIM).size(9.0).strong());

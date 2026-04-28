@@ -15,7 +15,11 @@ powershell -Command "Unblock-File -Path '%~dp0%EXE_NAME%'"
 echo [!] Whitelisting folder in Windows Defender...
 powershell -Command "Add-MpPreference -ExclusionPath '%~dp0'"
 
-:: 3. Create Desktop Shortcut
+:: 3. Register Windows Explorer right-click actions (HKCU)
+echo [!] Registering Explorer context menu actions...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install_explorer_context_menu.ps1" -Action install -ExePath "%~dp0%EXE_NAME%"
+
+:: 4. Create Desktop Shortcut
 echo [!] Creating Desktop Shortcut...
 set SCRIPT_PATH=%TEMP%\create_shortcut.vbs
 echo Set oWS = WScript.CreateObject("WScript.Shell") > %SCRIPT_PATH%
