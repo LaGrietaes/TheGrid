@@ -252,7 +252,7 @@ impl Default for MediaIngestState {
             selected_idx:        None,
             selected_ids:        HashSet::new(),
             review:              HashMap::new(),
-            cols:                4,
+            cols:                6,
             type_filter:         MediaFileType::All,
             src_filter:          MediaSourceType::All,
             show_filter_help:    false,
