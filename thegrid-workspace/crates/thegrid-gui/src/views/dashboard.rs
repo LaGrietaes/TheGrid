@@ -1867,6 +1867,7 @@ impl MainScreenUiRules {
     const SECTION_GAP: f32 = 16.0;
     const BLOCK_GAP: f32 = 8.0;
     const ACTION_CARD_H: f32 = 86.0;
+    #[allow(dead_code)]
     const ACTION_CARD_PAD: f32 = 16.0;
     const ACTION_LABEL_SIZE: f32 = 9.0;
     const ACTION_SUB_SIZE: f32 = 8.0;

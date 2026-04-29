@@ -509,6 +509,7 @@ pub fn render_crt_icon(ui: &mut Ui, icon_type: IconType, size: f32, color: Color
 }
 
 /// Status badge (ONLINE/OFFLINE/etc.) with optional icon
+#[allow(dead_code)]
 pub fn status_badge(ui: &mut Ui, label: &str, icon: Option<IconType>, active: bool) {
     let color = if active { Colors::GREEN } else { Colors::TEXT_MUTED };
     
@@ -594,6 +595,7 @@ impl Fx {
 
     /// Draw a pulsing glow around `rect`. Call every frame from `update()` to animate.
     /// `time` is `ctx.input(|i| i.time)`.
+    #[allow(dead_code)]
     pub fn pulse_glow_rect(painter: &egui::Painter, rect: egui::Rect, color: Color32, time: f64) {
         let pulse = ((time * 2.5).sin() as f32 * 0.4 + 0.6).clamp(0.2, 1.0);
         let color_pulsed = Color32::from_rgba_unmultiplied(
@@ -674,6 +676,7 @@ impl Fx {
 
     /// Ghost-number watermark: draws a very large, low-alpha number string
     /// centred in `rect`. Good for node count, status codes, etc.
+    #[allow(dead_code)]
     pub fn ghost_number(painter: &egui::Painter, rect: egui::Rect, text: &str, color: Color32, size: f32) {
         let ghost = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 18);
         painter.text(
@@ -687,6 +690,7 @@ impl Fx {
 
     /// Horizontal scan-line overlay over `rect`. `time` drives a slow drift.
     /// Draws only every Nth pixel row as a semi-transparent stripe.
+    #[allow(dead_code)]
     pub fn scanlines(painter: &egui::Painter, rect: egui::Rect, time: f64) {
         let drift = ((time * 8.0) as f32).rem_euclid(8.0);
         let stripe_color = Color32::from_rgba_unmultiplied(0, 0, 0, 28);
@@ -701,6 +705,7 @@ impl Fx {
 
     /// Inner glow fill: semi-transparent `color` gradient fading from center
     /// to edges, useful for making a panel appear lit from within.
+    #[allow(dead_code)]
     pub fn inner_glow(painter: &egui::Painter, rect: egui::Rect, color: Color32) {
         let c = rect.center();
         let max_r = rect.width().min(rect.height()) * 0.6;
@@ -755,6 +760,7 @@ impl Fx {
     }
 
     /// Quick-launch slot — smaller variant of action_pad with slot index ghost
+    #[allow(dead_code)]
     pub fn quick_slot(
         painter: &egui::Painter,
         rect: egui::Rect,

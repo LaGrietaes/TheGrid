@@ -116,6 +116,7 @@ pub fn ext_to_color(ext: Option<&str>) -> Color32 {
 /// Draw the THE GRID logo centered at `center` with outer-hexagon radius `r`.
 /// `color` should be `Colors::GREEN` (#00ff41).  Pass a dimmer tone for
 /// inactive / watermark uses.
+#[allow(dead_code)]
 pub fn draw_thegrid_logo(
     painter: &egui::Painter,
     center:  egui::Pos2,
@@ -190,6 +191,7 @@ pub fn draw_thegrid_logo(
 }
 
 /// Draw a compact (single-line-height) THE GRID wordmark below a given rect.
+#[allow(dead_code)]
 pub fn draw_thegrid_wordmark(
     painter:  &egui::Painter,
     rect:     egui::Rect,

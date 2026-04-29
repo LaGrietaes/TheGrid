@@ -67,12 +67,4 @@ psd           = "0.3"
 [build-dependencies]
 winres = "0.1"
 
-[profile.release]
-opt-level   = 3
-lto         = "thin"   # link-time optimization for smaller binary
-codegen-units = 1
-strip       = true     # strip debug symbols — reduces binary size ~30%
-
-[profile.dev]
-# Faster incremental builds during development
-opt-level   = 1
+# Profiles are defined at the workspace root (Cargo.toml)

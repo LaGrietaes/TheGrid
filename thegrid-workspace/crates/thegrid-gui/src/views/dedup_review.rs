@@ -48,6 +48,7 @@ pub struct DedupReviewState {
     /// Scan in progress
     pub scanning:    bool,
     /// Last scan timestamp
+    #[allow(dead_code)]
     pub last_scan:   Option<std::time::Instant>,
     // ── Filters ──────────────────────────────────────────────────────────────
     /// Filename / path substring filter

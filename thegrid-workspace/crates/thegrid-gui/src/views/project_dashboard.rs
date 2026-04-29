@@ -41,6 +41,7 @@ fn compute_progress(tasks: &[PlannerTask]) -> f32 {
     done as f32 / tasks.len() as f32
 }
 
+#[allow(dead_code)]
 fn infer_status<'a>(
     proj_id: &str,
     overrides: &'a HashMap<String, ProjectStatus>,

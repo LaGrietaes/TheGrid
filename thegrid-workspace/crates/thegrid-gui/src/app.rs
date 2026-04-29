@@ -104,7 +104,9 @@ impl ProjectNavTab {
 #[derive(Debug, Clone, Default)]
 pub struct QuickViewState {
     pub slots:          [Option<String>; 4],
+    #[allow(dead_code)]
     pub swap_open:      bool,
+    #[allow(dead_code)]
     pub swap_slot_idx:  Option<usize>,
 }
 
@@ -211,6 +213,7 @@ pub struct PlannerAddState {
 pub enum PlannerTaskStatus { #[default] Todo, InProgress, Done, Blocked }
 
 impl PlannerTaskStatus {
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Todo       => "TODO",
@@ -231,12 +234,14 @@ impl PlannerTaskStatus {
 
 #[derive(Debug, Clone)]
 pub struct PlannerTask {
+    #[allow(dead_code)]
     pub id:           String,
     pub title:        String,
     pub status:       PlannerTaskStatus,
     /// "AI", "HUMAN", or a person's name
     pub assignee:     String,
     pub ai_suggested: bool,
+    #[allow(dead_code)]
     pub notes:        String,
     pub depends_on:   Vec<String>,
 }

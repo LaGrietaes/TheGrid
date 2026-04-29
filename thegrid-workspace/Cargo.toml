@@ -29,6 +29,16 @@ default-members = [
 ]
 resolver = "2"
 
+[profile.release]
+opt-level     = 3
+lto           = "thin"   # link-time optimization for smaller binary
+codegen-units = 1
+strip         = true     # strip debug symbols — reduces binary size ~30%
+
+[profile.dev]
+# Faster incremental builds during development
+opt-level = 1
+
 [workspace.package]
 version = "0.4.0"
 edition = "2021"

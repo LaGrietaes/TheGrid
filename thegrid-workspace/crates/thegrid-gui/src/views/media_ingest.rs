@@ -278,8 +278,10 @@ pub struct MediaIngestState {
     pub cols:                usize,
     pub type_filter:         MediaFileType,
     pub src_filter:          MediaSourceType,
+    #[allow(dead_code)]
     pub show_filter_help:    bool,
     pub filter_only_picks:   bool,
+    #[allow(dead_code)]
     pub filter_only_unrated: bool,
     pub filter_min_rating:   u8,
     pub filter_min_quality:  f32,
