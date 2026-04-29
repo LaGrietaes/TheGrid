@@ -29,7 +29,7 @@ reqwest       = { workspace = true }
 eframe        = { version = "0.27", default-features = false, features = ["wgpu", "default_fonts"] }
 # wgpu renderer avoids the egui_glow GL_INVALID_OPERATION / STATUS_ACCESS_VIOLATION crash on Windows
 egui          = "0.27"
-egui_extras   = { version = "0.27", features = ["image", "svg"] }
+egui_extras   = { version = "0.27", features = ["image", "svg", "file"] }
 egui_tiles    = "0.8"
 # Phosphor icon font — 1000+ clean vector icons, works with egui 0.27
 egui-phosphor = { version = "0.5", features = ["regular"] }

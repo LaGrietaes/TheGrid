@@ -799,6 +799,8 @@ impl TheGridApp {
         // Initialize the shared runtime
         let runtime = Arc::new(AppRuntime::new(config.clone(), tx.clone())
             .expect("Failed to initialize AppRuntime"));
+        let ingest_launch = launch_args.ingest_path.is_some() || launch_args.open_file.is_some();
+        runtime.set_ui_priority_mode(ingest_launch);
         runtime.start_services();
 
         Self {
@@ -4111,6 +4113,9 @@ impl eframe::App for TheGridApp {
         }
 
         // 6. Screen dispatch
+        let boot_to_ingest = matches!(self.screen, Screen::Boot)
+            && self.shell_launch.as_ref().map_or(false, |a| a.ingest_path.is_some() || a.open_file.is_some());
+        self.runtime.set_ui_priority_mode(matches!(self.screen, Screen::MediaIngest) || boot_to_ingest);
         match self.screen.clone() {
 
             Screen::Boot => {
@@ -4746,7 +4751,12 @@ impl eframe::App for TheGridApp {
                         // Trigger search if debounce fired or Enter pressed
                         if actions.trigger_search {
                             let q = self.media_ingest.query.clone();
-                            self.runtime.spawn_search(q, None, self.semantic_enabled);
+                            self.runtime.spawn_search_with_limit(
+                                q,
+                                None,
+                                false,
+                                actions.search_limit,
+                            );
                         }
 
                         // Route all fired events

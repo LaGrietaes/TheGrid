@@ -110,6 +110,7 @@ fn apply_automation_rules_for_file(
 pub struct AppRuntime {
     pub config:       Arc<Mutex<Config>>,
     pub db:           Arc<Mutex<Database>>,
+    pub db_path:      PathBuf,
     pub event_tx:     mpsc::Sender<AppEvent>,
     
     // Services
@@ -125,6 +126,9 @@ pub struct AppRuntime {
     pub media_analyzer: Arc<Mutex<Option<Arc<dyn thegrid_ai::MediaAnalyzer>>>>,
     pub agent_shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     pub hash_worker_running: Arc<AtomicBool>,
+    pub embedding_worker_running: Arc<AtomicBool>,
+    pub media_worker_running: Arc<AtomicBool>,
+    pub ui_priority_mode: Arc<AtomicBool>,
     pub sync_health: Arc<Mutex<std::collections::HashMap<String, SyncHealthMetrics>>>,
 
     // Compute delegation
@@ -492,6 +496,7 @@ impl AppRuntime {
         let runtime = Self {
             config: config_arc,
             db,
+            db_path,
             event_tx,
             file_watcher,
             semantic_search: Arc::new(Mutex::new(None)),
@@ -501,6 +506,9 @@ impl AppRuntime {
             media_analyzer: Arc::new(Mutex::new(None)),
             agent_shutdown: Arc::new(Mutex::new(None)),
             hash_worker_running: Arc::new(AtomicBool::new(false)),
+            embedding_worker_running: Arc::new(AtomicBool::new(false)),
+            media_worker_running: Arc::new(AtomicBool::new(false)),
+            ui_priority_mode: Arc::new(AtomicBool::new(false)),
             sync_health: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tailscale_peers: Arc::new(Mutex::new(Vec::new())),
             compute_router,
@@ -514,6 +522,12 @@ impl AppRuntime {
     pub fn update_tailscale_peers(&self, peers: Vec<TailscaleDevice>) {
         let mut lock = self.tailscale_peers.lock().unwrap();
         *lock = peers;
+    }
+
+    /// When enabled, interactive UI screens (e.g. Media Ingest) get priority.
+    /// Background workers reduce batch sizes and parallelism to keep the app responsive.
+    pub fn set_ui_priority_mode(&self, enabled: bool) {
+        self.ui_priority_mode.store(enabled, Ordering::Relaxed);
     }
 
     /// Periodically re-fetch Tailscale devices in the background so that
@@ -1125,81 +1139,88 @@ impl AppRuntime {
 
     /// Scan duplicates with GUI-provided filters to keep large indexes manageable.
     pub fn spawn_duplicates_scan_filtered(&self, filter: thegrid_core::models::DuplicateScanFilter) {
-        let db = Arc::clone(&self.db);
+        let db_path = self.db_path.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
             log::info!("[Runtime] Starting duplicate file scan...");
-            let result = db.lock().map(|guard| guard.get_duplicate_groups());
-            match result {
-                Ok(Ok(groups)) => {
-                    let raw_group_count = groups.len();
-                    let ext_filter: HashSet<String> = filter
-                        .include_extensions
-                        .iter()
-                        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
-                        .filter(|e| !e.is_empty())
-                        .collect();
-                    let path_prefix = filter.path_prefix
-                        .as_deref()
-                        .map(|p| p.to_lowercase())
-                        .filter(|p| !p.is_empty());
 
-                    let mut filtered_groups: Vec<(String, u64, Vec<thegrid_core::models::FileSearchResult>)> = Vec::new();
-                    for (hash, size, files) in groups {
-                        if size < filter.min_size_bytes {
+            // Open a *dedicated* read-only connection so this long-running
+            // query never contends with the shared Arc<Mutex<Database>> used
+            // by the watcher, media analyzer, and embed worker.
+            let scan_db = match Database::open(&db_path) {
+                Ok(d)  => d,
+                Err(e) => { log::error!("[Runtime] Duplicate scan: DB open failed: {}", e); return; }
+            };
+            let groups = match scan_db.get_duplicate_groups() {
+                Ok(g)  => g,
+                Err(e) => { log::error!("[Runtime] Duplicate scan DB error: {}", e); return; }
+            };
+            // scan_db dropped here — connection closed.
+
+            let raw_group_count = groups.len();
+            let ext_filter: HashSet<String> = filter
+                .include_extensions
+                .iter()
+                .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                .filter(|e| !e.is_empty())
+                .collect();
+            let path_prefix = filter.path_prefix
+                .as_deref()
+                .map(|p| p.to_lowercase())
+                .filter(|p| !p.is_empty());
+
+            let mut filtered_groups: Vec<(String, u64, Vec<thegrid_core::models::FileSearchResult>)> = Vec::new();
+            for (hash, size, files) in groups {
+                if size < filter.min_size_bytes {
+                    continue;
+                }
+                let mut keep = Vec::new();
+                for file in files {
+                    if filter.exclude_system_paths && thegrid_core::should_skip_path(&file.path) {
+                        continue;
+                    }
+                    if let Some(device_id) = filter.device_id.as_deref() {
+                        if !device_id.is_empty() && file.device_id != device_id {
                             continue;
                         }
-                        let mut keep = Vec::new();
-                        for file in files {
-                            if filter.exclude_system_paths && thegrid_core::should_skip_path(&file.path) {
-                                continue;
-                            }
-                            if let Some(device_id) = filter.device_id.as_deref() {
-                                if !device_id.is_empty() && file.device_id != device_id {
-                                    continue;
-                                }
-                            }
-                            if !ext_filter.is_empty() {
-                                let file_ext = file.ext.clone().unwrap_or_default().to_lowercase();
-                                if !ext_filter.contains(&file_ext) {
-                                    continue;
-                                }
-                            }
-                            if let Some(prefix) = path_prefix.as_deref() {
-                                let fp = file.path.to_string_lossy().to_lowercase();
-                                if !fp.starts_with(prefix) {
-                                    continue;
-                                }
-                            }
-                            keep.push(file);
-                        }
-
-                        if keep.len() > 1 {
-                            filtered_groups.push((hash, size, keep));
+                    }
+                    if !ext_filter.is_empty() {
+                        let file_ext = file.ext.clone().unwrap_or_default().to_lowercase();
+                        if !ext_filter.contains(&file_ext) {
+                            continue;
                         }
                     }
-
-                    filtered_groups.sort_by(|a, b| {
-                        let aw = a.1.saturating_mul(a.2.len().saturating_sub(1) as u64);
-                        let bw = b.1.saturating_mul(b.2.len().saturating_sub(1) as u64);
-                        bw.cmp(&aw)
-                    });
-
-                    let max_groups = filter.max_groups.max(1);
-                    if filtered_groups.len() > max_groups {
-                        filtered_groups.truncate(max_groups);
+                    if let Some(prefix) = path_prefix.as_deref() {
+                        let fp = file.path.to_string_lossy().to_lowercase();
+                        if !fp.starts_with(prefix) {
+                            continue;
+                        }
                     }
-
-                    log::info!(
-                        "[Runtime] Duplicate scan found {} raw group(s), {} filtered group(s)",
-                        raw_group_count,
-                        filtered_groups.len()
-                    );
-                    let _ = tx.send(AppEvent::DuplicatesFound(filtered_groups));
+                    keep.push(file);
                 }
-                Ok(Err(e)) => log::error!("[Runtime] Duplicate scan DB error: {}", e),
-                Err(_) => log::error!("[Runtime] Duplicate scan: DB lock poisoned"),
+
+                if keep.len() > 1 {
+                    filtered_groups.push((hash, size, keep));
+                }
             }
+
+            filtered_groups.sort_by(|a, b| {
+                let aw = a.1.saturating_mul(a.2.len().saturating_sub(1) as u64);
+                let bw = b.1.saturating_mul(b.2.len().saturating_sub(1) as u64);
+                bw.cmp(&aw)
+            });
+
+            let max_groups = filter.max_groups.max(1);
+            if filtered_groups.len() > max_groups {
+                filtered_groups.truncate(max_groups);
+            }
+
+            log::info!(
+                "[Runtime] Duplicate scan found {} raw group(s), {} filtered group(s)",
+                raw_group_count,
+                filtered_groups.len()
+            );
+            let _ = tx.send(AppEvent::DuplicatesFound(filtered_groups));
         });
     }
 
@@ -1387,6 +1408,7 @@ impl AppRuntime {
         let db       = self.db.clone();
         let semantic = self.semantic_search.clone();
         let config   = self.config.clone();
+        let ui_priority = Arc::clone(&self.ui_priority_mode);
 
         std::thread::spawn(move || {
             const LOCAL_OLLAMA: &str = "http://127.0.0.1:11434";
@@ -1490,25 +1512,49 @@ impl AppRuntime {
             match provider_result {
                 Ok(p) => {
                     match SemanticSearch::new(p) {
-                        Ok(mut search) => {
-                            // Warm up index from previously stored embeddings.
-                            if let Ok(guard) = db.lock() {
-                                if let Ok(all) = guard.get_all_embeddings() {
-                                    let n = all.len();
-                                    for (fid, vec) in all {
-                                        let _ = search.add_vector(fid, &vec);
-                                    }
-                                    log::info!("[AI] Loaded {} existing embeddings into vector index", n);
-                                }
-                            }
+                        Ok(search) => {
                             let model_id = search.model_id().to_string();
-                            let count = search.vector_count();
                             {
                                 let mut lock = semantic.lock().expect("semantic lock");
                                 *lock = Some(search);
                             }
-                            log::info!("[AI] Semantic engine ready: model={} vectors={}", model_id, count);
+                            log::info!("[AI] Semantic engine ready: model={} vectors=0", model_id);
                             let _ = event_tx.send(AppEvent::SemanticReady);
+
+                            // Defer heavy vector warmup while interactive screens are prioritized.
+                            let db_warm = Arc::clone(&db);
+                            let semantic_warm = Arc::clone(&semantic);
+                            let ui_priority_warm = Arc::clone(&ui_priority);
+                            let event_tx_warm = event_tx.clone();
+                            std::thread::spawn(move || {
+                                while ui_priority_warm.load(Ordering::Relaxed) {
+                                    std::thread::sleep(std::time::Duration::from_millis(800));
+                                }
+
+                                let all = match db_warm.lock() {
+                                    Ok(guard) => guard.get_all_embeddings().unwrap_or_default(),
+                                    Err(_) => Vec::new(),
+                                };
+                                if all.is_empty() {
+                                    return;
+                                }
+
+                                let mut loaded = 0usize;
+                                if let Ok(mut lock) = semantic_warm.lock() {
+                                    if let Some(search) = lock.as_mut() {
+                                        for (fid, vec) in all {
+                                            let _ = search.add_vector(fid, &vec);
+                                            loaded += 1;
+                                            if loaded % 3000 == 0 {
+                                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                log::info!("[AI] Warmed semantic index with {} vectors", loaded);
+                                let _ = event_tx_warm.send(AppEvent::Status(format!("semantic_warmup_loaded:{}", loaded)));
+                            });
                         }
                         Err(e) => {
                             let _ = event_tx.send(AppEvent::SemanticFailed(format!("Vector engine: {}", e)));
@@ -1524,9 +1570,15 @@ impl AppRuntime {
     }
 
     pub fn spawn_embedding_worker(&self) {
+        if self.embedding_worker_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         let db       = self.db.clone();
         let event_tx = self.event_tx.clone();
         let semantic = self.semantic_search.clone();
+        let ui_priority = Arc::clone(&self.ui_priority_mode);
+        let running = Arc::clone(&self.embedding_worker_running);
         let remote_ai = self.remote_ai_nodes.clone();
         let termux_agent = self.termux_agent.clone();
         let tailscale_peers = Arc::clone(&self.tailscale_peers);
@@ -1554,6 +1606,7 @@ impl AppRuntime {
             let mut last_router_probe = std::time::Instant::now() - std::time::Duration::from_secs(300);
 
             loop {
+                let ui_mode = ui_priority.load(Ordering::Relaxed);
                 let local_engine = {
                     let lock = semantic.lock().expect("semantic lock");
                     lock.as_ref().map(|s| (s.provider(), s.model_id().to_string()))
@@ -1642,7 +1695,8 @@ impl AppRuntime {
                 // Pull from priority queue first; fall back to unqueued files.
                 let batch: Vec<(i64, String)> = match db.lock() {
                     Ok(guard) => {
-                        let target_batch = (20usize).saturating_mul(max_parallel_requests).min(200);
+                        let effective_parallel = if ui_mode { 1 } else { max_parallel_requests };
+                        let target_batch = (20usize).saturating_mul(effective_parallel).min(200);
                         let queued = guard.get_embedding_queue_batch(target_batch).unwrap_or_default();
                         if queued.is_empty() {
                             // Queue is drained; re-seed from files without embeddings
@@ -1700,7 +1754,8 @@ impl AppRuntime {
                 }
                 let router_peer = router_peer_cache.clone();
 
-                let worker_count = max_parallel_requests
+                let effective_parallel = if ui_mode { 1 } else { max_parallel_requests };
+                let worker_count = effective_parallel
                     .max(1)
                     .min(8)
                     .min(work_items.len().max(1));
@@ -1821,8 +1876,10 @@ impl AppRuntime {
                     let _ = event_tx.send(AppEvent::EmbeddingProgress { indexed, total });
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(if ui_mode { 350 } else { 100 }));
             }
+
+            running.store(false, Ordering::SeqCst);
         });
     }
 
@@ -1835,10 +1892,10 @@ impl AppRuntime {
         let config = Arc::clone(&self.config);
         let event_tx = self.event_tx.clone();
         let running = Arc::clone(&self.hash_worker_running);
+        let ui_priority = Arc::clone(&self.ui_priority_mode);
 
         std::thread::spawn(move || {
             log::info!("[Runtime] Starting background hashing worker...");
-            let batch_size = 50;
             let mut hashed_this_session = 0usize;
             // total = files already hashed before this session + still-remaining
             // We track remaining so we can compute a stable total even as new files arrive.
@@ -1853,6 +1910,8 @@ impl AppRuntime {
             });
 
             loop {
+                let ui_mode = ui_priority.load(Ordering::Relaxed);
+                let batch_size = if ui_mode { 8 } else { 50 };
                 // Re-count remaining each batch to account for newly-indexed files.
                 let remaining = db.lock()
                     .map(|g| g.count_files_needing_hash().unwrap_or(0))
@@ -1878,7 +1937,7 @@ impl AppRuntime {
                         hashed: total_to_hash,
                         total:  total_to_hash,
                     });
-                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    std::thread::sleep(std::time::Duration::from_secs(if ui_mode { 45 } else { 30 }));
                     continue;
                 }
 
@@ -1962,7 +2021,7 @@ impl AppRuntime {
                 }
 
                 // Yield to other threads
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(if ui_mode { 250 } else { 50 }));
             }
 
             running.store(false, Ordering::SeqCst);
@@ -1970,11 +2029,17 @@ impl AppRuntime {
     }
 
     pub fn spawn_media_analyzer_worker(&self) {
+        if self.media_worker_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         let db = Arc::clone(&self.db);
         let cfg = Arc::clone(&self.config);
         let event_tx = self.event_tx.clone();
         let analyzer = Arc::clone(&self.media_analyzer);
         let termux_agent = Arc::clone(&self.termux_agent);
+        let ui_priority = Arc::clone(&self.ui_priority_mode);
+        let running = Arc::clone(&self.media_worker_running);
 
         std::thread::spawn(move || {
             log::info!("[Runtime] Starting background media analyzer worker...");
@@ -1985,6 +2050,7 @@ impl AppRuntime {
             let mut last_mode_status = std::time::Instant::now() - std::time::Duration::from_secs(15);
 
             loop {
+                let ui_mode = ui_priority.load(Ordering::Relaxed);
                 let az = {
                     let lock = analyzer.lock().unwrap();
                     lock.clone()
@@ -2062,6 +2128,10 @@ impl AppRuntime {
                     batch_size = 32;
                 } else {
                     batch_size = 12;
+                }
+                if ui_mode {
+                    workers = workers.min(1);
+                    batch_size = batch_size.min(4);
                 }
                 if tablet_assist_enabled && tablet_idle_for_assist {
                     // If tablet is free, we can run media processing harder locally while
@@ -2193,12 +2263,14 @@ impl AppRuntime {
                         )));
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::thread::sleep(std::time::Duration::from_millis(if ui_mode { 1200 } else { 500 }));
             }
+
+            running.store(false, Ordering::SeqCst);
         });
     }
 
-    pub fn spawn_search(&self, query: String, device_filter: Option<String>, semantic_enabled: bool) {
+    pub fn spawn_search_with_limit(&self, query: String, device_filter: Option<String>, semantic_enabled: bool, limit: usize) {
         let db       = Arc::clone(&self.db);
         let tx       = self.event_tx.clone();
         let semantic_search  = self.semantic_search.clone();
@@ -2207,6 +2279,7 @@ impl AppRuntime {
             let cfg = self.config.lock().unwrap();
             (cfg.api_key.clone(), cfg.agent_port)
         };
+        let limit = limit.clamp(1, 500);
 
         std::thread::spawn(move || {
             let (clean_query, media_filters) = AppRuntime::parse_media_search_filters(&query);
@@ -2223,7 +2296,7 @@ impl AppRuntime {
                 if has_local {
                     if let Ok(mut lock) = semantic_search.lock() {
                         if let Some(engine) = &mut *lock {
-                            if let Ok(hits) = engine.search(&effective_query, 50) {
+                            if let Ok(hits) = engine.search(&effective_query, limit) {
                                 let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
                                 results = db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default();
                             }
@@ -2238,7 +2311,7 @@ impl AppRuntime {
 
                     if let Some(ip) = remote_node {
                         if let Ok(client) = AgentClient::new(&ip, port, api_key) {
-                            if let Ok(hits) = client.remote_search(&effective_query, 50) {
+                            if let Ok(hits) = client.remote_search(&effective_query, limit) {
                                 let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
                                 results = db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default();
                             }
@@ -2250,7 +2323,7 @@ impl AppRuntime {
                     if force_filtered_search {
                         guard.search_fts_with_media_filters(
                             &effective_query,
-                            50,
+                            limit,
                             device_filter.as_deref(),
                             media_filters.in_focus,
                             media_filters.min_quality,
@@ -2271,13 +2344,17 @@ impl AppRuntime {
                             media_filters.pick_flag.as_deref(),
                         ).ok()
                     } else {
-                        guard.search_fts(&effective_query, 50, device_filter.as_deref()).ok()
+                        guard.search_fts(&effective_query, limit, device_filter.as_deref()).ok()
                     }
                 }).unwrap_or_default();
             }
 
             let _ = tx.send(AppEvent::SearchResults(results));
         });
+    }
+
+    pub fn spawn_search(&self, query: String, device_filter: Option<String>, semantic_enabled: bool) {
+        self.spawn_search_with_limit(query, device_filter, semantic_enabled, 50);
     }
 
     pub fn spawn_get_telemetry(&self, ip: String, device_id: String) {

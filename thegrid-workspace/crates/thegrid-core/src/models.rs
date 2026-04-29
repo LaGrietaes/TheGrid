@@ -269,6 +269,9 @@ pub struct FileSearchResult {
     #[serde(default)]
     pub detected_by: DetectionSource,
     pub rank: Option<f64>,
+    /// Raw JSON from the ai_metadata column — parsed on demand in the UI
+    #[serde(default)]
+    pub ai_metadata: Option<String>,
 }
 
 impl FileSearchResult {

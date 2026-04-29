@@ -490,6 +490,10 @@ pub struct MediaMetadata {
     pub captured_at: Option<String>,
     pub gps_lat: Option<f64>,
     pub gps_lon: Option<f64>,
+    /// Duration in seconds (MP4/MOV containers)
+    pub duration_secs: Option<f64>,
+    /// Video codec or container short name
+    pub video_codec: Option<String>,
 }
 
 /// Trait for analyzing media files.
@@ -990,14 +994,22 @@ impl MediaAnalyzer for CudaMediaAnalyzer {
                 Self::inject_exif(&mut meta, path);
             }
             "mp4" | "mkv" | "mov" | "avi" => {
-                // Container-level analysis for video assets.
                 let size_mb = path.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
-                meta.description = format!("{} container, ~{}MB", ext.to_ascii_uppercase(), size_mb);
-                meta.tags = vec![
-                    ext.to_string(),
-                    "video".into(),
-                    "container-only-analysis".into(),
-                ];
+                let duration = match ext.as_str() {
+                    "mp4" | "mov" => read_mp4_duration(path),
+                    _ => None,
+                };
+                meta.duration_secs = duration;
+                meta.video_codec = Some(ext.to_ascii_uppercase());
+                if let Some(d) = duration {
+                    let mins = (d / 60.0) as u64;
+                    let secs = (d % 60.0) as u64;
+                    meta.description = format!("{} {}:{:02}  ~{}MB", ext.to_ascii_uppercase(), mins, secs, size_mb);
+                    meta.tags.push(format!("duration_{}s", d as u64));
+                } else {
+                    meta.description = format!("{} container, ~{}MB", ext.to_ascii_uppercase(), size_mb);
+                }
+                meta.tags.extend([ext.to_string(), "video".into(), "container-only-analysis".into()]);
             }
             _ => {
                 meta.description = format!("Unsupported media type: {}", ext);
@@ -1013,5 +1025,67 @@ impl MediaAnalyzer for CudaMediaAnalyzer {
         );
         Ok(meta)
     }
+}
+
+// ── MP4/MOV duration extraction ───────────────────────────────────────────────
+// Pure-Rust box parser: finds the 'mvhd' atom inside 'moov' and reads
+// duration/timescale without any external dependency.
+
+fn find_mp4_box<R: std::io::Read + std::io::Seek>(
+    f: &mut R,
+    box_type: &[u8; 4],
+    start: u64,
+    end: u64,
+) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut pos = start;
+    while pos + 8 <= end {
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        let mut hdr = [0u8; 8];
+        f.read_exact(&mut hdr).ok()?;
+        let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        if &hdr[4..8] == box_type { return Some(pos); }
+        if size < 8 { break; }
+        pos += size;
+    }
+    None
+}
+
+fn read_mp4_duration(path: &std::path::Path) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    // Search only the first 64 MB to avoid reading huge video files entirely
+    let scan_end = file_len.min(64 * 1024 * 1024);
+
+    let moov_pos = find_mp4_box(&mut f, b"moov", 0, scan_end)?;
+    f.seek(SeekFrom::Start(moov_pos)).ok()?;
+    let mut sz_buf = [0u8; 4];
+    f.read_exact(&mut sz_buf).ok()?;
+    let moov_size = u32::from_be_bytes(sz_buf) as u64;
+
+    let mvhd_pos = find_mp4_box(&mut f, b"mvhd", moov_pos + 8, moov_pos + moov_size)?;
+    // Skip box size(4) + box type(4) = 8 bytes, then read version(1) + flags(3)
+    f.seek(SeekFrom::Start(mvhd_pos + 8)).ok()?;
+    let mut ver_flags = [0u8; 4];
+    f.read_exact(&mut ver_flags).ok()?;
+    let version = ver_flags[0];
+
+    let (timescale, duration): (u64, u64) = if version == 1 {
+        // v1: creation(8) + modification(8) + timescale(4) + duration(8)
+        f.seek(SeekFrom::Current(16)).ok()?;
+        let mut ts = [0u8; 4]; f.read_exact(&mut ts).ok()?;
+        let mut d  = [0u8; 8]; f.read_exact(&mut d).ok()?;
+        (u32::from_be_bytes(ts) as u64, u64::from_be_bytes(d))
+    } else {
+        // v0: creation(4) + modification(4) + timescale(4) + duration(4)
+        f.seek(SeekFrom::Current(8)).ok()?;
+        let mut ts = [0u8; 4]; f.read_exact(&mut ts).ok()?;
+        let mut d  = [0u8; 4]; f.read_exact(&mut d).ok()?;
+        (u32::from_be_bytes(ts) as u64, u32::from_be_bytes(d) as u64)
+    };
+
+    if timescale == 0 { return None; }
+    Some(duration as f64 / timescale as f64)
 }
 

@@ -52,8 +52,9 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_files_device  ON files(device_id);
-            CREATE INDEX IF NOT EXISTS idx_files_ext     ON files(ext);
-            CREATE INDEX IF NOT EXISTS idx_files_modified ON files(modified DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_ext       ON files(ext);
+            CREATE INDEX IF NOT EXISTS idx_files_modified  ON files(modified DESC);
+            CREATE INDEX IF NOT EXISTS idx_files_hash_size ON files(hash, size) WHERE hash IS NOT NULL AND hash != '';
 
             CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
                 name,
@@ -405,30 +406,41 @@ impl Database {
     }
 
     pub fn get_duplicate_groups(&self) -> Result<Vec<(String, u64, Vec<FileSearchResult>)>> {
+        // Single query: self-join to find only hashes that appear more than once,
+        // then fetch all matching file rows in one pass. Holds the lock for one
+        // short read instead of N+1 sequential reads.
         let mut stmt = self.conn.prepare(
-            "SELECT hash, size FROM files 
-             WHERE hash IS NOT NULL AND hash != '' AND hash NOT LIKE 'ERR_%'
-             GROUP BY hash, size 
-             HAVING COUNT(*) > 1"
+            "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
+                    f.ext, f.size, f.modified, f.hash, f.quick_hash,
+                    f.indexed_at, f.detected_by, 0.0 as rank
+             FROM files f
+             INNER JOIN (
+                 SELECT hash, size
+                 FROM files
+                 WHERE hash IS NOT NULL AND hash != '' AND hash NOT LIKE 'ERR_%'
+                 GROUP BY hash, size
+                 HAVING COUNT(*) > 1
+             ) dup ON f.hash = dup.hash AND f.size = dup.size
+             ORDER BY f.hash, f.size, f.id"
         )?;
 
-        let groups = stmt.query_map([], |row| {
-            let hash: String = row.get(0)?;
-            let size: i64    = row.get(1)?;
-            Ok((hash, size as u64))
-        })?;
+        let rows = stmt.query_map([], |r| self.map_search_result(r))?;
+        let mut all_files: Vec<FileSearchResult> = rows
+            .filter_map(|r| r.ok())
+            .collect();
 
-        let mut results = Vec::new();
-        for g in groups {
-            let (hash, size) = g?;
-            let mut file_stmt = self.conn.prepare(
-                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank 
-                 FROM files WHERE hash = ?1 AND size = ?2"
-            )?;
-            let files = file_stmt.query_map(params![hash, size as i64], |r| self.map_search_result(r))?;
-            let mut file_list = Vec::new();
-            for f in files { file_list.push(f?); }
-            results.push((hash, size, file_list));
+        // Group by (hash, size) — rows are already sorted by hash
+        let mut results: Vec<(String, u64, Vec<FileSearchResult>)> = Vec::new();
+        for file in all_files.drain(..) {
+            let key_hash = file.hash.clone().unwrap_or_default();
+            let key_size = file.size;
+            if let Some(last) = results.last_mut() {
+                if last.0 == key_hash && last.1 == key_size {
+                    last.2.push(file);
+                    continue;
+                }
+            }
+            results.push((key_hash, key_size, vec![file]));
         }
         Ok(results)
     }
@@ -669,6 +681,29 @@ impl Database {
                 .map(DetectionSource::from_db)
                 .unwrap_or_default(),
             rank:        row.get(12)?,
+            ai_metadata: None,
+        })
+    }
+
+    fn map_search_result_ai(&self, row: &rusqlite::Row) -> rusqlite::Result<FileSearchResult> {
+        Ok(FileSearchResult {
+            id:          row.get(0)?,
+            device_id:   row.get(1)?,
+            device_name: row.get(2)?,
+            path:        PathBuf::from(row.get::<_, String>(3)?),
+            name:        row.get(4)?,
+            ext:         row.get(5)?,
+            size:        row.get::<_, i64>(6)? as u64,
+            modified:    row.get(7)?,
+            hash:        row.get(8)?,
+            quick_hash:  row.get(9)?,
+            indexed_at:  row.get(10)?,
+            detected_by: row.get::<_, Option<String>>(11)?
+                .as_deref()
+                .map(DetectionSource::from_db)
+                .unwrap_or_default(),
+            rank:        row.get(12)?,
+            ai_metadata: row.get(13)?,
         })
     }
 
@@ -1184,7 +1219,7 @@ impl Database {
 
         let sql = if device_filter.is_some() {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
-                                        f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
+                                        f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank, f.ai_metadata
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
@@ -1193,7 +1228,7 @@ impl Database {
              LIMIT ?3"
         } else {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
-                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
+                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank, f.ai_metadata
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
@@ -1222,6 +1257,7 @@ impl Database {
                     .map(DetectionSource::from_db)
                     .unwrap_or_default(),
                 rank:        row.get(12)?,
+                ai_metadata: row.get(13)?,
             })
         };
 
@@ -1272,7 +1308,7 @@ impl Database {
         if query.trim().is_empty() {
             // Filter-only mode: no FTS text query required.
             let sql = if device_filter.is_some() {
-                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
+                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank, ai_metadata
                  FROM files
                  WHERE device_id = ?1
                                      AND LOWER(COALESCE(ext, '')) IN ('jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','raw','cr2','nef','arw','dng','mp4','mkv','mov','avi')
@@ -1296,7 +1332,7 @@ impl Database {
                  ORDER BY indexed_at DESC
                                  LIMIT ?19"
             } else {
-                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank
+                "SELECT id, device_id, device_name, path, name, ext, size, modified, hash, quick_hash, indexed_at, detected_by, 0.0 as rank, ai_metadata
                  FROM files
                                  WHERE LOWER(COALESCE(ext, '')) IN ('jpg','jpeg','png','webp','gif','bmp','tif','tiff','heic','heif','raw','cr2','nef','arw','dng','mp4','mkv','mov','avi')
                    AND (?1 IS NULL OR CAST(json_extract(ai_metadata, '$.in_focus') AS INTEGER) = ?1)
@@ -1344,7 +1380,7 @@ impl Database {
                         pick_flag_param,
                         limit as i64,
                     ],
-                    |row| self.map_search_result(row),
+                    |row| self.map_search_result_ai(row),
                 )?;
                 for r in rows {
                     out.push(r?);
@@ -1371,7 +1407,7 @@ impl Database {
                         pick_flag_param,
                         limit as i64,
                     ],
-                    |row| self.map_search_result(row),
+                    |row| self.map_search_result_ai(row),
                 )?;
                 for r in rows {
                     out.push(r?);
@@ -1383,7 +1419,7 @@ impl Database {
         let safe_query = sanitize_fts_query(query);
         let sql = if device_filter.is_some() {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
-                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
+                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank, f.ai_metadata
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
@@ -1410,7 +1446,7 @@ impl Database {
                          LIMIT ?20"
         } else {
             "SELECT f.id, f.device_id, f.device_name, f.path, f.name,
-                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank
+                    f.ext, f.size, f.modified, f.hash, f.quick_hash, f.indexed_at, f.detected_by, fts.rank, f.ai_metadata
              FROM files_fts fts
              JOIN files f ON f.id = fts.rowid
              WHERE files_fts MATCH ?1
@@ -1461,7 +1497,7 @@ impl Database {
                     pick_flag_param,
                     limit as i64,
                 ],
-                |row| self.map_search_result(row),
+                |row| self.map_search_result_ai(row),
             )?;
             for r in rows {
                 out.push(r?);
@@ -1489,7 +1525,7 @@ impl Database {
                     pick_flag_param,
                     limit as i64,
                 ],
-                |row| self.map_search_result(row),
+                |row| self.map_search_result_ai(row),
             )?;
             for r in rows {
                 out.push(r?);
@@ -2239,6 +2275,7 @@ impl Database {
                         .and_then(|s| serde_json::from_str(&format!("\"{}\"", s)).ok())
                         .unwrap_or(DetectionSource::FullScan),
                     rank: None,
+                    ai_metadata: None,
                 },
                 source_type: row.get::<_, String>(17)?,
                 action:      row.get::<_, String>(18)?,
