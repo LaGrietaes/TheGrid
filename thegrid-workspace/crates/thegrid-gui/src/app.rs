@@ -1488,6 +1488,18 @@ impl TheGridApp {
         });
     }
 
+    fn spawn_trigger_remote_update(&self, ip: String, device_id: String) {
+        let port = self.config.agent_port;
+        let api_key = self.config.api_key.clone();
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.trigger_update()) {
+                Ok(_) => { let _ = tx.send(AppEvent::RemoteUpdateStarted { device_id }); }
+                Err(e) => { let _ = tx.send(AppEvent::RemoteUpdateFailed { device_id, error: e.to_string() }); }
+            }
+        });
+    }
+
     #[allow(dead_code)]
     fn spawn_fm_delete(&self, ip: String, _device_id: String, paths: Vec<String>) {
         let port = self.config.agent_port;
@@ -2346,6 +2358,12 @@ impl TheGridApp {
                 }
                 AppEvent::RemoteConfigFailed { device_id: _, error } => {
                     self.push_toast(Toast::err(format!("Config update failed: {}", error)));
+                }
+                AppEvent::RemoteUpdateStarted { device_id } => {
+                    self.push_toast(Toast::ok(format!("Update started on {} — rebuilding in background", device_id)));
+                }
+                AppEvent::RemoteUpdateFailed { device_id, error } => {
+                    self.push_toast(Toast::err(format!("Update failed on {}: {}", device_id, error)));
                 }
                 AppEvent::FileSent { queue_idx, name } => {
                     if let Some(item) = self.file_queue.get_mut(queue_idx) {
@@ -3968,6 +3986,11 @@ impl TheGridApp {
         if actions.global_sync {
             self.push_toast(Toast::info("Starting mesh sync..."));
             self.sync_all_nodes();
+        }
+
+        if actions.update_node {
+            self.push_toast(Toast::info(format!("Triggering update on {}...", ip)));
+            self.spawn_trigger_remote_update(ip.to_string(), device_id.to_string());
         }
 
         if actions.load_clipboard {

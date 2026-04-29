@@ -52,6 +52,17 @@ pub enum AppEvent {
         error:     String,
     },
 
+    /// Remote node update (git pull + rebuild) was triggered successfully
+    RemoteUpdateStarted {
+        device_id: String,
+    },
+
+    /// Remote node update trigger failed (agent unreachable or rejected)
+    RemoteUpdateFailed {
+        device_id: String,
+        error:     String,
+    },
+
     // ── Remote Terminal ────────────────────────────────────────────────────
     /// Terminal session created
     RemoteTerminalCreated {

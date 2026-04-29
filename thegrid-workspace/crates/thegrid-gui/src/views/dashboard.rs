@@ -147,6 +147,8 @@ pub struct DetailActions {
     pub fm_rename: Option<(String, String)>,
     /// File manager: move selected files to a destination directory
     pub fm_move:   Option<(Vec<String>, std::path::PathBuf)>,
+    /// Remote update: trigger git pull + rebuild on remote node
+    pub update_node: bool,
 }
 
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -977,6 +979,13 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
         }
         if action_card(&mut cols[2], theme::IconType::Power, "WOL", "Send Wake-on-LAN") {
             actions.wake_device = true;
+        }
+    });
+
+    ui.add_space(MainScreenUiRules::BLOCK_GAP);
+    ui.columns(3, |cols| {
+        if action_card(&mut cols[0], theme::IconType::Globe, "UPDATE NODE", "Git pull + rebuild on node") {
+            actions.update_node = true;
         }
     });
 

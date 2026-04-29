@@ -405,6 +405,73 @@ impl AgentServer {
             return Ok(());
         }
 
+        // POST /v1/update — triggers a git pull + rebuild on this node.
+        // Detects platform and runs the appropriate update script non-blocking.
+        if method == "POST" && url == "/v1/update" {
+            if !self.capability_enabled("remote_control") {
+                Self::respond_capability_forbidden(req, "remote_control")?;
+                return Ok(());
+            }
+            let tx = self.event_tx.clone();
+            std::thread::spawn(move || {
+                #[cfg(target_os = "windows")]
+                let script_result = {
+                    // Look for gitupdate.cmd next to the running binary first, fall back to PATH
+                    let exe_dir = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                    let script = exe_dir
+                        .map(|d| d.join("gitupdate.cmd"))
+                        .filter(|p| p.exists());
+                    match script {
+                        Some(path) => std::process::Command::new("cmd")
+                            .args(["/C", path.to_string_lossy().as_ref()])
+                            .status(),
+                        None => std::process::Command::new("cmd")
+                            .args(["/C", "gitupdate.cmd"])
+                            .status(),
+                    }
+                };
+                #[cfg(not(target_os = "windows"))]
+                let script_result = {
+                    let exe_dir = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                    let script = exe_dir
+                        .map(|d| d.join("tg_update.sh"))
+                        .filter(|p| p.exists());
+                    match script {
+                        Some(path) => std::process::Command::new("sh")
+                            .arg(path)
+                            .status(),
+                        None => std::process::Command::new("sh")
+                            .args(["-c", "bash tg_update.sh"])
+                            .status(),
+                    }
+                };
+                match script_result {
+                    Ok(s) if s.success() => {
+                        let _ = tx.send(AppEvent::Status("remote_update_done:".to_string()));
+                    }
+                    Ok(s) => {
+                        let _ = tx.send(AppEvent::Status(
+                            format!("remote_update_failed:exit code {}", s.code().unwrap_or(-1)),
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::Status(
+                            format!("remote_update_failed:{}", e),
+                        ));
+                    }
+                }
+            });
+            req.respond(
+                Response::from_string(r#"{"ok":true,"message":"update started"}"#)
+                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap()),
+            )?;
+            return Ok(());
+        }
+
         if method == "POST" && url == "/adb/enable" {
             if !self.capability_enabled("remote_control") {
                 Self::respond_capability_forbidden(req, "remote_control")?;
@@ -1682,6 +1749,22 @@ impl AgentClient {
             .body("")
             .send()
             .context("Sending restart request")?;
+        if !resp.status().is_success() {
+            return Err(Self::handle_error(resp));
+        }
+        Ok(())
+    }
+
+    /// POST /v1/update — triggers a git pull + rebuild on the remote node.
+    /// Returns immediately; the node runs the update script in the background.
+    pub fn trigger_update(&self) -> Result<()> {
+        let endpoint = format!("{}/v1/update", self.base_url);
+        let resp = self.http.post(&endpoint)
+            .header("X-Grid-Key", &self.api_key)
+            .header("Content-Length", "0")
+            .body("")
+            .send()
+            .context("Sending update request")?;
         if !resp.status().is_success() {
             return Err(Self::handle_error(resp));
         }
