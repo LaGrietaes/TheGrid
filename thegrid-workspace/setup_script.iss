@@ -36,7 +36,8 @@ Name: "{commondesktop}\The Grid"; Filename: "{app}\launch_thegrid.cmd"
 
 [Run]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\install_explorer_context_menu.ps1"" -Action install -ExePath ""{app}\thegrid.exe"""; Flags: runhidden postinstall
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup_networking.ps1"""; Flags: runhidden postinstall
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup_networking.ps1"" -AgentPort 5000"; Flags: postinstall
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup_networking.ps1"" -AgentPort 5000 -ForceWebAuth"; Description: "Verify Tailscale Web Auth now (recommended if token changed)"; Flags: postinstall unchecked
 Filename: "{app}\launch_thegrid.cmd"; Description: "Launch The Grid"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]

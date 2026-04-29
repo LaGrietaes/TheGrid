@@ -54,6 +54,14 @@ Installer now includes:
 - `setup_networking.ps1` (opens agent port `5000`, RDP/firewall baseline)
 - `scripts/mesh_connection_smoke.ps1` (post-install mesh validation)
 
+Installer networking setup now also:
+- detects local Tailscale installation automatically
+- starts Tailscale service when needed
+- runs web auth (`tailscale up`) when node is not authenticated
+- offers an optional post-install checkbox: `Verify Tailscale Web Auth now (recommended if token changed)`
+
+This avoids relying on manually copying/reusing old Tailscale API keys during node onboarding.
+
 After installing on Artic, validate remotely:
 
 ```powershell
