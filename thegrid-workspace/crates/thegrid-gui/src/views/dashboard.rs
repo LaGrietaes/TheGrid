@@ -62,6 +62,8 @@ pub struct DetailState<'a> {
     pub watch_paths:    &'a [std::path::PathBuf],
     /// Phase 3: live telemetry for this device (None = not yet fetched)
     pub telemetry:      Option<&'a thegrid_core::models::NodeTelemetry>,
+    /// Sync health snapshot for this device (None = not yet observed)
+    pub sync_health:    Option<&'a thegrid_core::models::SyncHealthMetrics>,
     /// Phase 3: Smart Rules for filtering
     pub smart_rules:    &'a [thegrid_core::models::SmartRule],
     /// New in Node Enhancement: tracks the current directory being browsed
@@ -102,6 +104,7 @@ pub struct DetailActions {
     pub launch_rdp:      bool,
     pub browse_share:    bool,
     pub ping:            bool,
+    pub global_sync:     bool,
     pub send_clipboard:  bool,
     pub load_clipboard:  bool,
     pub select_files:    bool,
@@ -970,8 +973,7 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
             actions.scan_remote = true;
         }
         if action_card(&mut cols[1], theme::IconType::Globe, "GLOBAL SYNC", "Pull from remote mesh") {
-            // This button triggers mesh sync immediately (implicit in app.rs if scan_remote is false?)
-            // For now, let's keep it simple.
+            actions.global_sync = true;
         }
         if action_card(&mut cols[2], theme::IconType::Power, "WOL", "Send Wake-on-LAN") {
             actions.wake_device = true;
@@ -1098,6 +1100,11 @@ fn render_actions_tab(ui: &mut Ui, s: &mut DetailState, actions: &mut DetailActi
         render_watched_paths_section(ui, s.watch_paths, actions);
     }
 
+    ui.add_space(MainScreenUiRules::SECTION_GAP);
+    ui.add(egui::Separator::default().spacing(0.0));
+    ui.add_space(MainScreenUiRules::SECTION_GAP);
+    render_sync_health_section(ui, s.sync_health);
+
     // â”€â”€ AI Model Setup â”€â”€
     if s.is_tg_agent {
         ui.add_space(MainScreenUiRules::SECTION_GAP);
@@ -1222,6 +1229,64 @@ fn render_watched_paths_section(ui: &mut Ui, watch_paths: &[PathBuf], actions: &
     if theme::secondary_button(ui, "+ ADD WATCH DIRECTORY").clicked() {
         actions.add_watch_path = true;
     }
+}
+
+fn render_sync_health_section(ui: &mut Ui, sync_health: Option<&SyncHealthMetrics>) {
+    theme::section_title(ui, "// SYNC HEALTH");
+    ui.add_space(MainScreenUiRules::BLOCK_GAP);
+
+    egui::Frame::none()
+        .fill(Colors::BG_WIDGET)
+        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER))
+        .show(ui, |ui| {
+            let Some(health) = sync_health else {
+                ui.label(RichText::new("No sync health data yet. Metrics appear after mesh sync activity.").color(Colors::TEXT_MUTED).size(9.0));
+                return;
+            };
+
+            let is_live = health.sync_age_secs.map(|secs| secs < 120).unwrap_or(false);
+            let state_label = if is_live { "LIVE" } else { "STALE" };
+            let state_color = if is_live { Colors::GREEN } else { Colors::AMBER };
+            let last_sync = health
+                .last_sync_at
+                .map(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+                    .map(|dt| dt.with_timezone(&chrono::Local).format("%d/%m/%y %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "-".to_string()))
+                .unwrap_or_else(|| "-".to_string());
+            let age = health
+                .sync_age_secs
+                .map(|secs| format!("{}s", secs))
+                .unwrap_or_else(|| "-".to_string());
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("STATE").color(Colors::TEXT_DIM).size(MainScreenUiRules::INFO_LABEL_SIZE));
+                ui.label(RichText::new(state_label).color(state_color).size(MainScreenUiRules::INFO_VALUE_SIZE).strong());
+                ui.add_space(16.0);
+                ui.label(RichText::new("AGE").color(Colors::TEXT_DIM).size(MainScreenUiRules::INFO_LABEL_SIZE));
+                ui.label(RichText::new(age).color(Colors::TEXT).size(MainScreenUiRules::INFO_VALUE_SIZE).strong());
+                ui.add_space(16.0);
+                ui.label(RichText::new("TOMBSTONES").color(Colors::TEXT_DIM).size(MainScreenUiRules::INFO_LABEL_SIZE));
+                ui.label(RichText::new(health.tombstone_count.to_string()).color(Colors::TEXT).size(MainScreenUiRules::INFO_VALUE_SIZE).strong());
+                ui.add_space(16.0);
+                ui.label(RichText::new("FAILURES").color(Colors::TEXT_DIM).size(MainScreenUiRules::INFO_LABEL_SIZE));
+                ui.label(RichText::new(health.sync_failures.to_string()).color(if health.sync_failures > 0 { Colors::AMBER } else { Colors::TEXT }).size(MainScreenUiRules::INFO_VALUE_SIZE).strong());
+            });
+
+            ui.add_space(8.0);
+            ui.label(RichText::new(format!("LAST SYNC: {}", last_sync)).color(Colors::TEXT_DIM).size(8.0));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "DETECTION SOURCES | full_scan={} | watcher={} | sync={}",
+                    health.detection_sources.full_scan,
+                    health.detection_sources.watcher,
+                    health.detection_sources.sync,
+                ))
+                .color(Colors::TEXT)
+                .size(8.0)
+            );
+        });
 }
 
 fn action_card(ui: &mut Ui, icon: theme::IconType, label: &str, sub: &str) -> bool {

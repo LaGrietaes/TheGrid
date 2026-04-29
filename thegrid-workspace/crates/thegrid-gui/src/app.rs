@@ -261,10 +261,36 @@ impl PlannerTask {
 
 const RELEASES_LATEST_URL: &str = "https://api.github.com/repos/LaGrietaes/TheGrid/releases/latest";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct ReleaseInfo {
     tag_name: String,
     html_url: String,
+    #[serde(default)]
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UpdateState {
+    latest_version: Option<String>,
+    release_url: Option<String>,
+    download_url: Option<String>,
+    checking: bool,
+    applying: bool,
+    restart_required: bool,
+    last_error: Option<String>,
+}
+
+enum ApplyUpdateOutcome {
+    AlreadyLatest,
+    RestartRequired,
+    InstallerLaunched(String),
+    ReleasePageOpened(String),
 }
 
 enum GitUpdateOutcome {
@@ -275,6 +301,124 @@ enum GitUpdateOutcome {
 fn parse_version_tag(tag: &str) -> Option<Version> {
     let clean = tag.trim().trim_start_matches('v').trim_start_matches('V');
     Version::parse(clean).ok()
+}
+
+fn check_latest_release() -> Result<Option<ReleaseInfo>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let response = client
+        .get(RELEASES_LATEST_URL)
+        .header("User-Agent", format!("thegrid-gui/{}", env!("CARGO_PKG_VERSION")))
+        .send()
+        .map_err(|e| e.to_string())?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    let release = response
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json::<ReleaseInfo>()
+        .map_err(|e| e.to_string())?;
+
+    let current = parse_version_tag(env!("CARGO_PKG_VERSION"))
+        .ok_or_else(|| "Failed to parse current app version".to_string())?;
+    let latest = parse_version_tag(&release.tag_name)
+        .ok_or_else(|| format!("Invalid release tag: {}", release.tag_name))?;
+
+    if latest > current {
+        Ok(Some(release))
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_git_repo() -> bool {
+    std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn find_windows_installer_asset(release: &ReleaseInfo) -> Option<String> {
+    release
+        .assets
+        .iter()
+        .find(|asset| {
+            let name = asset.name.to_ascii_lowercase();
+            name.ends_with(".exe") && (name.contains("setup") || name.contains("installer") || name.contains("thegrid"))
+        })
+        .map(|asset| asset.browser_download_url.clone())
+}
+
+fn try_download_and_launch_windows_installer(release: &ReleaseInfo, download_url: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let bytes = client
+        .get(download_url)
+        .header("User-Agent", format!("thegrid-gui/{}", env!("CARGO_PKG_VERSION")))
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .bytes()
+        .map_err(|e| e.to_string())?;
+
+    let file_name = release
+        .assets
+        .iter()
+        .find(|asset| asset.browser_download_url == download_url)
+        .map(|asset| asset.name.clone())
+        .unwrap_or_else(|| format!("TheGrid_{}_Setup.exe", release.tag_name.trim_start_matches('v')));
+
+    let target_dir = dirs::download_dir().unwrap_or_else(std::env::temp_dir);
+    let target_path = target_dir.join(file_name);
+    std::fs::write(&target_path, &bytes).map_err(|e| e.to_string())?;
+
+    std::process::Command::new(&target_path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    Ok(target_path.display().to_string())
+}
+
+fn try_apply_update(release: &ReleaseInfo, download_url: Option<&str>) -> Result<ApplyUpdateOutcome, String> {
+    if is_git_repo() {
+        return match try_git_update()? {
+            GitUpdateOutcome::UpToDate => Ok(ApplyUpdateOutcome::AlreadyLatest),
+            GitUpdateOutcome::Updated => {
+                try_rebuild_binaries()?;
+                Ok(ApplyUpdateOutcome::RestartRequired)
+            }
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let installer_url = download_url
+            .map(|u| u.to_string())
+            .or_else(|| find_windows_installer_asset(release));
+        if let Some(installer_url) = installer_url {
+            let path = try_download_and_launch_windows_installer(release, &installer_url)?;
+            return Ok(ApplyUpdateOutcome::InstallerLaunched(path));
+        }
+    }
+
+    if !release.html_url.is_empty() {
+        open::that(&release.html_url).map_err(|e| e.to_string())?;
+        return Ok(ApplyUpdateOutcome::ReleasePageOpened(release.html_url.clone()));
+    }
+
+    Err("No update package is available for this build yet.".to_string())
 }
 
 fn try_git_update() -> Result<GitUpdateOutcome, String> {
@@ -505,6 +649,9 @@ pub struct TheGridApp {
     // ── Phase 3: Telemetry cache ──────────────────────────────────────────────
     // key = Tailscale device_id, value = latest NodeTelemetry snapshot
     telemetry_cache: HashMap<String, NodeTelemetry>,
+    update_state: UpdateState,
+    // key = Tailscale device_id, value = latest sync health snapshot
+    sync_health_cache: HashMap<String, SyncHealthMetrics>,
     // When we last polled each device for telemetry (to rate-limit polls)
     telemetry_last_poll: HashMap<String, std::time::Instant>,
     // When we last probed each remote device with /ping (separate from telemetry)
@@ -855,6 +1002,8 @@ impl TheGridApp {
             timeline: TimelineState::default(),
             viewport: ViewportState::default(),
             telemetry_cache:     HashMap::new(),
+            update_state:        UpdateState::default(),
+            sync_health_cache:   HashMap::new(),
             telemetry_last_poll: HashMap::new(),
             ping_last_poll:      HashMap::new(),
             telemetry_tree: build_default_telemetry_tree(),
@@ -952,80 +1101,126 @@ impl TheGridApp {
         }
 
         let auto_update = std::env::var("THEGRID_AUTO_UPDATE")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true);
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        self.spawn_release_check(auto_update);
+    }
+
+    fn spawn_release_check(&mut self, apply_if_available: bool) {
+        if self.update_state.checking || self.update_state.applying {
+            return;
+        }
+
+        self.update_state.checking = true;
+        self.update_state.last_error = None;
+        self.set_status("Checking for updates...");
 
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            let client = match reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-            {
-                Ok(c) => c,
-                Err(_) => return,
-            };
-
-            let response = match client
-                .get(RELEASES_LATEST_URL)
-                .header("User-Agent", format!("thegrid-gui/{}", env!("CARGO_PKG_VERSION")))
-                .send()
-            {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                return;
-            }
-
-            let release = match response.error_for_status().and_then(|r| r.json::<ReleaseInfo>()) {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-
-            let current = match parse_version_tag(env!("CARGO_PKG_VERSION")) {
-                Some(v) => v,
-                None => return,
-            };
-            let latest = match parse_version_tag(&release.tag_name) {
-                Some(v) => v,
-                None => return,
-            };
-
-            if latest > current {
-                if auto_update {
+            match check_latest_release() {
+                Ok(Some(release)) => {
+                    let download_url = find_windows_installer_asset(&release).unwrap_or_default();
                     let _ = tx.send(AppEvent::Status(format!(
-                        "update_available:{}|{}",
+                        "update_available:{}|{}|{}",
                         release.tag_name,
-                        release.html_url
+                        release.html_url,
+                        download_url,
                     )));
-                    match try_git_update() {
-                        Ok(GitUpdateOutcome::UpToDate) => {
-                            let _ = tx.send(AppEvent::Status("update_latest".to_string()));
-                        }
-                        Ok(GitUpdateOutcome::Updated) => {
-                            match try_rebuild_binaries() {
-                                Ok(()) => {
-                                    let _ = tx.send(AppEvent::Status("update_applied_restart_gui".to_string()));
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(AppEvent::Status(format!("update_failed:{}", e)));
-                                }
+                    if apply_if_available {
+                        match try_apply_update(&release, if download_url.is_empty() { None } else { Some(download_url.as_str()) }) {
+                            Ok(ApplyUpdateOutcome::AlreadyLatest) => {
+                                let _ = tx.send(AppEvent::Status("update_latest".to_string()));
+                            }
+                            Ok(ApplyUpdateOutcome::RestartRequired) => {
+                                let _ = tx.send(AppEvent::Status("update_applied_restart_gui".to_string()));
+                            }
+                            Ok(ApplyUpdateOutcome::InstallerLaunched(path)) => {
+                                let _ = tx.send(AppEvent::Status(format!("update_installer_started:{}", path)));
+                            }
+                            Ok(ApplyUpdateOutcome::ReleasePageOpened(url)) => {
+                                let _ = tx.send(AppEvent::Status(format!("update_release_opened:{}", url)));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::Status(format!("update_failed:{}", e)));
                             }
                         }
-                        Err(e) => {
-                            let _ = tx.send(AppEvent::Status(format!("update_failed:{}", e)));
-                        }
                     }
-                } else {
-                    let _ = tx.send(AppEvent::Status(format!(
-                        "update_available:{}|{}",
-                        release.tag_name,
-                        release.html_url
-                    )));
+                }
+                Ok(None) => {
+                    let _ = tx.send(AppEvent::Status("update_latest".to_string()));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Status(format!("update_failed:{}", e)));
                 }
             }
         });
+    }
+
+    fn spawn_apply_update(&mut self) {
+        if self.update_state.applying {
+            return;
+        }
+
+        let Some(version) = self.update_state.latest_version.clone() else {
+            self.push_toast(Toast::info("No update is currently available."));
+            return;
+        };
+
+        self.update_state.applying = true;
+        self.update_state.last_error = None;
+        self.set_status(format!("Applying update {}...", version));
+
+        let release = ReleaseInfo {
+            tag_name: version,
+            html_url: self.update_state.release_url.clone().unwrap_or_default(),
+            assets: self.update_state.download_url.clone().map(|url| vec![ReleaseAsset {
+                name: "TheGrid_Setup.exe".to_string(),
+                browser_download_url: url,
+            }]).unwrap_or_default(),
+        };
+        let download_url = self.update_state.download_url.clone();
+        let tx = self.event_tx.clone();
+
+        std::thread::spawn(move || {
+            match try_apply_update(&release, download_url.as_deref()) {
+                Ok(ApplyUpdateOutcome::AlreadyLatest) => {
+                    let _ = tx.send(AppEvent::Status("update_latest".to_string()));
+                }
+                Ok(ApplyUpdateOutcome::RestartRequired) => {
+                    let _ = tx.send(AppEvent::Status("update_applied_restart_gui".to_string()));
+                }
+                Ok(ApplyUpdateOutcome::InstallerLaunched(path)) => {
+                    let _ = tx.send(AppEvent::Status(format!("update_installer_started:{}", path)));
+                }
+                Ok(ApplyUpdateOutcome::ReleasePageOpened(url)) => {
+                    let _ = tx.send(AppEvent::Status(format!("update_release_opened:{}", url)));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::Status(format!("update_failed:{}", e)));
+                }
+            }
+        });
+    }
+
+    fn restart_current_gui(&mut self) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let cwd = exe.parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| "Failed to resolve executable directory".to_string())?;
+
+        let mut cmd = std::process::Command::new(&exe);
+        for arg in std::env::args().skip(1) {
+            if arg != "--skip-update-check" {
+                cmd.arg(arg);
+            }
+        }
+        cmd.current_dir(cwd)
+            .env("THEGRID_SKIP_UPDATE_CHECK", "1")
+            .spawn()
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
     }
 
     /// Process `--scan`, `--ingest`, `--open` CLI launch args once after boot.
@@ -2251,6 +2446,9 @@ impl TheGridApp {
                     self.refresh_index_stats();
                     self.index_stats.scanning = false;
                 }
+                AppEvent::SyncHealthUpdated { device_id, metrics } => {
+                    self.sync_health_cache.insert(device_id, metrics);
+                }
                 AppEvent::SyncFailed { device_id, error } => {
                     log::debug!("Sync failed for {}: {}", device_id, error);
                     let now = chrono::Utc::now().timestamp();
@@ -2590,9 +2788,16 @@ impl TheGridApp {
                         self.set_status(phase);
                     } else if msg.starts_with("update_available:") {
                         let payload = &msg["update_available:".len()..];
-                        let mut parts = payload.splitn(2, '|');
+                        let mut parts = payload.splitn(3, '|');
                         let version = parts.next().unwrap_or("unknown");
                         let url = parts.next().unwrap_or("");
+                        let download_url = parts.next().unwrap_or("");
+                        self.update_state.checking = false;
+                        self.update_state.applying = false;
+                        self.update_state.latest_version = Some(version.to_string());
+                        self.update_state.release_url = if url.is_empty() { None } else { Some(url.to_string()) };
+                        self.update_state.download_url = if download_url.is_empty() { None } else { Some(download_url.to_string()) };
+                        self.update_state.last_error = None;
                         self.push_toast(Toast::info(format!("Update available: {}", version)));
                         if !url.is_empty() {
                             self.set_status(format!("New version {} available: {}", version, url));
@@ -2600,12 +2805,38 @@ impl TheGridApp {
                             self.set_status(format!("New version {} available", version));
                         }
                     } else if msg == "update_applied_restart_gui" {
+                        self.update_state.checking = false;
+                        self.update_state.applying = false;
+                        self.update_state.restart_required = true;
+                        self.update_state.last_error = None;
                         self.push_toast(Toast::ok("Update applied. Restart THE GRID to run the latest version."));
                         self.set_status("Updated binaries successfully. Restart required.");
                     } else if msg == "update_latest" {
+                        self.update_state.checking = false;
+                        self.update_state.applying = false;
+                        self.update_state.restart_required = false;
+                        self.update_state.latest_version = None;
+                        self.update_state.release_url = None;
+                        self.update_state.download_url = None;
                         self.set_status("Already on latest version.");
+                    } else if msg.starts_with("update_installer_started:") {
+                        let path = &msg["update_installer_started:".len()..];
+                        self.update_state.checking = false;
+                        self.update_state.applying = false;
+                        self.update_state.last_error = None;
+                        self.push_toast(Toast::ok(format!("Installer launched: {}", path)));
+                        self.set_status("Update installer launched. Complete installation to finish update.");
+                    } else if msg.starts_with("update_release_opened:") {
+                        let url = &msg["update_release_opened:".len()..];
+                        self.update_state.checking = false;
+                        self.update_state.applying = false;
+                        self.push_toast(Toast::info("Opened release page for update."));
+                        self.set_status(format!("Opened release page: {}", url));
                     } else if msg.starts_with("update_failed:") {
                         let detail = &msg["update_failed:".len()..];
+                        self.update_state.checking = false;
+                        self.update_state.applying = false;
+                        self.update_state.last_error = Some(detail.to_string());
                         self.push_toast(Toast::err(format!("Auto-update failed: {}", detail)));
                         self.set_status("Auto-update failed. Check logs/status and retry manually.");
                     } else if msg.starts_with("config_update:") {
@@ -3392,6 +3623,10 @@ impl TheGridApp {
         let mut go_fwd      = false;
         let mut go_home     = false;
         let mut nav_open_settings = false;
+        let mut check_updates = false;
+        let mut apply_update = false;
+        let mut restart_after_update = false;
+        let mut open_release_notes: Option<String> = None;
 
         egui::TopBottomPanel::top("titlebar")
             .exact_height(36.0)
@@ -3574,6 +3809,40 @@ impl TheGridApp {
                         let _ = resp;
 
                         ui.add_space(8.0);
+                        ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).color(Colors::TEXT_DIM).size(9.0));
+
+                        if self.update_state.checking {
+                            ui.add_space(6.0);
+                            ui.spinner();
+                            ui.label(RichText::new("CHECKING").color(Colors::AMBER).size(8.5));
+                        } else if self.update_state.applying {
+                            ui.add_space(6.0);
+                            ui.spinner();
+                            ui.label(RichText::new("UPDATING").color(Colors::AMBER).size(8.5));
+                        } else if self.update_state.restart_required {
+                            ui.add_space(6.0);
+                            if crate::theme::micro_button(ui, "RESTART").clicked() {
+                                restart_after_update = true;
+                            }
+                        } else {
+                            if let Some(latest) = &self.update_state.latest_version {
+                                ui.add_space(6.0);
+                                ui.label(RichText::new(format!("NEW {}", latest)).color(Colors::AMBER).size(8.5).strong());
+                                if crate::theme::micro_button(ui, "UPDATE").clicked() {
+                                    apply_update = true;
+                                }
+                                if let Some(url) = self.update_state.release_url.clone() {
+                                    if crate::theme::micro_button(ui, "NOTES").clicked() {
+                                        open_release_notes = Some(url);
+                                    }
+                                }
+                            }
+                            if crate::theme::micro_button(ui, "CHECK").clicked() {
+                                check_updates = true;
+                            }
+                        }
+
+                        ui.add_space(8.0);
                         ui.label(RichText::new(&device_name).color(Colors::TEXT_MUTED).size(9.0));
                     });
                 });
@@ -3583,6 +3852,19 @@ impl TheGridApp {
         if go_fwd   { self.navigate_forward(); }
         if go_home  { self.navigate_to(Screen::Dashboard); }
         if nav_open_settings { let _ = self.event_tx.send(AppEvent::OpenSettings); }
+        if check_updates { self.spawn_release_check(false); }
+        if apply_update { self.spawn_apply_update(); }
+        if let Some(url) = open_release_notes {
+            if let Err(e) = open::that(&url) {
+                self.push_toast(Toast::err(format!("Failed to open release page: {}", e)));
+            }
+        }
+        if restart_after_update {
+            match self.restart_current_gui() {
+                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(e) => self.push_toast(Toast::err(format!("Restart failed: {}", e))),
+            }
+        }
     }
 
     fn render_statusbar(&self, ctx: &Context) {
@@ -3681,6 +3963,11 @@ impl TheGridApp {
         if actions.ping {
             self.push_toast(Toast::info(format!("Pinging {}...", ip)));
             self.spawn_ping(ip.to_string(), device_id.to_string(), true);
+        }
+
+        if actions.global_sync {
+            self.push_toast(Toast::info("Starting mesh sync..."));
+            self.sync_all_nodes();
         }
 
         if actions.load_clipboard {
@@ -4432,6 +4719,7 @@ impl eframe::App for TheGridApp {
                             let log_snap     = self.transfer_log.clone();
                             let watch_snap   = self.runtime.config.lock().unwrap().watch_paths.clone();
                             let telem_snap   = telemetry_snap.get(&device.id).cloned();
+                            let sync_health_snap = self.sync_health_cache.get(&device.id).cloned();
                             let drive_manifest_snap = self.file_manager.drive_last_manifest.clone();
                             let status = self.get_node_status(&device.id);
 
@@ -4453,6 +4741,7 @@ impl eframe::App for TheGridApp {
                                 is_tg_agent:    self.is_tg_agent,
                                 watch_paths:    &watch_snap,
                                 telemetry:      telem_snap.as_ref(),
+                                sync_health:    sync_health_snap.as_ref(),
                                 smart_rules:    &self.config.smart_rules,
                                 _current_remote_path: &mut self.current_remote_path,
                                 file_manager: &mut self.file_manager,
