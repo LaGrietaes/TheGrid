@@ -59,6 +59,7 @@ uuid          = { version = "1.7", features = ["v4"] }
 
 # Image processing (used for loading window icon)
 image         = "0.24"
+rodio         = "0.22"
 
 # Adobe PSD file decoding — extracts merged composite for preview
 psd           = "0.3"

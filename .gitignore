@@ -9,3 +9,22 @@ node_modules/
 .env
 debug/
 release/
+
+# Rust / Cargo
+**/target/
+**/*.rs.bk
+
+# Node / JS
+**/node_modules/
+**/npm-debug.log*
+**/yarn-error.log*
+
+# Editor / OS
+.vscode/
+Thumbs.db
+
+# Local generated project artifacts
+.tmp-smoke-appdata/
+thegrid-workspace/.tmp-smoke-appdata/
+thegrid-workspace/.winapp/
+.claude/worktrees/

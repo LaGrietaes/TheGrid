@@ -1037,7 +1037,7 @@ fn find_mp4_box<R: std::io::Read + std::io::Seek>(
     start: u64,
     end: u64,
 ) -> Option<u64> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::SeekFrom;
     let mut pos = start;
     while pos + 8 <= end {
         f.seek(SeekFrom::Start(pos)).ok()?;

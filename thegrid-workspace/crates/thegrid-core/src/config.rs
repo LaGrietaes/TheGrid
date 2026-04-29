@@ -134,7 +134,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api_key: "tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string(),
+            api_key: Self::default_api_key(),
             device_name: "0N3-DEV".to_string(),
             device_type: Self::default_device_type(),
             rdp_username: "0N3-DEV".to_string(),
@@ -176,6 +176,14 @@ impl Default for Config {
 }
 
 impl Config {
+    fn default_api_key() -> String {
+        std::env::var("THEGRID_API_KEY")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_default()
+    }
+
     fn default_agent_port() -> u16 {
         5000
     }
@@ -226,10 +234,9 @@ impl Config {
         // Normalize and trim API key
         cfg.api_key = cfg.api_key.trim().to_string();
 
-        // Fallback to hardcoded key if loaded one is empty
+        // Optional fallback from environment variable if key in config is empty.
         if cfg.api_key.is_empty() {
-            cfg.api_key =
-                "tskey-api-kMA88YTvnk11CNTRL-GwpDrsDdtrRYKvV7TAeNsRHTsjrH5dG8".to_string();
+            cfg.api_key = Self::default_api_key();
         }
 
         // Migrate names to 0N3-DEV as requested

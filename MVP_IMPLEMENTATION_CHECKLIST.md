@@ -119,6 +119,7 @@ Users can start the GUI or headless node and immediately begin discovering, inde
 - Collection management UI
 - Backup scheduling
 - RDP proxy
+- Media ingest project-linked LUT presets for fast batch picture grading (future sprint)
 
 ---
 

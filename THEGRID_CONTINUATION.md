@@ -868,5 +868,94 @@ cargo check --workspace
 
 ---
 
+## 10. NEAR-TERM VIDEO EDITOR ROADMAP (AI + HUMAN REVIEW)
+
+Target flow:
+1. Ingest long footage.
+2. AI proposes "keep" ranges (first pass).
+3. Human adjusts ranges in a timeline UI (second pass).
+4. Export only approved clips, discard the rest.
+5. Auto-name + auto-group clips with cinematic descriptions.
+
+### 10A. Data model additions
+
+Add to core models (new structs):
+
+```rust
+pub struct VideoCutSuggestion {
+    pub file_id: i64,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub confidence: f32,
+    pub reason: String, // e.g. "stable framing", "subject speaking"
+}
+
+pub struct VideoCutDecision {
+    pub file_id: i64,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub keep: bool,      // true = keep/export, false = discard
+    pub reviewed_by_human: bool,
+}
+
+pub struct VideoClipAsset {
+    pub source_file_id: i64,
+    pub clip_index: u32,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub output_path: std::path::PathBuf,
+    pub group_category: String,
+    pub cinematic_description: String,
+    pub auto_title: String,
+}
+```
+
+### 10B. Pipeline (implementation order)
+
+1. Suggestion pass (AI):
+- Input: source video + optional transcript/audio peaks + motion/focus metrics.
+- Output: ordered `VideoCutSuggestion` list.
+
+2. Review pass (human):
+- Timeline editor UI with in/out handles and keyboard nudging.
+- Approve/reject each suggested segment and create manual segments.
+
+3. Cut/export pass:
+- Use ffmpeg segment extraction (`-ss`, `-to`, stream copy when possible).
+- Export only approved ranges and optionally delete/discard rejected material.
+
+4. Naming/classification pass:
+- Auto-title format example: `Roll_B_Under_Desk_Desktop_001`.
+- Group by project/category and attach cinematic description.
+
+### 10C. Immediate UI entry point
+
+Add a new tab in Media Ingest: `CUT REVIEW`.
+
+Phase 1 UI inside this tab:
+- Source scrubber + frame strip.
+- Suggested cuts list with confidence and reason.
+- Keep/Discard toggles and manual trim inputs.
+- Batch export button: `EXPORT APPROVED CUTS`.
+
+### 10D. Event bus additions (AppEvent)
+
+```rust
+RequestVideoCutSuggestions { file_id: i64 }
+VideoCutSuggestionsReady { file_id: i64, cuts: Vec<VideoCutSuggestion> }
+SaveVideoCutDecisions { file_id: i64, decisions: Vec<VideoCutDecision> }
+ExportApprovedVideoCuts { file_id: i64 }
+VideoCutsExported { file_id: i64, clips: Vec<VideoClipAsset> }
+```
+
+### 10E. Acceptance criteria (MVP)
+
+- For a 10-20 minute source clip, user can approve/reject suggested ranges in one screen.
+- Export generates only approved clips into a deterministic folder layout.
+- Each clip gets auto-title, category, and cinematic description.
+- Original source remains untouched unless explicit "discard rejected ranges" is enabled.
+
+---
+
 *End of handoff document. Good luck in VSCode. The pipes are clean.*
 *— Dev Chief*

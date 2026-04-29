@@ -479,7 +479,7 @@ fn render_task_panel(
     proj_name: &str,
     tasks:     &mut HashMap<String, Vec<PlannerTask>>,
     new_task:  &mut String,
-    edit_idx:  &mut Option<(String, usize)>,
+    _edit_idx: &mut Option<(String, usize)>,
 ) {
     egui::Frame::none()
         .fill(Colors::BG_PANEL)

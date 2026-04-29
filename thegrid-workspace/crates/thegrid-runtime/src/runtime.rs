@@ -559,6 +559,7 @@ impl AppRuntime {
     }
 
     pub fn start_services(&self) {
+        let _ = self.event_tx.send(AppEvent::Status("startup_phase:Preparing local services...".to_string()));
         let (p, k, c) = {
             let cfg = self.config.lock().unwrap();
             (cfg.agent_port, cfg.api_key.clone(), cfg.clone())
@@ -574,6 +575,7 @@ impl AppRuntime {
         )));
 
         // Start agent server
+        let _ = self.event_tx.send(AppEvent::Status(format!("startup_phase:Starting local agent on port {}...", p)));
         let transfers_dir = c.effective_transfers_dir();
         let mut server = AgentServer::new(
             p,
@@ -620,6 +622,7 @@ impl AppRuntime {
         };
 
         if self.is_ai_node || has_remote_provider {
+            let _ = self.event_tx.send(AppEvent::Status("startup_phase:Initializing semantic services...".to_string()));
             self.spawn_semantic_initializer();
             self.spawn_embedding_worker();
         }
@@ -630,6 +633,7 @@ impl AppRuntime {
             .unwrap_or(true);
 
         if media_ai_enabled {
+            let _ = self.event_tx.send(AppEvent::Status("startup_phase:Initializing media analyzer...".to_string()));
             let mode_raw = std::env::var("THEGRID_MEDIA_MODE").ok().unwrap_or_else(|| {
                 self.config
                     .lock()
@@ -662,6 +666,7 @@ impl AppRuntime {
         }
 
         // Background indexing helpers + peer discovery for compute delegation
+        let _ = self.event_tx.send(AppEvent::Status("startup_phase:Starting background workers...".to_string()));
         self.spawn_peer_refresh_loop();
         self.spawn_hashing_worker();
 
@@ -680,6 +685,8 @@ impl AppRuntime {
                 )));
             }
         }
+
+        let _ = self.event_tx.send(AppEvent::Status("startup_services_ready".to_string()));
     }
 
     pub fn restart_services(&self) {

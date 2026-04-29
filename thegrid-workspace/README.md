@@ -76,8 +76,11 @@ THE GRID's core MVP provides cross-device file discovery, indexing, and semantic
 
 Edit or create `~/.config/thegrid/config.json` and add the directories you want indexed:
 
+Security note: keep secrets local. Do not commit API keys to source control. You can set `api_key` in local config or export `THEGRID_API_KEY` in your shell.
+
 ```json
 {
+  "api_key": "tskey-api-REPLACE-WITH-YOUR-LOCAL-KEY",
   "device_name": "MY-LAPTOP",
   "device_type": "Laptop",
   "watch_paths": [

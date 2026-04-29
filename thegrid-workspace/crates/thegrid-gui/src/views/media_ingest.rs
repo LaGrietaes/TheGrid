@@ -13,9 +13,13 @@
 //   Ctrl+A  - select all
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 use egui::{Color32, Key, RichText, ScrollArea, Ui, Vec2};
+use image::GenericImageView;
 use thegrid_core::{AppEvent, models::FileSearchResult};
+use thegrid_ai::MediaMetadata;
 use crate::theme::Colors;
+use crate::views::video_preview::{extract_video_frame_png, is_video_ext, VideoPreviewError};
 
 // --- Pick flag constants ----------------------------------------------------
 
@@ -212,6 +216,41 @@ pub struct FileReviewState {
     pub color_label: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum MediaResizePreset {
+    Print,
+    Social,
+    Ads,
+    Free,
+}
+
+impl MediaResizePreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Print => "PRINT",
+            Self::Social => "SOCIAL",
+            Self::Ads => "ADS",
+            Self::Free => "FREE",
+        }
+    }
+
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Print => "print",
+            Self::Social => "social",
+            Self::Ads => "ads",
+            Self::Free => "free",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaResizeRequest {
+    pub file_ids: Vec<i64>,
+    pub preset: MediaResizePreset,
+    pub replace_original: bool,
+}
+
 // --- View state ------------------------------------------------------------
 
 pub struct MediaIngestState {
@@ -223,9 +262,19 @@ pub struct MediaIngestState {
     pub loading:             bool,
     pub sort:                MediaSortField,
     pub sort_desc:           bool,
+    pub sort_dirty:          bool,
     pub selected_idx:        Option<usize>,
     pub selected_ids:        HashSet<i64>,
     pub review:              HashMap<i64, FileReviewState>,
+    pub thumb_cache:         HashMap<i64, egui::TextureHandle>,
+    pub thumb_failed:        HashSet<i64>,
+    thumb_pending:           HashSet<i64>,
+    thumb_tx:                mpsc::Sender<ThumbLoadResult>,
+    thumb_rx:                mpsc::Receiver<ThumbLoadResult>,
+    placeholder_cache:       HashMap<String, egui::TextureHandle>,
+    placeholder_missing:     HashSet<String>,
+    pub video_thumb_backend_unavailable: bool,
+    pub resize_replace_original: bool,
     pub cols:                usize,
     pub type_filter:         MediaFileType,
     pub src_filter:          MediaSourceType,
@@ -236,10 +285,12 @@ pub struct MediaIngestState {
     pub filter_min_quality:  f32,
     pub filter_only_geotagged: bool,
     pub filter_in_focus:     bool,
+    pub media_preview:       crate::views::video_preview::MediaPreviewState,
 }
 
 impl Default for MediaIngestState {
     fn default() -> Self {
+        let (thumb_tx, thumb_rx) = mpsc::channel();
         Self {
             query:               String::new(),
             pending_query:       String::new(),
@@ -249,9 +300,19 @@ impl Default for MediaIngestState {
             loading:             false,
             sort:                MediaSortField::Date,
             sort_desc:           true,
+            sort_dirty:          true,
             selected_idx:        None,
             selected_ids:        HashSet::new(),
             review:              HashMap::new(),
+            thumb_cache:         HashMap::new(),
+            thumb_failed:        HashSet::new(),
+            thumb_pending:       HashSet::new(),
+            thumb_tx,
+            thumb_rx,
+            placeholder_cache:   HashMap::new(),
+            placeholder_missing: HashSet::new(),
+            video_thumb_backend_unavailable: false,
+            resize_replace_original: false,
             cols:                6,
             type_filter:         MediaFileType::All,
             src_filter:          MediaSourceType::All,
@@ -262,6 +323,7 @@ impl Default for MediaIngestState {
             filter_min_quality:  0.0,
             filter_only_geotagged: false,
             filter_in_focus:     false,
+            media_preview:       crate::views::video_preview::MediaPreviewState::default(),
         }
     }
 }
@@ -272,7 +334,16 @@ pub struct MediaIngestActions {
     pub events:         Vec<AppEvent>,
     pub trigger_search: bool,
     pub open_preview:   Option<FileSearchResult>,
+    pub resize_request: Option<MediaResizeRequest>,
     pub search_limit:   usize,
+}
+
+const CARD_TITLE_H: f32 = 26.0;
+const CARD_META_H: f32 = 136.0;
+const MAX_THUMBNAIL_INFLIGHT: usize = 6;
+
+fn card_total_height(img_side: f32) -> f32 {
+    CARD_TITLE_H + img_side + CARD_META_H
 }
 
 impl Default for MediaIngestActions {
@@ -281,9 +352,37 @@ impl Default for MediaIngestActions {
             events: Vec::new(),
             trigger_search: false,
             open_preview: None,
+            resize_request: None,
             search_limit: 50,
         }
     }
+}
+
+struct DecodedThumb {
+    width:  u32,
+    height: u32,
+    rgba:   Vec<u8>,  // pre-decoded RGBA pixels
+}
+
+enum ThumbLoadResult {
+    Ready { file_id: i64, thumb: DecodedThumb },
+    Failed { file_id: i64, backend_missing: bool },
+}
+
+/// Decode image bytes to RGBA on the calling thread (intended for background workers).
+fn decode_thumb_bytes(bytes: &[u8]) -> Option<DecodedThumb> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let resized = if w > 480 || h > 480 { img.thumbnail(480, 480) } else { img };
+    let rgba_img = resized.to_rgba8();
+    Some(DecodedThumb {
+        width:  rgba_img.width(),
+        height: rgba_img.height(),
+        rgba:   rgba_img.into_raw(),
+    })
 }
 
 // --- Main render -----------------------------------------------------------
@@ -291,94 +390,70 @@ impl Default for MediaIngestActions {
 pub fn render_media_ingest(ui: &mut Ui, state: &mut MediaIngestState) -> MediaIngestActions {
     let mut actions = MediaIngestActions::default();
 
+    drain_thumbnail_results(ui.ctx(), state);
+
     render_top_bar(ui, state, &mut actions);
     let visible = render_filter_bar(ui, state);
 
     let approx_cols = state.cols.max(1);
     handle_keyboard(ui, state, &mut actions, approx_cols, &visible);
 
-    sort_results(&mut state.results, state.sort, state.sort_desc, &state.review);
+    if state.sort_dirty {
+        sort_results(&mut state.results, state.sort, state.sort_desc, &state.review);
+        state.sort_dirty = false;
+    }
 
     let n = visible.len();
-    let cols = state.cols.max(1);
+    let preview_file = current_preview_file(state, &visible);
+    let preview_open = preview_file.is_some();
+    let cols = if preview_open {
+        state.cols.saturating_sub(1).max(1)
+    } else {
+        state.cols.max(1)
+    };
+    let selection_h = if !state.selected_ids.is_empty() { 70.0 } else { 0.0 };
+    let status_h = 24.0;
+    let content_h = (ui.available_height() - selection_h - status_h - 6.0).max(240.0);
 
-    let scrollable_height = ui.available_height()
-        - if !state.selected_ids.is_empty() { 36.0 } else { 0.0 }
-        - 22.0;
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), content_h),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            if preview_open {
+                let total_w = ui.available_width();
+                let preview_w = (total_w * 0.34).clamp(320.0, 460.0);
+                let grid_w = (total_w - preview_w - 12.0).max(220.0);
 
-    ScrollArea::vertical()
-        .max_height(scrollable_height.max(100.0))
-        .show(ui, |ui| {
-            if n == 0 {
-                ui.add_space(40.0);
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("NO FILES MATCH CURRENT FILTER")
-                            .color(Colors::TEXT_MUTED)
-                            .size(11.0)
-                            .extra_letter_spacing(4.0),
+                ui.horizontal_top(|ui| {
+                    ui.set_height(content_h);
+
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(grid_w, content_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            render_cards_grid(ui, state, &mut actions, &visible, cols, content_h);
+                        },
+                    );
+
+                    ui.add_space(12.0);
+
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(preview_w, content_h),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            if let Some(file) = preview_file.as_ref() {
+                                if render_inline_preview_panel(ui, state, file, content_h) {
+                                    actions.open_preview = Some(file.clone());
+                                }
+                            }
+                        },
                     );
                 });
-                return;
+            } else {
+                render_cards_grid(ui, state, &mut actions, &visible, cols, content_h);
             }
-
-            let avail_w = ui.available_width();
-            let gap = 8.0;
-            let cell_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).max(140.0);
-            // Card structure (matches HTML prototype):
-            //   title bar 26 + image area 1:1 (= cell_w) + meta panel ~120
-            let img_side = cell_w;
-            let total_h  = 26.0 + img_side + 120.0;
-            let rows = (n + cols - 1) / cols;
-
-            for row in 0..rows {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
-                    for col in 0..cols {
-                        let idx = row * cols + col;
-                        if idx >= n {
-                            ui.allocate_space(Vec2::new(cell_w, total_h));
-                            continue;
-                        }
-                        let file_id = visible[idx];
-                        let file_pos = state.results.iter().position(|f| f.id == file_id);
-                        if let Some(pos) = file_pos {
-                            let file = state.results[pos].clone();
-                            let is_focused = state.selected_idx == Some(idx);
-                            let is_selected = state.selected_ids.contains(&file_id);
-                            let rev = state.review.get(&file_id).cloned().unwrap_or_default();
-
-                            // Strictly bound the card UI to a fixed-size sub-region.
-                            // This is the critical fix: without this, child widgets
-                            // can overflow the intended card width because the outer
-                            // horizontal layout gives them the full row width.
-                            let resp = ui.allocate_ui_with_layout(
-                                Vec2::new(cell_w, total_h),
-                                egui::Layout::top_down(egui::Align::Min),
-                                |ui| {
-                                    ui.set_min_size(Vec2::new(cell_w, total_h));
-                                    ui.set_max_width(cell_w);
-                                    render_card(ui, &file, &rev, is_focused, is_selected, cell_w, img_side)
-                                },
-                            ).inner;
-
-                            if resp.clicked() {
-                                if is_selected {
-                                    state.selected_ids.remove(&file_id);
-                                } else {
-                                    state.selected_ids.insert(file_id);
-                                }
-                                state.selected_idx = Some(idx);
-                            }
-                            if resp.double_clicked() {
-                                actions.open_preview = Some(file);
-                            }
-                        }
-                    }
-                });
-                ui.add_space(gap);
-            }
-        });
+        },
+    );
 
     if !state.selected_ids.is_empty() {
         render_selection_bar(ui, state, &mut actions);
@@ -457,7 +532,7 @@ fn render_top_bar(ui: &mut Ui, state: &mut MediaIngestState, actions: &mut Media
 
                     for n in [6usize, 5, 4, 3] {
                         let active = state.cols == n;
-                        let color = if active { Colors::GREEN } else { Color32::from_gray(72) };
+                        let color = if active { Colors::GREEN } else { Color32::from_gray(118) };
                         let fill = if active { Color32::from_rgba_unmultiplied(0, 255, 65, 20) } else { Color32::TRANSPARENT };
                         if ui.add(
                             egui::Button::new(RichText::new(n.to_string()).size(9.0).color(color))
@@ -477,7 +552,7 @@ fn render_top_bar(ui: &mut Ui, state: &mut MediaIngestState, actions: &mut Media
                             if state.sort_desc { " v" } else { " ^" }
                         } else { "" };
                         let label = format!("{}{}", s.label(), arrow);
-                        let color = if active { Colors::GREEN } else { Color32::from_gray(72) };
+                        let color = if active { Colors::GREEN } else { Color32::from_gray(118) };
                         let fill = if active { Color32::from_rgba_unmultiplied(0, 255, 65, 16) } else { Color32::TRANSPARENT };
                         if ui.add(
                             egui::Button::new(RichText::new(label).size(8.0).color(color))
@@ -491,6 +566,7 @@ fn render_top_bar(ui: &mut Ui, state: &mut MediaIngestState, actions: &mut Media
                                 state.sort = s;
                                 state.sort_desc = true;
                             }
+                            state.sort_dirty = true;
                         }
                     }
 
@@ -518,7 +594,7 @@ fn render_filter_bar(ui: &mut Ui, state: &mut MediaIngestState) -> Vec<i64> {
                     MediaFileType::Audio, MediaFileType::Psd, MediaFileType::Ai, MediaFileType::Doc, MediaFileType::Drone,
                 ] {
                     let active = state.type_filter == t;
-                    let color  = if active { t.fg_color() } else { Color32::from_gray(72) };
+                    let color  = if active { t.fg_color() } else { Color32::from_gray(118) };
                     let fill   = if active { t.bg_color() } else { Color32::TRANSPARENT };
                     let border = if active { t.border_color() } else { Colors::BORDER2 };
                     if ui.add(
@@ -540,7 +616,7 @@ fn render_filter_bar(ui: &mut Ui, state: &mut MediaIngestState) -> Vec<i64> {
                     MediaSourceType::Mirrorless, MediaSourceType::Phone, MediaSourceType::AudioRec, MediaSourceType::Workstation,
                 ] {
                     let active = state.src_filter == s;
-                    let color  = if active { Colors::GREEN } else { Color32::from_gray(72) };
+                    let color  = if active { Colors::GREEN } else { Color32::from_gray(118) };
                     let fill   = if active { Color32::from_rgba_unmultiplied(0, 255, 65, 16) } else { Color32::TRANSPARENT };
                     let border = if active { Colors::GREEN_DIM } else { Colors::BORDER2 };
                     if ui.add(
@@ -557,7 +633,7 @@ fn render_filter_bar(ui: &mut Ui, state: &mut MediaIngestState) -> Vec<i64> {
                     let sel = state.selected_ids.len();
                     if sel > 0 {
                         if ui.add(
-                            egui::Button::new(RichText::new("CLEAR").size(8.0).color(Color32::from_gray(68)))
+                            egui::Button::new(RichText::new("CLEAR").size(8.0).color(Color32::from_gray(128)))
                                 .fill(Color32::TRANSPARENT)
                                 .stroke(egui::Stroke::new(1.0, Colors::BORDER2)),
                         ).clicked() {
@@ -577,7 +653,7 @@ fn render_filter_bar(ui: &mut Ui, state: &mut MediaIngestState) -> Vec<i64> {
                         .collect();
 
                     if ui.add(
-                        egui::Button::new(RichText::new("SEL ALL").size(8.0).color(Color32::from_gray(68)))
+                        egui::Button::new(RichText::new("SEL ALL").size(8.0).color(Color32::from_gray(128)))
                             .fill(Color32::TRANSPARENT)
                             .stroke(egui::Stroke::new(1.0, Colors::BORDER2)),
                     ).clicked() {
@@ -607,6 +683,14 @@ fn passes_filter(f: &FileSearchResult, state: &MediaIngestState) -> bool {
 // it impossible for child widgets to overflow the card boundary. Interactive
 // widgets (PICK/RJCT buttons) get their own sub-uis at computed sub-rects.
 
+struct CardResponse {
+    response: egui::Response,
+    rating_clicked: Option<u8>,
+    pick_clicked: Option<&'static str>,
+    preview_clicked: bool,
+    consumed_click: bool,
+}
+
 fn render_card(
     ui: &mut Ui,
     file: &FileSearchResult,
@@ -615,13 +699,17 @@ fn render_card(
     is_selected: bool,
     width: f32,
     img_side: f32,
-) -> egui::Response {
+    thumb: Option<&egui::TextureHandle>,
+    show_video_backend_badge: bool,
+    show_full_meta: bool,
+) -> CardResponse {
     let t = MediaFileType::from_ext(file.ext.as_deref().unwrap_or(""));
     let fg = t.fg_color();
     let bg_tint = Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 30);
+    let meta = if show_full_meta { parse_media_metadata(file) } else { None };
 
-    let title_h = 26.0;
-    let meta_h  = 120.0;
+    let title_h = CARD_TITLE_H;
+    let meta_h  = CARD_META_H;
     let total_h = title_h + img_side + meta_h;
 
     // Allocate the entire card rect upfront.
@@ -646,6 +734,10 @@ fn render_card(
     let stroke_w = if is_selected || is_focused { 1.5 } else { 1.0 };
 
     p.rect_filled(card_rect, 0.0, card_bg);
+    if is_selected || is_focused {
+        p.rect_filled(card_rect, 0.0, Color32::from_rgba_unmultiplied(0, 255, 65, 12));
+        p.rect_stroke(card_rect.expand(1.5), 0.0, egui::Stroke::new(1.2, Color32::from_rgba_unmultiplied(0, 255, 65, 120)));
+    }
     p.rect_stroke(card_rect, 0.0, egui::Stroke::new(stroke_w, border_color));
 
     // Sub-rects
@@ -736,6 +828,40 @@ fn render_card(
     // ---- Image / blueprint placeholder ----
     p.rect_filled(img_rect, 0.0, Color32::from_rgb(5, 7, 8));
 
+    if let Some(tex) = thumb {
+        let tex_size = tex.size_vec2();
+        if tex_size.x > 0.0 && tex_size.y > 0.0 {
+            let scale = (img_rect.width() / tex_size.x).min(img_rect.height() / tex_size.y);
+            let draw_size = tex_size * scale;
+            let draw_min = img_rect.center() - draw_size * 0.5;
+            let draw_rect = egui::Rect::from_min_size(draw_min, draw_size);
+            p.image(
+                tex.id(),
+                draw_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            p.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(img_rect.min.x, img_rect.max.y - 18.0), Vec2::new(img_rect.width(), 18.0)),
+                0.0,
+                Color32::from_rgba_unmultiplied(0, 0, 0, 130),
+            );
+
+            if matches!(t, MediaFileType::Video) {
+                let tri = vec![
+                    img_rect.center() + egui::vec2(-10.0, -14.0),
+                    img_rect.center() + egui::vec2(-10.0, 14.0),
+                    img_rect.center() + egui::vec2(14.0, 0.0),
+                ];
+                p.add(egui::Shape::convex_polygon(
+                    tri,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                    egui::Stroke::NONE,
+                ));
+            }
+        }
+    }
+
     // Subtle scanlines
     {
         let mut y = img_rect.min.y;
@@ -748,34 +874,39 @@ fn render_card(
         }
     }
 
-    // Slab extension text (centered, sized relative to img_side)
-    let ext_up = file.ext.as_deref().unwrap_or("FILE").to_uppercase();
-    let slab_size = (img_side * 0.32).clamp(40.0, 110.0);
-    p.text(
-        img_rect.center() - egui::vec2(0.0, slab_size * 0.10),
-        egui::Align2::CENTER_CENTER,
-        format!(".{}", ext_up),
-        egui::FontId::monospace(slab_size),
-        Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 130),
-    );
+    if thumb.is_none() {
+        // Slab extension text (centered, sized relative to img_side)
+        let ext_up = file.ext.as_deref().unwrap_or("FILE").to_uppercase();
+        let slab_size = (img_side * 0.32).clamp(40.0, 110.0);
+        p.text(
+            img_rect.center() - egui::vec2(0.0, slab_size * 0.10),
+            egui::Align2::CENTER_CENTER,
+            format!(".{}", ext_up),
+            egui::FontId::monospace(slab_size),
+            Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 170),
+        );
 
-    // Type label below the slab
-    p.text(
-        img_rect.center() + egui::vec2(0.0, slab_size * 0.55),
-        egui::Align2::CENTER_CENTER,
-        t.label(),
-        egui::FontId::monospace(9.0),
-        Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 90),
-    );
+        // Type label below the slab
+        p.text(
+            img_rect.center() + egui::vec2(0.0, slab_size * 0.55),
+            egui::Align2::CENTER_CENTER,
+            t.label(),
+            egui::FontId::monospace(9.0),
+            Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 120),
+        );
+    }
+
+    draw_device_blueprint(&p, img_rect, MediaSourceType::from_device(&file.device_name), fg, thumb.is_some());
 
     // Reject overlay
     if rev.pick_flag == PICK_REJECT {
+        let reject_size = (img_side * 0.32).clamp(40.0, 110.0);
         p.rect_filled(img_rect, 0.0, Color32::from_rgba_unmultiplied(180, 20, 20, 55));
         p.text(
             img_rect.center(),
             egui::Align2::CENTER_CENTER,
             "X",
-            egui::FontId::proportional(slab_size * 1.4),
+            egui::FontId::proportional(reject_size * 1.4),
             Color32::from_rgba_unmultiplied(220, 60, 60, 230),
         );
     }
@@ -805,6 +936,7 @@ fn render_card(
     let status = match rev.pick_flag.as_str() {
         PICK_PICK   => "PICK",
         PICK_REJECT => "REJECTED",
+        _ if thumb.is_some() => "THUMB READY",
         _           => "PREVIEW READY",
     };
     p.text(
@@ -814,6 +946,24 @@ fn render_card(
         egui::FontId::monospace(7.5),
         Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), 130),
     );
+
+    if show_video_backend_badge {
+        let badge = "NO FFMPEG";
+        let galley = p.layout_no_wrap(
+            badge.to_string(),
+            egui::FontId::monospace(7.0),
+            Color32::from_rgb(255, 180, 80),
+        );
+        let pad = egui::vec2(4.0, 2.0);
+        let badge_size = galley.size() + pad * 2.0;
+        let badge_rect = egui::Rect::from_min_size(
+            egui::pos2(img_rect.max.x - badge_size.x - 6.0, img_rect.min.y + 6.0),
+            badge_size,
+        );
+        p.rect_filled(badge_rect, 1.0, Color32::from_rgba_unmultiplied(30, 18, 0, 220));
+        p.rect_stroke(badge_rect, 1.0, egui::Stroke::new(1.0, Color32::from_rgb(255, 180, 80)));
+        p.galley(badge_rect.min + pad, galley, Color32::from_rgb(255, 180, 80));
+    }
 
     // ---- Meta panel ----
     p.rect_filled(meta_rect, 0.0, Color32::from_rgb(10, 10, 10));
@@ -827,15 +977,37 @@ fn render_card(
 
     // Meta rows (drawn as text)
     let meta_pad_x = 9.0;
-    let label_color = Color32::from_gray(80);
+    let label_color = Color32::from_gray(118);
     let mut row_y = meta_rect.min.y + 8.0;
-    let row_h = 12.0;
+    let row_h = 11.0;
 
-    let rows_data = [
-        ("SOURCE", file.device_name.clone(),   Color32::from_gray(225)),
-        ("SIZE",   fmt_size(file.size),        fg),
-        ("DATE",   fmt_date(file.modified),    Color32::from_gray(200)),
+    let mut rows_data: Vec<(&str, String, Color32)> = vec![
+        ("SOURCE", file.device_name.clone(), Color32::from_gray(225)),
+        ("SIZE", fmt_size(file.size), fg),
+        ("DATE", fmt_date(file.modified), Color32::from_gray(205)),
     ];
+    if let Some(folder) = file.path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()) {
+        rows_data.push(("FOLDER", folder, Color32::from_gray(186)));
+    }
+    if let Some(h) = &file.quick_hash {
+        let short = if h.len() > 8 { &h[..8] } else { h.as_str() };
+        rows_data.push(("QHASH", short.to_string(), Color32::from_gray(165)));
+    }
+    if let Some(m) = &meta {
+        if let (Some(w), Some(h)) = (m.width, m.height) {
+            rows_data.push(("RES", format!("{}x{}", w, h), Color32::from_gray(220)));
+        }
+        if let Some(q) = m.quality_score {
+            rows_data.push(("QUALITY", format!("{:.0}%", (q * 100.0).clamp(0.0, 100.0)), Color32::from_rgb(90, 210, 150)));
+        }
+        if let Some(make) = &m.camera_make {
+            rows_data.push(("CAM", truncate_name(make, 16), Color32::from_rgb(140, 196, 255)));
+        }
+        if let Some(lens) = &m.lens_model {
+            rows_data.push(("LENS", truncate_name(lens, 16), Color32::from_rgb(180, 220, 255)));
+        }
+    }
+
     for (lbl, val, vc) in &rows_data {
         // Label left
         p.text(
@@ -856,27 +1028,77 @@ fn render_card(
             *vc,
         );
         row_y += row_h;
+        if row_y > meta_rect.max.y - 40.0 {
+            break;
+        }
     }
 
     // Stars row
-    let star_y = row_y + 6.0;
+    let star_y = row_y + 4.0;
     let rating = rev.rating.unwrap_or(0);
+    let mut rating_clicked = None;
+    let mut consumed_click = false;
+    let mut preview_clicked = false;
     for star in 1u8..=5 {
+        let star_pos = egui::pos2(meta_rect.min.x + meta_pad_x + (star as f32 - 1.0) * 12.0, star_y);
+        let star_rect = egui::Rect::from_min_size(star_pos - egui::vec2(1.0, 1.0), Vec2::new(11.0, 13.0));
+        let star_resp = ui.interact(star_rect, ui.id().with(("star_rate", file.id, star)), egui::Sense::click());
+        if star_resp.clicked() {
+            rating_clicked = Some(star);
+            consumed_click = true;
+        }
         let c = if star <= rating {
             Color32::from_rgb(255, 210, 40)
         } else {
-            Color32::from_gray(48)
+            Color32::from_gray(70)
         };
         p.text(
-            egui::pos2(meta_rect.min.x + meta_pad_x + (star as f32 - 1.0) * 12.0, star_y),
+            star_pos,
             egui::Align2::LEFT_TOP,
-            "*",
+            if star <= rating { "*" } else { "+" },
             egui::FontId::monospace(13.0),
             c,
         );
     }
 
-    // PICK / RJCT buttons (interactive — sub-ui at calculated rect)
+    // Telemetry strip (quality / focus / gps / duration)
+    if let Some(m) = &meta {
+        let strip_y = star_y + 16.0;
+        let mut chip_x = meta_rect.min.x + meta_pad_x;
+        let chip_h = 14.0;
+        let chip_gap = 4.0;
+        let btn_y = meta_rect.max.y - 18.0 - 8.0;
+        if strip_y + chip_h <= btn_y - 2.0 {
+            let mut chips: Vec<(String, Color32)> = Vec::new();
+            if let Some(q) = m.quality_score {
+                chips.push((format!("Q:{:.0}%", (q * 100.0).clamp(0.0, 100.0)), Color32::from_rgb(90, 210, 150)));
+            }
+            if let Some(focus) = m.focus_score {
+                chips.push((format!("F:{:.0}%", (focus * 100.0).clamp(0.0, 100.0)), Color32::from_rgb(120, 190, 255)));
+            }
+            if m.gps_lat.is_some() && m.gps_lon.is_some() {
+                chips.push(("GPS".to_string(), Color32::from_rgb(0, 220, 200)));
+            }
+            if let Some(dur) = m.duration_secs {
+                chips.push((format_duration_short(dur), Color32::from_rgb(255, 170, 80)));
+            }
+
+            for (text, color) in chips.into_iter().take(4) {
+                let g = p.layout_no_wrap(text, egui::FontId::monospace(7.5), color);
+                let chip_w = g.size().x + 8.0;
+                if chip_x + chip_w > meta_rect.max.x - meta_pad_x {
+                    break;
+                }
+                let chip_rect = egui::Rect::from_min_size(egui::pos2(chip_x, strip_y), Vec2::new(chip_w, chip_h));
+                p.rect_filled(chip_rect, 1.0, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 30));
+                p.rect_stroke(chip_rect, 1.0, egui::Stroke::new(0.8, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 140)));
+                p.galley(chip_rect.min + egui::vec2(4.0, 2.5), g, color);
+                chip_x += chip_w + chip_gap;
+            }
+        }
+    }
+
+    // VIEW / PICK / RJCT buttons (interactive — sub-ui at calculated rect)
     let btn_w = 44.0;
     let btn_h = 18.0;
     let btn_y = meta_rect.max.y - btn_h - 8.0;
@@ -884,6 +1106,10 @@ fn render_card(
     let pick_active = rev.pick_flag == PICK_PICK;
     let rjct_active = rev.pick_flag == PICK_REJECT;
 
+    let view_rect = egui::Rect::from_min_size(
+        egui::pos2(meta_rect.min.x + meta_pad_x, btn_y),
+        Vec2::new(btn_w, btn_h),
+    );
     let pick_rect = egui::Rect::from_min_size(
         egui::pos2(meta_rect.max.x - meta_pad_x - btn_w * 2.0 - 4.0, btn_y),
         Vec2::new(btn_w, btn_h),
@@ -893,6 +1119,11 @@ fn render_card(
         Vec2::new(btn_w, btn_h),
     );
 
+    paint_pill(&p, view_rect, "VIEW",
+        Colors::GREEN,
+        Color32::TRANSPARENT,
+        Colors::GREEN_DIM,
+    );
     paint_pill(&p, pick_rect, "PICK",
         if pick_active { Colors::GREEN } else { Color32::from_gray(76) },
         if pick_active { Color32::from_rgba_unmultiplied(0, 255, 65, 30) } else { Color32::TRANSPARENT },
@@ -905,16 +1136,33 @@ fn render_card(
     );
 
     // Hit testing for the buttons (return separate response, but let click bubble to card)
+    let view_resp = ui.interact(view_rect, ui.id().with(("view_btn", file.id)), egui::Sense::click());
     let pick_resp = ui.interact(pick_rect, ui.id().with(("pick_btn", file.id)), egui::Sense::click());
     let rjct_resp = ui.interact(rjct_rect, ui.id().with(("rjct_btn", file.id)), egui::Sense::click());
+    let mut pick_clicked = None;
+    if view_resp.clicked() {
+        preview_clicked = true;
+        consumed_click = true;
+    }
+    if pick_resp.clicked() {
+        pick_clicked = Some(PICK_PICK);
+        consumed_click = true;
+    }
+    if rjct_resp.clicked() {
+        pick_clicked = Some(PICK_REJECT);
+        consumed_click = true;
+    }
 
-    // The card-level response: forward button clicks via the response (caller handles state)
-    // Note: we don't currently route these — clicks on buttons fall through and are
-    // treated as a card click (toggling selection). That's acceptable for now;
-    // future work: surface button events in MediaIngestActions.
-    let _ = (pick_resp, rjct_resp);
+    // The card-level response forwards button clicks via CardResponse fields.
+    let _ = (view_resp, pick_resp, rjct_resp);
 
-    response
+    CardResponse {
+        response,
+        rating_clicked,
+        pick_clicked,
+        preview_clicked,
+        consumed_click,
+    }
 }
 
 fn paint_pill(p: &egui::Painter, rect: egui::Rect, text: &str, fg: Color32, bg: Color32, border: Color32) {
@@ -926,7 +1174,7 @@ fn paint_pill(p: &egui::Painter, rect: egui::Rect, text: &str, fg: Color32, bg: 
 
 // --- Selection action bar --------------------------------------------------
 
-fn render_selection_bar(ui: &mut Ui, state: &mut MediaIngestState, _actions: &mut MediaIngestActions) {
+fn render_selection_bar(ui: &mut Ui, state: &mut MediaIngestState, actions: &mut MediaIngestActions) {
     let sel_count = state.selected_ids.len();
     let sel_size: u64 = state.results.iter()
         .filter(|f| state.selected_ids.contains(&f.id))
@@ -938,18 +1186,49 @@ fn render_selection_bar(ui: &mut Ui, state: &mut MediaIngestState, _actions: &mu
         .stroke(egui::Stroke::new(1.0, Colors::GREEN))
         .inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 0.0, bottom: 0.0 })
         .show(ui, |ui| {
-            ui.set_min_height(36.0);
+            ui.set_min_height(70.0);
             ui.horizontal(|ui| {
-                ui.set_min_height(36.0);
+                ui.set_min_height(70.0);
                 ui.label(
                     RichText::new(format!("{} FILE{} SELECTED", sel_count, if sel_count == 1 { "" } else { "S" }))
                         .color(Colors::GREEN).size(10.0).strong()
                 );
                 ui.label(RichText::new(fmt_size(sel_size)).color(Colors::GREEN_DIM).size(8.0));
 
+                ui.add_space(10.0);
+                let mode_label = if state.resize_replace_original {
+                    "MODE: REPLACE ORIGINAL"
+                } else {
+                    "MODE: SAVE COPY"
+                };
+                if ui.add(
+                    egui::Button::new(RichText::new(mode_label).size(8.0).color(Colors::GREEN))
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM)),
+                ).clicked() {
+                    state.resize_replace_original = !state.resize_replace_original;
+                }
+
+                ui.add_space(6.0);
+                ui.label(RichText::new("RESIZE").size(8.0).color(Color32::from_gray(130)));
+
+                for preset in [MediaResizePreset::Print, MediaResizePreset::Social, MediaResizePreset::Ads, MediaResizePreset::Free] {
+                    if ui.add(
+                        egui::Button::new(RichText::new(preset.label()).size(8.0).color(Colors::GREEN).strong())
+                            .fill(Color32::from_rgba_unmultiplied(0, 255, 65, 12))
+                            .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM)),
+                    ).clicked() {
+                        actions.resize_request = Some(MediaResizeRequest {
+                            file_ids: state.selected_ids.iter().copied().collect(),
+                            preset,
+                            replace_original: state.resize_replace_original,
+                        });
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(
-                        egui::Button::new(RichText::new("X CLEAR").size(8.0).color(Color32::from_gray(85)))
+                            egui::Button::new(RichText::new("X CLEAR").size(8.0).color(Color32::from_gray(128)))
                             .fill(Color32::TRANSPARENT)
                             .stroke(egui::Stroke::new(1.0, Colors::BORDER2)),
                     ).clicked() {
@@ -967,13 +1246,11 @@ fn render_selection_bar(ui: &mut Ui, state: &mut MediaIngestState, _actions: &mu
                         }
                     }
 
-                    for action in ["MOVE", "EXPORT", "TAG ALL", "INGEST"] {
-                        let _ = ui.add(
-                            egui::Button::new(RichText::new(action).size(8.0).color(Colors::GREEN).strong())
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::new(1.0, Colors::GREEN)),
-                        );
-                    }
+                    let _ = ui.add(
+                        egui::Button::new(RichText::new("EXPORT").size(8.0).color(Colors::GREEN).strong())
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::new(1.0, Colors::GREEN)),
+                    );
                 });
             });
         });
@@ -1013,7 +1290,7 @@ fn render_status_bar(ui: &mut Ui, state: &MediaIngestState, showing: usize) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new("THEGRID / MEDIA INGEST / MVP")
-                            .size(7.5).color(Color32::from_gray(40)),
+                            .size(7.5).color(Color32::from_gray(95)),
                     );
                 });
             });
@@ -1176,6 +1453,461 @@ fn sort_results(results: &mut Vec<FileSearchResult>, sort: MediaSortField, desc:
         };
         if desc { ord.reverse() } else { ord }
     });
+}
+
+fn parse_media_metadata(file: &FileSearchResult) -> Option<MediaMetadata> {
+    let raw = file.ai_metadata.as_ref()?;
+    serde_json::from_str::<MediaMetadata>(raw).ok()
+}
+
+fn is_raster_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "jpg" | "jpeg" | "png" | "bmp" | "gif" | "webp" | "tif" | "tiff" | "ico"
+    )
+}
+
+fn ensure_card_thumbnail(state: &mut MediaIngestState, file: &FileSearchResult, allow_video: bool, high_priority: bool) {
+    if state.thumb_cache.contains_key(&file.id) || state.thumb_failed.contains(&file.id) || state.thumb_pending.contains(&file.id) {
+        return;
+    }
+    if state.thumb_pending.len() >= MAX_THUMBNAIL_INFLIGHT && !high_priority {
+        return;
+    }
+
+    let ext = file.ext.as_deref().unwrap_or("").to_lowercase();
+    let file_id = file.id;
+    let path = file.path.clone();
+    let tx = state.thumb_tx.clone();
+
+    if is_raster_ext(&ext) {
+        state.thumb_pending.insert(file.id);
+        std::thread::spawn(move || {
+            let result = std::fs::read(&path).ok()
+                .and_then(|bytes| decode_thumb_bytes(&bytes));
+            match result {
+                Some(thumb) => { let _ = tx.send(ThumbLoadResult::Ready { file_id, thumb }); }
+                None        => { let _ = tx.send(ThumbLoadResult::Failed { file_id, backend_missing: false }); }
+            }
+        });
+        return;
+    }
+
+    if is_video_ext(&ext) {
+        if !allow_video {
+            return;
+        }
+        if state.video_thumb_backend_unavailable {
+            state.thumb_failed.insert(file.id);
+            return;
+        }
+
+        state.thumb_pending.insert(file.id);
+        std::thread::spawn(move || {
+            match extract_video_frame_png(&path) {
+                Ok(bytes) => {
+                    match decode_thumb_bytes(&bytes) {
+                        Some(thumb) => { let _ = tx.send(ThumbLoadResult::Ready { file_id, thumb }); }
+                        None        => { let _ = tx.send(ThumbLoadResult::Failed { file_id, backend_missing: false }); }
+                    }
+                }
+                Err(VideoPreviewError::BackendMissing) => {
+                    let _ = tx.send(ThumbLoadResult::Failed { file_id, backend_missing: true });
+                }
+                Err(VideoPreviewError::ExtractFailed) => {
+                    let _ = tx.send(ThumbLoadResult::Failed { file_id, backend_missing: false });
+                }
+            }
+        });
+        return;
+    }
+
+    state.thumb_failed.insert(file.id);
+}
+
+/// Budget: process at most this many ready thumbnails per frame to avoid
+/// a multi-image decode spike on the main thread (decoding already happened
+/// in the background thread; only the GPU upload remains here).
+const MAX_TEXTURES_PER_FRAME: usize = 3;
+
+fn drain_thumbnail_results(ctx: &egui::Context, state: &mut MediaIngestState) {
+    let mut uploaded = 0;
+    loop {
+        match state.thumb_rx.try_recv() {
+            Ok(ThumbLoadResult::Ready { file_id, thumb }) => {
+                state.thumb_pending.remove(&file_id);
+                if uploaded < MAX_TEXTURES_PER_FRAME {
+                    let size = [thumb.width as usize, thumb.height as usize];
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, &thumb.rgba);
+                    let tex = ctx.load_texture(
+                        format!("ingest_thumb_{}", file_id),
+                        color,
+                        Default::default(),
+                    );
+                    state.thumb_cache.insert(file_id, tex);
+                    uploaded += 1;
+                    ctx.request_repaint();
+                } else {
+                    // Requeue this result for next frame — just mark as not-pending so
+                    // it can be re-dispatched or we re-try upload next frame.
+                    // Simplest: put it back by re-inserting pending and requeing via a
+                    // small side buffer, but that adds complexity.  Instead we accept
+                    // one extra upload this frame and simply break after this one.
+                    let size = [thumb.width as usize, thumb.height as usize];
+                    let color = egui::ColorImage::from_rgba_unmultiplied(size, &thumb.rgba);
+                    let tex = ctx.load_texture(
+                        format!("ingest_thumb_{}", file_id),
+                        color,
+                        Default::default(),
+                    );
+                    state.thumb_cache.insert(file_id, tex);
+                    ctx.request_repaint();
+                    break; // stop draining; resume next frame
+                }
+            }
+            Ok(ThumbLoadResult::Failed { file_id, backend_missing }) => {
+                state.thumb_pending.remove(&file_id);
+                if backend_missing {
+                    state.video_thumb_backend_unavailable = true;
+                }
+                state.thumb_failed.insert(file_id);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn current_preview_file(state: &MediaIngestState, visible: &[i64]) -> Option<FileSearchResult> {
+    if let Some(idx) = state.selected_idx {
+        if let Some(file_id) = visible.get(idx) {
+            if let Some(file) = state.results.iter().find(|f| f.id == *file_id) {
+                return Some(file.clone());
+            }
+        }
+    }
+
+    state.selected_ids.iter()
+        .find_map(|file_id| state.results.iter().find(|f| f.id == *file_id).cloned())
+}
+
+fn placeholder_key_for_type(t: MediaFileType) -> &'static str {
+    match t {
+        MediaFileType::Raw => "raw",
+        MediaFileType::Video => "video",
+        MediaFileType::Photo => "photo",
+        MediaFileType::Audio => "audio",
+        MediaFileType::Psd => "psd",
+        MediaFileType::Ai => "ai",
+        MediaFileType::Doc => "doc",
+        MediaFileType::Drone => "drone",
+        MediaFileType::All => "doc",
+    }
+}
+
+fn placeholder_candidate_files(key: &str) -> [&str; 4] {
+    match key {
+        "raw" => ["raw.png", "RAW.png", "photo.png", "doc.png"],
+        "video" => ["video.png", "VIDEO.png", "mp4.png", "doc.png"],
+        "photo" => ["photo.png", "PHOTO.png", "image.png", "doc.png"],
+        "audio" => ["audio.png", "AUDIO.png", "sound.png", "doc.png"],
+        "psd" => ["psd.png", "PSD.png", "design.png", "doc.png"],
+        "ai" => ["ai.png", "AI.png", "vector.png", "doc.png"],
+        "drone" => ["drone.png", "DRONE.png", "uav.png", "doc.png"],
+        _ => ["doc.png", "DOC.png", "file.png", "placeholder.png"],
+    }
+}
+
+fn try_type_placeholder_texture(
+    ctx: &egui::Context,
+    state: &mut MediaIngestState,
+    file_type: MediaFileType,
+) -> Option<egui::TextureHandle> {
+    let key = placeholder_key_for_type(file_type).to_string();
+    if let Some(tex) = state.placeholder_cache.get(&key) {
+        return Some(tex.clone());
+    }
+    if state.placeholder_missing.contains(&key) {
+        return None;
+    }
+
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let placeholders_dir = manifest_dir.join("assets").join("placeholders");
+    for name in placeholder_candidate_files(&key) {
+        let path = placeholders_dir.join(name);
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Some(tex) = load_texture_from_bytes(ctx, -10_000 - key.len() as i64, &bytes) {
+                state.placeholder_cache.insert(key.clone(), tex.clone());
+                return Some(tex);
+            }
+        }
+    }
+
+    state.placeholder_missing.insert(key);
+    None
+}
+
+fn render_cards_grid(
+    ui: &mut Ui,
+    state: &mut MediaIngestState,
+    actions: &mut MediaIngestActions,
+    visible: &[i64],
+    cols: usize,
+    scrollable_height: f32,
+) {
+    let n = visible.len();
+
+    ScrollArea::vertical()
+        .max_height(scrollable_height.max(100.0))
+        .show(ui, |ui| {
+            if n == 0 {
+                ui.add_space(40.0);
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("NO FILES MATCH CURRENT FILTER")
+                            .color(Colors::TEXT_MUTED)
+                            .size(11.0)
+                            .extra_letter_spacing(4.0),
+                    );
+                });
+                return;
+            }
+
+            let avail_w = ui.available_width();
+            let gap = 8.0;
+            let cell_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).max(140.0);
+            let img_side = cell_w;
+            let total_h = card_total_height(img_side);
+            let rows = (n + cols - 1) / cols;
+
+            for row in 0..rows {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
+                    for col in 0..cols {
+                        let idx = row * cols + col;
+                        if idx >= n {
+                            ui.allocate_space(Vec2::new(cell_w, total_h));
+                            continue;
+                        }
+                        let file_id = visible[idx];
+                        let file_pos = state.results.iter().position(|f| f.id == file_id);
+                        if let Some(pos) = file_pos {
+                            let file = state.results[pos].clone();
+                            let file_type = MediaFileType::from_ext(file.ext.as_deref().unwrap_or(""));
+                            let is_focused = state.selected_idx == Some(idx);
+                            let is_selected = state.selected_ids.contains(&file_id);
+                            let rev = state.review.get(&file_id).cloned().unwrap_or_default();
+                            let allow_video_thumb = is_focused || is_selected;
+                            ensure_card_thumbnail(state, &file, allow_video_thumb, allow_video_thumb);
+                            let mut thumb = state.thumb_cache.get(&file_id).cloned();
+                            if thumb.is_none() {
+                                thumb = try_type_placeholder_texture(ui.ctx(), state, file_type);
+                            }
+                            let show_video_backend_badge = state.video_thumb_backend_unavailable
+                                && file_type == MediaFileType::Video
+                                && thumb.is_none();
+
+                            let resp = ui.allocate_ui_with_layout(
+                                Vec2::new(cell_w, total_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_min_size(Vec2::new(cell_w, total_h));
+                                    ui.set_max_width(cell_w);
+                                    render_card(
+                                        ui,
+                                        &file,
+                                        &rev,
+                                        is_focused,
+                                        is_selected,
+                                        cell_w,
+                                        img_side,
+                                        thumb.as_ref(),
+                                        show_video_backend_badge,
+                                        is_focused || is_selected,
+                                    )
+                                },
+                            ).inner;
+
+                            if let Some(rating) = resp.rating_clicked {
+                                state.review.entry(file_id).or_default().rating = Some(rating);
+                                state.sort_dirty = true;
+                                actions.events.push(AppEvent::SetMediaReview {
+                                    file_id,
+                                    rating: Some(rating),
+                                    pick_flag: None,
+                                    color_label: None,
+                                });
+                            }
+                            if let Some(flag) = resp.pick_clicked {
+                                state.review.entry(file_id).or_default().pick_flag = flag.to_string();
+                                actions.events.push(AppEvent::SetMediaReview {
+                                    file_id,
+                                    rating: None,
+                                    pick_flag: Some(flag.to_string()),
+                                    color_label: None,
+                                });
+                            }
+                            if resp.preview_clicked {
+                                actions.open_preview = Some(file.clone());
+                            }
+
+                            if resp.response.clicked() && !resp.consumed_click {
+                                let multi_select = ui.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+                                if multi_select {
+                                    if is_selected {
+                                        state.selected_ids.remove(&file_id);
+                                    } else {
+                                        state.selected_ids.insert(file_id);
+                                    }
+                                } else {
+                                    state.selected_ids.clear();
+                                    state.selected_ids.insert(file_id);
+                                }
+                                state.selected_idx = Some(idx);
+                            }
+                        }
+                    }
+                });
+                ui.add_space(gap);
+            }
+        });
+}
+
+fn render_inline_preview_panel(ui: &mut Ui, state: &mut MediaIngestState, file: &FileSearchResult, panel_height: f32) -> bool {
+    ensure_card_thumbnail(state, file, true, true);
+    let meta = parse_media_metadata(file);
+    let mut thumb = state.thumb_cache.get(&file.id).cloned();
+    if thumb.is_none() {
+        let file_type = MediaFileType::from_ext(file.ext.as_deref().unwrap_or(""));
+        thumb = try_type_placeholder_texture(ui.ctx(), state, file_type);
+    }
+    let media_h = (panel_height - 250.0).clamp(180.0, 360.0);
+
+    egui::Frame::none()
+        .fill(Color32::from_rgb(10, 10, 10))
+        .stroke(egui::Stroke::new(1.0, Colors::BORDER2))
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height(panel_height)
+                .show(ui, |ui| {
+                    ui.label(RichText::new("INLINE PREVIEW").color(Colors::GREEN).size(9.0).strong());
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&file.name).color(Colors::TEXT).size(10.0).strong());
+                    ui.label(RichText::new(file.device_name.clone()).color(Colors::TEXT_MUTED).size(8.0));
+                    ui.add_space(8.0);
+
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(5, 7, 8))
+                        .stroke(egui::Stroke::new(1.0, Colors::BORDER2))
+                        .inner_margin(egui::Margin::same(6.0))
+                        .show(ui, |ui| {
+                            ui.set_min_height(media_h);
+                            ui.set_max_height(media_h);
+                            if crate::views::video_preview::render_media_preview(
+                                ui,
+                                &mut state.media_preview,
+                                &file.path,
+                                media_h,
+                            ) {
+                                // Inline player handled the content.
+                            } else if let Some(texture) = thumb.as_ref() {
+                                let avail = ui.available_width() - 8.0;
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(egui::Image::from_texture(texture)
+                                        .max_width(avail)
+                                        .maintain_aspect_ratio(true));
+                                });
+                            } else if state.thumb_pending.contains(&file.id) {
+                                ui.centered_and_justified(|ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.spinner();
+                                        ui.add_space(6.0);
+                                        ui.label(RichText::new("Loading preview...").color(Colors::TEXT_MUTED).size(8.5));
+                                    });
+                                });
+                            } else {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(RichText::new("No inline thumbnail available").color(Colors::TEXT_MUTED).size(8.5));
+                                });
+                            }
+                        });
+
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(format!("SIZE  {}", fmt_size(file.size))).color(Colors::TEXT_DIM).size(8.0));
+                    ui.label(RichText::new(format!("DATE  {}", fmt_date(file.modified))).color(Colors::TEXT_DIM).size(8.0));
+                    if let Some(meta) = meta {
+                        if let (Some(w), Some(h)) = (meta.width, meta.height) {
+                            ui.label(RichText::new(format!("RES   {}x{}", w, h)).color(Colors::TEXT_DIM).size(8.0));
+                        }
+                        if let Some(score) = meta.quality_score {
+                            ui.label(RichText::new(format!("QUAL  {:.0}%", (score * 100.0).clamp(0.0, 100.0))).color(Colors::TEXT_DIM).size(8.0));
+                        }
+                        if let Some(dur) = meta.duration_secs {
+                            ui.label(RichText::new(format!("DUR   {}", format_duration_short(dur))).color(Colors::TEXT_DIM).size(8.0));
+                        }
+                    }
+
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Inline preview only. Click selects. Ctrl+Click multi-select.")
+                        .size(7.5)
+                        .color(Colors::TEXT_MUTED));
+                });
+        });
+
+    false
+}
+
+fn load_texture_from_bytes(ctx: &egui::Context, file_id: i64, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let thumb = decode_thumb_bytes(bytes)?;
+    let size = [thumb.width as usize, thumb.height as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, &thumb.rgba);
+    Some(ctx.load_texture(format!("ingest_thumb_{}", file_id), color, Default::default()))
+}
+
+fn format_duration_short(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{:01}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{:02}:{:02}", m, s)
+    }
+}
+
+fn draw_device_blueprint(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    src: MediaSourceType,
+    fg: Color32,
+    has_thumb: bool,
+) {
+    let alpha = if has_thumb { 44 } else { 90 };
+    let stroke = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(fg.r(), fg.g(), fg.b(), alpha));
+    let c = rect.center();
+
+    match src {
+        MediaSourceType::Drone => {
+            let r = rect.width().min(rect.height()) * 0.18;
+            p.circle_stroke(c, r, stroke);
+            p.circle_stroke(c + egui::vec2(-r * 1.6, -r * 1.3), r * 0.55, stroke);
+            p.circle_stroke(c + egui::vec2(r * 1.6, -r * 1.3), r * 0.55, stroke);
+            p.circle_stroke(c + egui::vec2(-r * 1.6, r * 1.3), r * 0.55, stroke);
+            p.circle_stroke(c + egui::vec2(r * 1.6, r * 1.3), r * 0.55, stroke);
+        }
+        MediaSourceType::Phone => {
+            let body = egui::Rect::from_center_size(c, egui::vec2(rect.width() * 0.22, rect.height() * 0.48));
+            p.rect_stroke(body, 3.0, stroke);
+            p.circle_filled(egui::pos2(body.center().x, body.max.y - 8.0), 1.5, stroke.color);
+        }
+        _ => {
+            let body = egui::Rect::from_center_size(c, egui::vec2(rect.width() * 0.42, rect.height() * 0.24));
+            p.rect_stroke(body, 2.0, stroke);
+            p.circle_stroke(egui::pos2(body.center().x, body.center().y), body.height() * 0.28, stroke);
+        }
+    }
 }
 
 pub fn build_effective_query(state: &MediaIngestState) -> String {

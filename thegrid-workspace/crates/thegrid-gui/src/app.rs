@@ -47,6 +47,7 @@ use crate::views::dashboard::{
 };
 use crate::views::search::SearchPanelState;
 use crate::views::setup::SetupState;
+use crate::views::media_ingest::MediaResizePreset;
 use crate::views::timeline::TimelineState;
 use crate::views::terminal::TerminalView;
 
@@ -487,6 +488,9 @@ pub struct TheGridApp {
     // --- Phase 4: Semantic AI UI State ---
     semantic_enabled:   bool,
     semantic_loading:   bool,
+    startup_services_dispatched: bool,
+    startup_services_ready: bool,
+    startup_status: String,
     embedding_progress: (usize, usize),
     hashing_progress:   (usize, usize),
     hashing_eta_secs:   Option<u64>,
@@ -673,6 +677,7 @@ pub struct ViewportState {
     pub preview_kind: PreviewKind,
     /// Cached texture for Image/Psd previews — loaded lazily in viewport.rs
     pub texture:      Option<egui::TextureHandle>,
+    pub media_preview: crate::views::video_preview::MediaPreviewState,
 }
 
 impl TheGridApp {
@@ -801,7 +806,6 @@ impl TheGridApp {
             .expect("Failed to initialize AppRuntime"));
         let ingest_launch = launch_args.ingest_path.is_some() || launch_args.open_file.is_some();
         runtime.set_ui_priority_mode(ingest_launch);
-        runtime.start_services();
 
         Self {
             screen:      Screen::Boot,
@@ -864,6 +868,9 @@ impl TheGridApp {
             // --- Phase 4: UI state (kept in app) ---
             semantic_enabled:  false,
             semantic_loading:  true,
+            startup_services_dispatched: false,
+            startup_services_ready: false,
+            startup_status: "Preparing startup...".to_string(),
             embedding_progress: (0, 0),
             hashing_progress:   (0, 0),
             hashing_eta_secs:   None,
@@ -909,6 +916,21 @@ impl TheGridApp {
             media_ingest:        crate::views::media_ingest::MediaIngestState::default(),
             shell_launch:        if launch_args.has_shell_args() { Some(launch_args) } else { None },
         }
+    }
+
+    fn dispatch_startup_services(&mut self) {
+        if self.startup_services_dispatched {
+            return;
+        }
+
+        self.startup_services_dispatched = true;
+        self.startup_status = "Starting local services...".to_string();
+        self.set_status("Starting local services...");
+
+        let runtime = Arc::clone(&self.runtime);
+        std::thread::spawn(move || {
+            runtime.start_services();
+        });
     }
 
     fn start_release_check(&mut self) {
@@ -2403,17 +2425,17 @@ impl TheGridApp {
                 AppEvent::SearchResults(results) => {
                     // Generation-tagged results arrive via Status("search_gen:N")
                     // before SearchResults — handled below. Accept all results for now.
-                    self.search.receive_results(self.search.query_gen, results.clone());
-
-                    // Also feed media ingest view when it's active
                     if self.screen == Screen::MediaIngest {
                         let ids: Vec<i64> = results.iter().map(|r| r.id).collect();
                         self.media_ingest.results = results;
-                        self.media_ingest.loading  = false;
+                        self.media_ingest.loading = false;
+                        self.media_ingest.sort_dirty = true;
                         // Bulk-load review state for these files
                         if !ids.is_empty() {
                             self.runtime.spawn_load_media_review_bulk(ids);
                         }
+                    } else {
+                        self.search.receive_results(self.search.query_gen, results);
                     }
                 }
 
@@ -2425,12 +2447,14 @@ impl TheGridApp {
                         rev.pick_flag = pick_flag;
                         rev.color_label = color_label;
                     }
+                    self.media_ingest.sort_dirty = true;
                 }
                 AppEvent::MediaReviewLoaded { file_id, rating, pick_flag, color_label, .. } => {
                     let rev = self.media_ingest.review.entry(file_id).or_default();
                     rev.rating = rating;
                     rev.pick_flag = pick_flag;
                     rev.color_label = color_label;
+                    self.media_ingest.sort_dirty = true;
                 }
 
                 AppEvent::DuplicatesFound(groups) => {
@@ -2551,6 +2575,14 @@ impl TheGridApp {
                         if let Ok(n) = msg["index_count:".len()..].parse::<u64>() {
                             self.index_stats.total_files = n;
                         }
+                    } else if msg == "startup_services_ready" {
+                        self.startup_services_ready = true;
+                        self.startup_status = "Startup complete.".to_string();
+                        self.set_status("Startup complete.");
+                    } else if msg.starts_with("startup_phase:") {
+                        let phase = msg["startup_phase:".len()..].to_string();
+                        self.startup_status = phase.clone();
+                        self.set_status(phase);
                     } else if msg.starts_with("update_available:") {
                         let payload = &msg["update_available:".len()..];
                         let mut parts = payload.splitn(2, '|');
@@ -3074,6 +3106,94 @@ impl TheGridApp {
             } else {
                 let _ = tx.send(AppEvent::FilePreviewLoaded { file_id: file.id, content: String::new(), kind });
             }
+        });
+    }
+
+    fn spawn_media_resize(
+        &mut self,
+        files: Vec<thegrid_core::models::FileSearchResult>,
+        preset: MediaResizePreset,
+        replace_original: bool,
+    ) {
+        if files.is_empty() {
+            self.push_toast(Toast::info("No files selected for resize."));
+            return;
+        }
+
+        let count = files.len();
+        let mode = if replace_original { "replace" } else { "copy" };
+        self.set_status(format!(
+            "Resize started: {} files [{} / {}]",
+            count,
+            preset.label(),
+            mode
+        ));
+
+        let tx = self.event_tx.clone();
+        std::thread::spawn(move || {
+            let mut ok = 0usize;
+            let mut skipped = 0usize;
+            let mut failed = 0usize;
+
+            for file in files {
+                let ext = file.ext.clone().unwrap_or_default().to_lowercase();
+                if !is_resizable_ext(&ext) {
+                    skipped += 1;
+                    continue;
+                }
+
+                let bytes = match std::fs::read(&file.path) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+
+                let img = match image::load_from_memory(&bytes) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                };
+
+                let resized = resize_for_preset(img, preset);
+                let target = if replace_original {
+                    file.path.clone()
+                } else {
+                    resize_copy_path(&file.path, preset.suffix(), &ext)
+                };
+
+                let save_result = if ext == "jpg" || ext == "jpeg" {
+                    let mut out = std::io::BufWriter::new(match std::fs::File::create(&target) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            failed += 1;
+                            continue;
+                        }
+                    });
+                    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+                    encoder.encode_image(&resized)
+                } else {
+                    resized.save(&target)
+                };
+
+                if save_result.is_ok() {
+                    ok += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+
+            let _ = tx.send(AppEvent::Status(format!(
+                "Resize done [{} / {}]: {} ok, {} skipped, {} failed",
+                preset.label(),
+                mode,
+                ok,
+                skipped,
+                failed
+            )));
         });
     }
 
@@ -4122,8 +4242,14 @@ impl eframe::App for TheGridApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(Colors::BG))
                     .show(ctx, |ui| {
+                        self.dispatch_startup_services();
                         let elapsed = self.boot_start.elapsed().as_secs_f32();
-                        let done = crate::views::boot::render(ui, elapsed);
+                        let done = crate::views::boot::render(
+                            ui,
+                            elapsed,
+                            &self.startup_status,
+                            self.startup_services_ready,
+                        );
                         if done {
                             if self.config.is_configured() {
                                 // Check if shell-launch args should override the target screen
@@ -4774,9 +4900,17 @@ impl eframe::App for TheGridApp {
                             }
                         }
 
-                        // Open preview if double-clicked
+                        if let Some(req) = actions.resize_request {
+                            let selected: Vec<_> = self.media_ingest.results.iter()
+                                .filter(|f| req.file_ids.contains(&f.id))
+                                .cloned()
+                                .collect();
+                            self.spawn_media_resize(selected, req.preset, req.replace_original);
+                        }
+
+                        // In Media Ingest we keep a single inline preview surface only.
                         if let Some(file) = actions.open_preview {
-                            let _ = self.event_tx.send(AppEvent::RequestFilePreview(file));
+                            self.set_status(format!("Inline preview only for Media Ingest: {}", file.name));
                         }
                     });
 
@@ -4802,13 +4936,15 @@ impl TheGridApp {
 
         let mut close = false;
         let mut confirm = false;
+        let modal = crate::theme::modal_metrics(ctx, 560.0, 380.0, 760.0, 24.0, 140.0);
 
         egui::Window::new("ADD TASK")
             .id(egui::Id::new("planner_add_popup"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .fixed_size(egui::vec2(340.0, 0.0))
+            .fixed_size(egui::vec2(modal.width, 0.0))
+            .max_height(ctx.screen_rect().height() - 48.0)
             .frame(egui::Frame::none()
                 .fill(Colors::BG_PANEL)
                 .stroke(egui::Stroke::new(1.5, Colors::GREEN_DIM))
@@ -4828,143 +4964,149 @@ impl TheGridApp {
                 ui.add(egui::Separator::default().spacing(6.0));
                 ui.add_space(4.0);
 
-                // Project selector
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("PROJECT").color(Colors::TEXT_MUTED).size(8.5));
+                egui::ScrollArea::vertical()
+                    .max_height(modal.max_body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+
+                    // Project selector
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("PROJECT").color(Colors::TEXT_MUTED).size(8.5));
+                        ui.add_space(8.0);
+                        egui::ComboBox::from_id_source("add_task_project")
+                            .selected_text(
+                                RichText::new(
+                                    self.config.projects.iter()
+                                        .find(|p| p.id == self.planner_add.project_id)
+                                        .map(|p| p.name.to_uppercase())
+                                        .unwrap_or_else(|| "SELECT…".into())
+                                ).color(Colors::TEXT).size(9.0)
+                            )
+                            .width(200.0)
+                            .show_ui(ui, |ui| {
+                                for proj in &self.config.projects {
+                                    ui.selectable_value(
+                                        &mut self.planner_add.project_id,
+                                        proj.id.clone(),
+                                        RichText::new(proj.name.to_uppercase()).size(9.0)
+                                    );
+                                }
+                            });
+                    });
                     ui.add_space(8.0);
-                    egui::ComboBox::from_id_source("add_task_project")
-                        .selected_text(
-                            RichText::new(
-                                self.config.projects.iter()
-                                    .find(|p| p.id == self.planner_add.project_id)
-                                    .map(|p| p.name.to_uppercase())
-                                    .unwrap_or_else(|| "SELECT…".into())
-                            ).color(Colors::TEXT).size(9.0)
-                        )
-                        .width(200.0)
-                        .show_ui(ui, |ui| {
-                            for proj in &self.config.projects {
-                                ui.selectable_value(
-                                    &mut self.planner_add.project_id,
-                                    proj.id.clone(),
-                                    RichText::new(proj.name.to_uppercase()).size(9.0)
-                                );
+
+                    // Task title
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("TITLE").color(Colors::TEXT_MUTED).size(8.5));
+                        ui.add_space(18.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.planner_add.task_title)
+                                .hint_text("Task description…")
+                                .font(egui::FontId::new(9.5, egui::FontFamily::Monospace))
+                                .desired_width(f32::INFINITY)
+                                .frame(true)
+                        );
+                    });
+                    ui.add_space(8.0);
+
+                    // Type: HUMAN / AI
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("TYPE").color(Colors::TEXT_MUTED).size(8.5));
+                        ui.add_space(20.0);
+                        for (tp, lbl) in [
+                            (crate::app::PlannerAddType::Human, "HUMAN"),
+                            (crate::app::PlannerAddType::Ai,    "AI"),
+                        ] {
+                            let active = self.planner_add.task_type == tp;
+                            let fill = if active { Color32::from_rgb(0, 20, 6) } else { Color32::TRANSPARENT };
+                            let col  = if active { Colors::GREEN } else { Colors::TEXT_DIM };
+                            if ui.add(
+                                egui::Button::new(RichText::new(lbl).color(col).size(8.5))
+                                    .fill(fill)
+                                    .stroke(egui::Stroke::new(1.0, if active { Colors::GREEN_DIM } else { Colors::BORDER }))
+                                    .min_size(egui::vec2(54.0, 20.0))
+                            ).clicked() { self.planner_add.task_type = tp; }
+                            ui.add_space(4.0);
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    // Priority: LOW / MED / HIGH
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("PRIORITY").color(Colors::TEXT_MUTED).size(8.5));
+                        for prio in [
+                            crate::app::PlannerAddPriority::Low,
+                            crate::app::PlannerAddPriority::Med,
+                            crate::app::PlannerAddPriority::High,
+                        ] {
+                            let active = self.planner_add.priority == prio;
+                            let col = if active { prio.color() } else { Colors::TEXT_MUTED };
+                            let fill = if active { Color32::from_rgba_premultiplied(
+                                prio.color().r() / 4, prio.color().g() / 4, prio.color().b() / 4, 80
+                            )} else { Color32::TRANSPARENT };
+                            if ui.add(
+                                egui::Button::new(RichText::new(prio.label()).color(col).size(8.5))
+                                    .fill(fill)
+                                    .stroke(egui::Stroke::new(1.0, if active { col } else { Colors::BORDER }))
+                                    .min_size(egui::vec2(44.0, 20.0))
+                            ).clicked() { self.planner_add.priority = prio; }
+                            ui.add_space(3.0);
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    // Description
+                    ui.label(RichText::new("DESCRIPTION").color(Colors::TEXT_MUTED).size(8.5));
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.planner_add.description)
+                            .hint_text("Optional notes / context…")
+                            .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(3)
+                            .frame(true)
+                    );
+                    ui.add_space(8.0);
+
+                    // Sub-tasks
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("SUB-TASKS").color(Colors::TEXT_MUTED).size(8.5));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let can_add = !self.planner_add.new_sub_task.trim().is_empty();
+                            if ui.add_enabled(can_add,
+                                egui::Button::new(RichText::new("+ ADD").color(Colors::GREEN).size(8.5))
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM))
+                            ).clicked() {
+                                let st = std::mem::take(&mut self.planner_add.new_sub_task);
+                                self.planner_add.sub_tasks.push((st, false));
                             }
                         });
-                });
-                ui.add_space(8.0);
-
-                // Task title
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("TITLE").color(Colors::TEXT_MUTED).size(8.5));
-                    ui.add_space(18.0);
+                    });
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.planner_add.task_title)
-                            .hint_text("Task description…")
-                            .font(egui::FontId::new(9.5, egui::FontFamily::Monospace))
+                        egui::TextEdit::singleline(&mut self.planner_add.new_sub_task)
+                            .hint_text("Add a sub-task…")
+                            .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
                             .desired_width(f32::INFINITY)
                             .frame(true)
                     );
-                });
-                ui.add_space(8.0);
-
-                // Type: HUMAN / AI
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("TYPE").color(Colors::TEXT_MUTED).size(8.5));
-                    ui.add_space(20.0);
-                    for (tp, lbl) in [
-                        (crate::app::PlannerAddType::Human, "HUMAN"),
-                        (crate::app::PlannerAddType::Ai,    "AI"),
-                    ] {
-                        let active = self.planner_add.task_type == tp;
-                        let fill = if active { Color32::from_rgb(0, 20, 6) } else { Color32::TRANSPARENT };
-                        let col  = if active { Colors::GREEN } else { Colors::TEXT_DIM };
-                        if ui.add(
-                            egui::Button::new(RichText::new(lbl).color(col).size(8.5))
-                                .fill(fill)
-                                .stroke(egui::Stroke::new(1.0, if active { Colors::GREEN_DIM } else { Colors::BORDER }))
-                                .min_size(egui::vec2(54.0, 20.0))
-                        ).clicked() { self.planner_add.task_type = tp; }
-                        ui.add_space(4.0);
-                    }
-                });
-                ui.add_space(8.0);
-
-                // Priority: LOW / MED / HIGH
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("PRIORITY").color(Colors::TEXT_MUTED).size(8.5));
-                    for prio in [
-                        crate::app::PlannerAddPriority::Low,
-                        crate::app::PlannerAddPriority::Med,
-                        crate::app::PlannerAddPriority::High,
-                    ] {
-                        let active = self.planner_add.priority == prio;
-                        let col = if active { prio.color() } else { Colors::TEXT_MUTED };
-                        let fill = if active { Color32::from_rgba_premultiplied(
-                            prio.color().r() / 4, prio.color().g() / 4, prio.color().b() / 4, 80
-                        )} else { Color32::TRANSPARENT };
-                        if ui.add(
-                            egui::Button::new(RichText::new(prio.label()).color(col).size(8.5))
-                                .fill(fill)
-                                .stroke(egui::Stroke::new(1.0, if active { col } else { Colors::BORDER }))
-                                .min_size(egui::vec2(44.0, 20.0))
-                        ).clicked() { self.planner_add.priority = prio; }
-                        ui.add_space(3.0);
-                    }
-                });
-                ui.add_space(8.0);
-
-                // Description
-                ui.label(RichText::new("DESCRIPTION").color(Colors::TEXT_MUTED).size(8.5));
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.planner_add.description)
-                        .hint_text("Optional notes / context…")
-                        .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(3)
-                        .frame(true)
-                );
-                ui.add_space(8.0);
-
-                // Sub-tasks
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("SUB-TASKS").color(Colors::TEXT_MUTED).size(8.5));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let can_add = !self.planner_add.new_sub_task.trim().is_empty();
-                        if ui.add_enabled(can_add,
-                            egui::Button::new(RichText::new("+ ADD").color(Colors::GREEN).size(8.5))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM))
-                        ).clicked() {
-                            let st = std::mem::take(&mut self.planner_add.new_sub_task);
-                            self.planner_add.sub_tasks.push((st, false));
-                        }
-                    });
-                });
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.planner_add.new_sub_task)
-                        .hint_text("Add a sub-task…")
-                        .font(egui::FontId::new(9.0, egui::FontFamily::Monospace))
-                        .desired_width(f32::INFINITY)
-                        .frame(true)
-                );
-                ui.add_space(4.0);
-                let mut remove_sub: Option<usize> = None;
-                for (i, (st, done)) in self.planner_add.sub_tasks.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.checkbox(done, "");
-                        let col = if *done { Colors::TEXT_MUTED } else { Colors::TEXT };
-                        ui.label(RichText::new(st.as_str()).color(col).size(9.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add(
-                                egui::Button::new(RichText::new("✕").color(Colors::RED).size(8.0))
-                                    .fill(Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
-                            ).clicked() { remove_sub = Some(i); }
+                    ui.add_space(4.0);
+                    let mut remove_sub: Option<usize> = None;
+                    for (i, (st, done)) in self.planner_add.sub_tasks.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(done, "");
+                            let col = if *done { Colors::TEXT_MUTED } else { Colors::TEXT };
+                            ui.label(RichText::new(st.as_str()).color(col).size(9.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(
+                                    egui::Button::new(RichText::new("✕").color(Colors::RED).size(8.0))
+                                        .fill(Color32::TRANSPARENT).stroke(egui::Stroke::NONE)
+                                ).clicked() { remove_sub = Some(i); }
+                            });
                         });
-                    });
-                }
-                if let Some(i) = remove_sub { self.planner_add.sub_tasks.remove(i); }
+                    }
+                    if let Some(i) = remove_sub { self.planner_add.sub_tasks.remove(i); }
+                });
 
                 ui.add_space(12.0);
                 ui.add(egui::Separator::default().spacing(4.0));
@@ -5010,13 +5152,15 @@ impl TheGridApp {
 
         let mut close = false;
         let mut confirm = false;
+        let modal = crate::theme::modal_metrics(ctx, 420.0, 320.0, 560.0, 24.0, 120.0);
 
         egui::Window::new("NEW PROJECT")
             .id(egui::Id::new("project_add_popup"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-            .fixed_size(egui::vec2(300.0, 0.0))
+            .fixed_size(egui::vec2(modal.width, 0.0))
+            .max_height(ctx.screen_rect().height() - 48.0)
             .frame(egui::Frame::window(&ctx.style())
                 .fill(crate::theme::Colors::BG_PANEL)
                 .stroke(egui::Stroke::new(1.0, crate::theme::Colors::GREEN_DIM))
@@ -5025,58 +5169,64 @@ impl TheGridApp {
                 use egui::RichText;
                 ui.add_space(8.0);
 
-                // Name
-                ui.label(RichText::new("PROJECT NAME").color(crate::theme::Colors::TEXT_DIM).size(9.0).strong());
-                ui.add_space(3.0);
-                ui.add(egui::TextEdit::singleline(&mut self.project_add.name)
-                    .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
-                    .desired_width(f32::INFINITY)
-                    .hint_text("MY PROJECT")
-                );
+                egui::ScrollArea::vertical()
+                    .max_height(modal.max_body_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
 
-                ui.add_space(10.0);
-
-                // Quick-slot picker
-                ui.label(RichText::new("PIN TO QUICK-SLOT").color(crate::theme::Colors::TEXT_DIM).size(9.0).strong());
-                ui.add_space(3.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    for s in 0..4usize {
-                        let active = self.project_add.slot == s;
-                        let col = if active { crate::theme::Colors::GREEN } else { crate::theme::Colors::TEXT_MUTED };
-                        let fill = if active { egui::Color32::from_rgb(0, 20, 6) } else { egui::Color32::TRANSPARENT };
-                        let btn = egui::Button::new(RichText::new(format!("SLOT {}", s + 1)).color(col).size(8.5))
-                            .fill(fill)
-                            .stroke(egui::Stroke::new(1.0, col))
-                            .min_size(egui::vec2(55.0, 22.0));
-                        if ui.add(btn).clicked() { self.project_add.slot = s; }
-                    }
-                });
-
-                ui.add_space(14.0);
-                ui.add(egui::Separator::default().spacing(0.0));
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    let name_ok = !self.project_add.name.trim().is_empty();
-                    let create_col = if name_ok { crate::theme::Colors::GREEN } else { crate::theme::Colors::TEXT_MUTED };
-                    let create_resp = ui.add(
-                        egui::Button::new(RichText::new("+ CREATE PROJECT").color(create_col).size(9.5).strong())
-                            .fill(egui::Color32::from_rgb(0, 20, 6))
-                            .stroke(egui::Stroke::new(1.0, crate::theme::Colors::GREEN_DIM))
-                            .min_size(egui::vec2(160.0, 28.0))
+                    // Name
+                    ui.label(RichText::new("PROJECT NAME").color(crate::theme::Colors::TEXT_DIM).size(9.0).strong());
+                    ui.add_space(3.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.project_add.name)
+                        .font(egui::FontId::new(11.0, egui::FontFamily::Monospace))
+                        .desired_width(f32::INFINITY)
+                        .hint_text("MY PROJECT")
                     );
-                    if create_resp.clicked() && name_ok { confirm = true; }
 
+                    ui.add_space(10.0);
+
+                    // Quick-slot picker
+                    ui.label(RichText::new("PIN TO QUICK-SLOT").color(crate::theme::Colors::TEXT_DIM).size(9.0).strong());
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for s in 0..4usize {
+                            let active = self.project_add.slot == s;
+                            let col = if active { crate::theme::Colors::GREEN } else { crate::theme::Colors::TEXT_MUTED };
+                            let fill = if active { egui::Color32::from_rgb(0, 20, 6) } else { egui::Color32::TRANSPARENT };
+                            let btn = egui::Button::new(RichText::new(format!("SLOT {}", s + 1)).color(col).size(8.5))
+                                .fill(fill)
+                                .stroke(egui::Stroke::new(1.0, col))
+                                .min_size(egui::vec2(55.0, 22.0));
+                            if ui.add(btn).clicked() { self.project_add.slot = s; }
+                        }
+                    });
+
+                    ui.add_space(14.0);
+                    ui.add(egui::Separator::default().spacing(0.0));
                     ui.add_space(8.0);
-                    if ui.add(
-                        egui::Button::new(RichText::new("CANCEL").color(crate::theme::Colors::TEXT_MUTED).size(9.0))
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::new(1.0, crate::theme::Colors::BORDER))
-                            .min_size(egui::vec2(70.0, 28.0))
-                    ).clicked() { close = true; }
+
+                    ui.horizontal(|ui| {
+                        let name_ok = !self.project_add.name.trim().is_empty();
+                        let create_col = if name_ok { crate::theme::Colors::GREEN } else { crate::theme::Colors::TEXT_MUTED };
+                        let create_resp = ui.add(
+                            egui::Button::new(RichText::new("+ CREATE PROJECT").color(create_col).size(9.5).strong())
+                                .fill(egui::Color32::from_rgb(0, 20, 6))
+                                .stroke(egui::Stroke::new(1.0, crate::theme::Colors::GREEN_DIM))
+                                .min_size(egui::vec2(160.0, 28.0))
+                        );
+                        if create_resp.clicked() && name_ok { confirm = true; }
+
+                        ui.add_space(8.0);
+                        if ui.add(
+                            egui::Button::new(RichText::new("CANCEL").color(crate::theme::Colors::TEXT_MUTED).size(9.0))
+                                .fill(egui::Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(1.0, crate::theme::Colors::BORDER))
+                                .min_size(egui::vec2(70.0, 28.0))
+                        ).clicked() { close = true; }
+                    });
+                    ui.add_space(8.0);
                 });
-                ui.add_space(8.0);
             });
 
         if confirm {
@@ -5097,4 +5247,27 @@ impl TheGridApp {
             self.project_add = ProjectAddState::default();
         }
     }
+}
+
+fn is_resizable_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tif" | "tiff"
+    )
+}
+
+fn resize_for_preset(img: image::DynamicImage, preset: MediaResizePreset) -> image::DynamicImage {
+    match preset {
+        MediaResizePreset::Print => img.resize(4961, 3508, image::imageops::FilterType::Lanczos3),
+        MediaResizePreset::Social => img.resize(1080, 1080, image::imageops::FilterType::Lanczos3),
+        MediaResizePreset::Ads => img.resize(1200, 628, image::imageops::FilterType::Lanczos3),
+        MediaResizePreset::Free => img.resize(1600, 1600, image::imageops::FilterType::Lanczos3),
+    }
+}
+
+fn resize_copy_path(path: &std::path::Path, suffix: &str, ext_hint: &str) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or(ext_hint);
+    parent.join(format!("{}_{}_copy.{}", stem, suffix, ext))
 }

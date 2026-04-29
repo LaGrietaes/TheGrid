@@ -122,8 +122,6 @@ pub fn draw_thegrid_logo(
     r:       f32,
     color:   Color32,
 ) {
-    use std::f32::consts::TAU;
-
     // ── helpers ────────────────────────────────────────────────────────────
     let hex_pt = |angle_deg: f32, radius: f32| -> egui::Pos2 {
         let a = angle_deg.to_radians();

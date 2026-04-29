@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use egui::{Color32, RichText, ScrollArea, Ui};
 use thegrid_core::models::{DuplicateGroup, FileSearchResult, SourceType};
-use crate::theme::{Colors, danger_button, micro_button, primary_button, section_title};
+use crate::theme::{self, Colors, danger_button, micro_button, primary_button, section_title};
 
 // ── Action per file ────────────────────────────────────────────────────────────
 
@@ -428,11 +428,14 @@ pub fn render_dedup_review(
     if state.confirming {
         let mut do_execute = false;
         let mut cancel = false;
+        let modal = theme::modal_metrics(ui.ctx(), 460.0, 340.0, 560.0, 24.0, 100.0);
 
         egui::Window::new("CONFIRM DELETION")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .fixed_size(egui::vec2(modal.width, 0.0))
+            .max_height(ui.ctx().screen_rect().height() - 48.0)
             .show(ui.ctx(), |ui| {
                 let pending = state.pending_deletes(groups);
                 ui.label(

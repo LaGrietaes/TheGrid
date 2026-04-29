@@ -157,6 +157,38 @@ fn build_style() -> Style {
     s
 }
 
+pub struct ModalMetrics {
+    pub width: f32,
+    pub max_body_height: f32,
+}
+
+/// Responsive modal sizing helper used by centered popups.
+///
+/// `chrome_height` is the approximate space used by fixed header/footer rows.
+pub fn modal_metrics(
+    ctx: &Context,
+    desired_width: f32,
+    min_width: f32,
+    max_width: f32,
+    screen_margin: f32,
+    chrome_height: f32,
+) -> ModalMetrics {
+    let screen = ctx.screen_rect();
+    let available_w = (screen.width() - screen_margin * 2.0).max(320.0);
+    let width = desired_width
+        .clamp(min_width, max_width)
+        .min(available_w)
+        .max(min_width.min(available_w));
+
+    let available_h = (screen.height() - screen_margin * 2.0).max(220.0);
+    let max_body_height = (available_h - chrome_height).max(140.0);
+
+    ModalMetrics {
+        width,
+        max_body_height,
+    }
+}
+
 // ── Reusable styled widgets ────────────────────────────────────────────────────
 //
 // These helper functions are used in the views to ensure consistent styling

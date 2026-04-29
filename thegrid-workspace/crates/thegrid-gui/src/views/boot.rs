@@ -25,13 +25,13 @@ static BOOT_LOG: &[&str] = &[
     "[UI]   Rendering command center...",
 ];
 
-/// Total boot duration in seconds
+/// Minimum boot duration in seconds
 const BOOT_DURATION: f32 = 2.5;
 
-pub fn render(ui: &mut Ui, boot_elapsed: f32) -> bool {
-    // Return true when boot is complete
+pub fn render(ui: &mut Ui, boot_elapsed: f32, startup_status: &str, startup_ready: bool) -> bool {
+    // Return true when minimum boot time elapsed and real startup has completed.
     let progress = (boot_elapsed / BOOT_DURATION).min(1.0);
-    let done = progress >= 1.0;
+    let done = progress >= 1.0 && startup_ready;
 
     // Full-screen centered layout
     let available = ui.available_rect_before_wrap();
@@ -90,6 +90,12 @@ pub fn render(ui: &mut Ui, boot_elapsed: f32) -> bool {
 
             // Fixed height spacer so the progress bar doesn't jump
             ui.add_space((4_usize.saturating_sub(lines_to_show.min(4))) as f32 * 18.0);
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(startup_status)
+                    .color(Colors::TEXT_MUTED)
+                    .size(9.0)
+            );
             ui.add_space(20.0);
 
             // ── Progress bar ───────────────────────────────────────────────────

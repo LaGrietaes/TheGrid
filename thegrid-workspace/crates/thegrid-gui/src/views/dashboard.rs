@@ -1577,6 +1577,7 @@ impl SettingsState {
 pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool {
     if !s.open { return false; }
     let mut saved = false;
+    let modal = theme::modal_metrics(ctx, 680.0, 540.0, 760.0, 24.0, 220.0);
 
     // Semi-transparent backdrop
     egui::Area::new(egui::Id::new("settings_backdrop"))
@@ -1598,7 +1599,8 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
         .resizable(false)
         .collapsible(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .fixed_size(egui::vec2(480.0, 0.0))
+        .fixed_size(egui::vec2(modal.width, 0.0))
+        .max_height(ctx.screen_rect().height() - 48.0)
         .frame(
             egui::Frame::none()
                 .fill(Colors::BG_PANEL)
@@ -1607,7 +1609,7 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
         .show(ctx, |ui| {
             // Cyan top accent bar
             let top = ui.next_widget_position();
-            let bar = egui::Rect::from_min_size(top, egui::vec2(480.0, 2.0));
+            let bar = egui::Rect::from_min_size(top, egui::vec2(modal.width, 2.0));
             ui.painter().rect_filled(bar, egui::Rounding::ZERO, Colors::GREEN);
             ui.add_space(2.0);
 
@@ -1642,91 +1644,104 @@ pub fn render_settings_modal(ctx: &egui::Context, s: &mut SettingsState) -> bool
             egui::Frame::none()
                 .inner_margin(egui::Margin::same(24.0))
                 .show(ui, |ui| {
-                    modal_field(ui, "TAILSCALE API KEY",    &mut s.api_key,      true,  "tskey-api-...");
-                    ui.add_space(14.0);
-                    modal_field(ui, "THIS DEVICE LABEL",    &mut s.device_name,  false, "e.g. WORKSTATION-MAIN");
-                    ui.add_space(14.0);
-                    modal_field(ui, "DEFAULT RDP USERNAME", &mut s.rdp_username, false, "e.g. Administrator");
-                    ui.add_space(14.0);
-                    modal_field(ui, "AGENT PORT",           &mut s.agent_port,   false, "47731");
-                    ui.add_space(14.0);
-                    modal_field(ui, "LOCAL AI MODEL",       &mut s.ai_model,     false, "e.g. llama3:8b");
+                    ScrollArea::vertical()
+                        .max_height(modal.max_body_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            modal_field(ui, "TAILSCALE API KEY",    &mut s.api_key,      true,  "tskey-api-...");
+                            ui.add_space(14.0);
+                            modal_field(ui, "THIS DEVICE LABEL",    &mut s.device_name,  false, "e.g. WORKSTATION-MAIN");
+                            ui.add_space(14.0);
+                            modal_field(ui, "DEFAULT RDP USERNAME", &mut s.rdp_username, false, "e.g. Administrator");
+                            ui.add_space(14.0);
+                            modal_field(ui, "AGENT PORT",           &mut s.agent_port,   false, "47731");
+                            ui.add_space(14.0);
+                            modal_field(ui, "LOCAL AI MODEL",       &mut s.ai_model,     false, "e.g. llama3:8b");
 
-                    ui.add_space(14.0);
-                    ui.label(RichText::new("MEDIA PROCESSING MODE").color(Colors::TEXT_DIM).size(9.0).strong());
-                    ui.add_space(4.0);
-                    egui::ComboBox::from_id_source("media_processing_mode_combo")
-                        .width(ui.available_width())
-                        .selected_text(s.media_processing_mode.clone())
-                        .show_ui(ui, |ui| {
-                            for mode in ["auto", "cpu", "dedicated_gpu"] {
-                                ui.selectable_value(&mut s.media_processing_mode, mode.to_string(), mode);
+                            ui.add_space(14.0);
+                            ui.label(RichText::new("MEDIA PROCESSING MODE").color(Colors::TEXT_DIM).size(9.0).strong());
+                            ui.add_space(4.0);
+                            egui::ComboBox::from_id_source("media_processing_mode_combo")
+                                .width(ui.available_width())
+                                .selected_text(s.media_processing_mode.clone())
+                                .show_ui(ui, |ui| {
+                                    for mode in ["auto", "cpu", "dedicated_gpu"] {
+                                        ui.selectable_value(&mut s.media_processing_mode, mode.to_string(), mode);
+                                    }
+                                });
+
+                            ui.add_space(8.0);
+                            ui.checkbox(&mut s.ai_tablet_assist, "Enable tablet-assisted AI/Media offload");
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("Tablet CPU max %").color(Colors::TEXT_DIM).size(9.0));
+                                ui.add(egui::TextEdit::singleline(&mut s.ai_tablet_assist_cpu_max_pct).desired_width(80.0));
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("Tablet GPU max %").color(Colors::TEXT_DIM).size(9.0));
+                                ui.add(egui::TextEdit::singleline(&mut s.ai_tablet_assist_gpu_max_pct).desired_width(80.0));
+                            });
+
+                            ui.add_space(14.0);
+                            ui.label(RichText::new("DEVICE TYPE").color(Colors::TEXT_DIM).size(9.0).strong());
+                            ui.add_space(4.0);
+                            egui::ComboBox::from_id_source("device_type_combo")
+                                .width(ui.available_width())
+                                .selected_text(s.device_type.clone())
+                                .show_ui(ui, |ui| {
+                                    for typ in ["Desktop", "Laptop", "Tablet", "Smartphone", "Server", "NAS", "Board"] {
+                                        ui.selectable_value(&mut s.device_type, typ.to_string(), typ);
+                                    }
+                                });
+
+                            ui.add_space(14.0);
+                            ui.add(egui::Separator::default().spacing(0.0));
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("GOOGLE DRIVE").color(Colors::TEXT_DIM).size(9.0).strong());
+                            ui.add_space(6.0);
+                            modal_field(ui, "OAUTH CLIENT ID",     &mut s.google_client_id,     false, "paste from Google Cloud Console");
+                            ui.add_space(8.0);
+                            modal_field(ui, "OAUTH CLIENT SECRET", &mut s.google_client_secret, true,  "paste from Google Cloud Console");
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if theme::primary_button(ui, "CONNECT DRIVE").clicked() {
+                                    s.connect_drive = true;
+                                }
+                                ui.add_space(8.0);
+                                if theme::micro_button(ui, "INDEX DRIVE").clicked() {
+                                    s.index_drive = true;
+                                }
+                            });
+                            ui.add_space(10.0);
+                            ui.add(egui::Separator::default().spacing(0.0));
+                            ui.add_space(14.0);
+                            ui.label(RichText::new("WATCHED DIRECTORIES").color(Colors::TEXT_DIM).size(9.0).strong());
+                            ui.add_space(4.0);
+
+                            let mut to_remove = None;
+                            for (i, path) in s.watch_paths.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let remove_btn_w = 30.0;
+                                    let path_w = (ui.available_width() - remove_btn_w - 8.0).max(160.0);
+                                    ui.add_sized(
+                                        [path_w, 0.0],
+                                        egui::TextEdit::singleline(path),
+                                    );
+                                    if ui
+                                        .add_sized([remove_btn_w, 0.0], egui::Button::new(egui_phosphor::regular::X))
+                                        .clicked()
+                                    {
+                                        to_remove = Some(i);
+                                    }
+                                });
+                                ui.add_space(4.0);
+                            }
+                            if let Some(i) = to_remove {
+                                s.watch_paths.remove(i);
+                            }
+                            if ui.button("+ ADD DIRECTORY").clicked() {
+                                s.watch_paths.push(String::new());
                             }
                         });
-
-                    ui.add_space(8.0);
-                    ui.checkbox(&mut s.ai_tablet_assist, "Enable tablet-assisted AI/Media offload");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Tablet CPU max %").color(Colors::TEXT_DIM).size(9.0));
-                        ui.add(egui::TextEdit::singleline(&mut s.ai_tablet_assist_cpu_max_pct).desired_width(80.0));
-                        ui.add_space(10.0);
-                        ui.label(RichText::new("Tablet GPU max %").color(Colors::TEXT_DIM).size(9.0));
-                        ui.add(egui::TextEdit::singleline(&mut s.ai_tablet_assist_gpu_max_pct).desired_width(80.0));
-                    });
-
-                    ui.add_space(14.0);
-                    ui.label(RichText::new("DEVICE TYPE").color(Colors::TEXT_DIM).size(9.0).strong());
-                    ui.add_space(4.0);
-                    egui::ComboBox::from_id_source("device_type_combo")
-                        .width(ui.available_width())
-                        .selected_text(s.device_type.clone())
-                        .show_ui(ui, |ui| {
-                            for typ in ["Desktop", "Laptop", "Tablet", "Smartphone", "Server", "NAS", "Board"] {
-                                ui.selectable_value(&mut s.device_type, typ.to_string(), typ);
-                            }
-                        });
-
-                    ui.add_space(14.0);
-                    ui.add(egui::Separator::default().spacing(0.0));
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("GOOGLE DRIVE").color(Colors::TEXT_DIM).size(9.0).strong());
-                    ui.add_space(6.0);
-                    modal_field(ui, "OAUTH CLIENT ID",     &mut s.google_client_id,     false, "paste from Google Cloud Console");
-                    ui.add_space(8.0);
-                    modal_field(ui, "OAUTH CLIENT SECRET", &mut s.google_client_secret, true,  "paste from Google Cloud Console");
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if theme::primary_button(ui, "CONNECT DRIVE").clicked() {
-                            s.connect_drive = true;
-                        }
-                        ui.add_space(8.0);
-                        if theme::micro_button(ui, "INDEX DRIVE").clicked() {
-                            s.index_drive = true;
-                        }
-                    });
-                    ui.add_space(10.0);
-                    ui.add(egui::Separator::default().spacing(0.0));
-                    ui.add_space(14.0);
-                    ui.label(RichText::new("WATCHED DIRECTORIES").color(Colors::TEXT_DIM).size(9.0).strong());
-                    ui.add_space(4.0);
-                    
-                    let mut to_remove = None;
-                    for (i, path) in s.watch_paths.iter_mut().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(path).desired_width(ui.available_width() - 30.0));
-                            if ui.button(egui_phosphor::regular::X).clicked() {
-                                to_remove = Some(i);
-                            }
-                        });
-                        ui.add_space(4.0);
-                    }
-                    if let Some(i) = to_remove {
-                        s.watch_paths.remove(i);
-                    }
-                    if ui.button("+ ADD DIRECTORY").clicked() {
-                        s.watch_paths.push(String::new());
-                    }
                 });
 
             ui.add(egui::Separator::default().spacing(0.0));
