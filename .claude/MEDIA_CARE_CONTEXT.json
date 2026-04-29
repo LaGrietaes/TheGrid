@@ -1,0 +1,43 @@
+{
+  "project": "TheGrid",
+  "focus": "Media Care Station",
+  "version": "v1",
+  "design_docs": [
+    "MEDIA_CARE_MASTER_INDEX_V1.md",
+    "MEDIA_CARE_BLUEPRINT_V1.md",
+    "MEDIA_CARE_UI_WIREFRAME_V1.md",
+    "MEDIA_CARE_EXISTING_PROJECT_CONNECTION_V1.md",
+    "MEDIA_CARE_DEPENDENCY_MATRIX_V1.md",
+    "MEDIA_CARE_BACKLOG_V1.md"
+  ],
+  "integration_targets": {
+    "gui": [
+      "thegrid-workspace/crates/thegrid-gui/src/app.rs",
+      "thegrid-workspace/crates/thegrid-gui/src/views/media_ingest.rs",
+      "thegrid-workspace/crates/thegrid-gui/src/views/video_preview.rs"
+    ],
+    "runtime": [
+      "thegrid-workspace/crates/thegrid-runtime/src/runtime.rs"
+    ],
+    "core": [
+      "thegrid-workspace/crates/thegrid-core/src/events.rs",
+      "thegrid-workspace/crates/thegrid-core/src/db.rs"
+    ]
+  },
+  "architecture_constraints": [
+    "egui update loop must stay non-blocking",
+    "background work should follow existing spawn_* runtime pattern",
+    "state updates should flow through AppEvent message bus",
+    "queue state must be persisted and recoverable",
+    "Gyroflow integration remains external in v1"
+  ],
+  "required_design_output_sections": [
+    "decision_summary",
+    "ui_impact",
+    "runtime_impact",
+    "core_event_impact",
+    "db_impact",
+    "risks_and_mitigations",
+    "acceptance_criteria"
+  ]
+}
