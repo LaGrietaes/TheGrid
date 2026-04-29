@@ -4,6 +4,7 @@
     "run:node": "cargo run -p thegrid-node",
     "build:gui": "cargo build --release -p thegrid-gui",
     "build:node": "cargo build --release -p thegrid-node",
+    "build:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\build_installer.ps1",
     "check:gui": "cargo check -p thegrid-gui",
     "check:node": "cargo check -p thegrid-node",
     "check:headless": "cargo check --workspace --exclude thegrid-gui",

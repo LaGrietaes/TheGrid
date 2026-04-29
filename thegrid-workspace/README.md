@@ -35,6 +35,33 @@ Flags:
 
 ---
 
+## Artic Node Installer Flow (Send/Fetch Ready)
+
+Use this flow before deploying to Artic so binaries and installer are always aligned with current code.
+
+```powershell
+cd thegrid-workspace
+npm run build:installer
+```
+
+What this does:
+- runs `cargo check --workspace`
+- builds fresh release binaries for `thegrid` and `thegrid-node`
+- compiles `TheGrid_Setup.exe` using Inno Setup
+- creates a timestamped copy (`TheGrid_Setup_yyyyMMdd-HHmm.exe`) for traceable deployments
+
+Installer now includes:
+- `setup_networking.ps1` (opens agent port `5000`, RDP/firewall baseline)
+- `scripts/mesh_connection_smoke.ps1` (post-install mesh validation)
+
+After installing on Artic, validate remotely:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\mesh_connection_smoke.ps1 -TargetIp <ARTIC_IP> -ApiKey <GRID_KEY>
+```
+
+---
+
 ## Organized Dual Targets (Single Branch)
 
 To work on GUI and NODE in sync while keeping headless builds free of GUI extras,

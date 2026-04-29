@@ -23,9 +23,9 @@ Write-Host "Configuring File and Printer Sharing..."
 Enable-NetFirewallRule -DisplayGroup "Compartir impresoras y archivos" -ErrorAction SilentlyContinue
 Enable-NetFirewallRule -DisplayGroup "File and Printer Sharing" -ErrorAction SilentlyContinue
 
-Write-Host "Allowing inbound 5555 The Grid agent..."
+Write-Host "Allowing inbound 5000 The Grid agent..."
 Remove-NetFirewallRule -DisplayName "TheGrid Agent" -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "TheGrid Agent" -Direction Inbound -LocalPort 5555 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
+New-NetFirewallRule -DisplayName "TheGrid Agent" -Direction Inbound -LocalPort 5000 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue
 
 Write-Host "Allowing ICMPv4 (Ping)..."
 Enable-NetFirewallRule -Name "CoreNet-Diag-ICMP4-EchoRequest-In" -ErrorAction SilentlyContinue
