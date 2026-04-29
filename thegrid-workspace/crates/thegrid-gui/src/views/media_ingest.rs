@@ -272,11 +272,17 @@ pub struct MediaIngestActions {
     pub events:         Vec<AppEvent>,
     pub trigger_search: bool,
     pub open_preview:   Option<FileSearchResult>,
+    pub search_limit:   usize,
 }
 
 impl Default for MediaIngestActions {
     fn default() -> Self {
-        Self { events: Vec::new(), trigger_search: false, open_preview: None }
+        Self {
+            events: Vec::new(),
+            trigger_search: false,
+            open_preview: None,
+            search_limit: 50,
+        }
     }
 }
 
