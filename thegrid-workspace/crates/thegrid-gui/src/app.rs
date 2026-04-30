@@ -1463,12 +1463,12 @@ impl TheGridApp {
         });
     }
 
-    fn spawn_update_remote_config(&self, ip: String, device_id: String, device_type: Option<String>, model: Option<String>, url: Option<String>) {
+    fn spawn_update_remote_config(&self, ip: String, device_id: String, device_type: Option<String>, model: Option<String>, url: Option<String>, new_api_key: Option<String>) {
         let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
         let tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            match AgentClient::new(&ip, port, api_key).and_then(|c| c.update_config(device_type, model, url)) {
+            match AgentClient::new(&ip, port, api_key).and_then(|c| c.update_config(device_type, model, url, new_api_key)) {
                 Ok(_) => { let _ = tx.send(AppEvent::RemoteConfigUpdated { device_id }); }
                 Err(e) => { let _ = tx.send(AppEvent::RemoteConfigFailed { device_id, error: e.to_string() }); }
             }
@@ -4180,7 +4180,7 @@ impl TheGridApp {
         }
 
         if let Some((dt, model, url)) = actions.update_remote_config {
-            self.spawn_update_remote_config(ip.to_string(), device_id.to_string(), dt, model, url);
+            self.spawn_update_remote_config(ip.to_string(), device_id.to_string(), dt, model, url, None);
         }
 
         if actions.create_terminal {
@@ -4890,6 +4890,7 @@ impl eframe::App for TheGridApp {
                                         Some(self.config.device_type.clone()),
                                         self.config.ai_model.clone(),
                                         self.config.ai_provider_url.clone(),
+                                        Some(self.config.api_key.clone()),
                                     );
                                     self.spawn_restart_remote_node(ip.clone(), id.clone());
                                     self.push_toast(Toast::ok(format!("Config pushed to {} — restarting node", ip)));

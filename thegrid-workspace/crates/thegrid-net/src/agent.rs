@@ -340,6 +340,7 @@ impl AgentServer {
                 device_type: Option<String>,
                 ai_model: Option<String>,
                 ai_provider_url: Option<String>,
+                api_key: Option<String>,
             }
 
             if let Ok(update) = serde_json::from_str::<ConfigUpdate>(&body) {
@@ -366,6 +367,13 @@ impl AgentServer {
                             cfg.ai_provider_url = Some(u);
                             changed = true;
                             ai_changed = true;
+                        }
+                    }
+                    if let Some(k) = update.api_key {
+                        let k = k.trim().to_string();
+                        if !k.is_empty() && cfg.api_key != k {
+                            cfg.api_key = k;
+                            changed = true;
                         }
                     }
 
@@ -1721,12 +1729,13 @@ impl AgentClient {
         Ok(())
     }
 
-    pub fn update_config(&self, device_type: Option<String>, model: Option<String>, url: Option<String>) -> Result<()> {
+    pub fn update_config(&self, device_type: Option<String>, model: Option<String>, url: Option<String>, api_key: Option<String>) -> Result<()> {
         let endpoint = format!("{}/v1/config", self.base_url);
         let body = serde_json::json!({
             "device_type": device_type,
             "ai_model": model,
             "ai_provider_url": url,
+            "api_key": api_key,
         });
         let resp = self.http.post(&endpoint)
             .header("X-Grid-Key", &self.api_key)
