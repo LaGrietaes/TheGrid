@@ -1324,7 +1324,7 @@ impl TheGridApp {
         let rdp = self.setup.rdp_user.trim().to_string();
         let tx  = self.event_tx.clone();
         std::thread::spawn(move || {
-            match TailscaleClient::new(&api_key).and_then(|c| c.fetch_devices()) {
+            match TailscaleClient::new(api_key.clone()).and_then(|c| c.fetch_devices()) {
                 Err(e) => { let _ = tx.send(AppEvent::SetupFailed(e.to_string())); }
                 Ok(_)  => {
                     let _ = tx.send(AppEvent::SetupComplete(Config {
