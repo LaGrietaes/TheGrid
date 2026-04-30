@@ -23,6 +23,7 @@ rusqlite    = { version = "0.31", features = ["bundled"] }
 
 # Platform-appropriate config/data directories (e.g. %APPDATA% on Windows)
 dirs        = "5"
+keyring     = "2"
 
 # ── Phase 2: Filesystem watcher ───────────────────────────────────────────────
 # notify-rs delivers OS-native file system events (inotify/FSEvents/ReadDirectoryChangesW)

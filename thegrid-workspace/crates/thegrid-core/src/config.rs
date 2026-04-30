@@ -2,6 +2,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+const KEYRING_SERVICE: &str = "thegrid";
+const KEYRING_USER: &str = "tailscale_api_key";
+
 /// All user-configurable settings for THE GRID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -220,6 +223,35 @@ impl Config {
         Ok(dir.join("config.json"))
     }
 
+    fn keyring_entry() -> Result<keyring::Entry> {
+        keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+            .context("Opening OS credential store entry")
+    }
+
+    fn load_api_key_secure() -> Result<Option<String>> {
+        let entry = Self::keyring_entry()?;
+        match entry.get_password() {
+            Ok(v) => {
+                let key = v.trim().to_string();
+                if key.is_empty() { Ok(None) } else { Ok(Some(key)) }
+            }
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Reading api key from OS credential store: {}", e)),
+        }
+    }
+
+    fn save_api_key_secure(api_key: &str) -> Result<()> {
+        let entry = Self::keyring_entry()?;
+        let key = api_key.trim();
+        if key.is_empty() {
+            let _ = entry.delete_password();
+            return Ok(());
+        }
+        entry
+            .set_password(key)
+            .map_err(|e| anyhow::anyhow!("Writing api key to OS credential store: {}", e))
+    }
+
     /// Load config from disk. Returns `Config::default()` if none exists yet.
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
@@ -231,11 +263,36 @@ impl Config {
             .with_context(|| format!("Reading config from {:?}", path))?;
         let mut cfg: Self = serde_json::from_str(&raw).context("Parsing config JSON")?;
 
-        // Normalize and trim API key
-        cfg.api_key = cfg.api_key.trim().to_string();
+        // Migrate legacy plaintext key from config.json into OS credential store.
+        let legacy_plaintext = cfg.api_key.trim().to_string();
+        cfg.api_key.clear();
 
-        // Optional fallback from environment variable if key in config is empty.
-        if cfg.api_key.is_empty() {
+        match Self::load_api_key_secure() {
+            Ok(Some(k)) => {
+                cfg.api_key = k;
+            }
+            Ok(None) => {
+                if !legacy_plaintext.is_empty() {
+                    if let Err(e) = Self::save_api_key_secure(&legacy_plaintext) {
+                        log::warn!("Could not migrate api_key into secure store: {}", e);
+                        cfg.api_key = legacy_plaintext;
+                    } else {
+                        cfg.api_key = legacy_plaintext;
+                        // Scrub plaintext copy from config.json after successful migration.
+                        if let Err(e) = cfg.save() {
+                            log::warn!("Could not scrub plaintext api_key from config file: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("Secure store unavailable, falling back to config/env api_key: {}", e);
+                cfg.api_key = legacy_plaintext;
+            }
+        }
+
+        // Optional fallback from environment variable if key remains empty.
+        if cfg.api_key.trim().is_empty() {
             cfg.api_key = Self::default_api_key();
         }
 
@@ -254,7 +311,13 @@ impl Config {
     /// Persist config to disk. Overwrites any existing file.
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path()?;
-        let json = serde_json::to_string_pretty(self)?;
+        Self::save_api_key_secure(&self.api_key)
+            .context("Persisting api_key in secure store")?;
+
+        // Keep non-secret config in JSON; api_key stays out of plaintext storage.
+        let mut non_secret = self.clone();
+        non_secret.api_key.clear();
+        let json = serde_json::to_string_pretty(&non_secret)?;
         std::fs::write(&path, json)?;
         log::info!("Config saved to {:?}", path);
         Ok(())

@@ -5,7 +5,8 @@ use thegrid_core::{TailscaleDevice, models::TailscaleDevicesResponse};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const API_BASE: &str = "https://api.tailscale.com/api/v2";
+const DEFAULT_API_BASE: &str = "https://api.tailscale.com/api/v2";
+const DEFAULT_TAILNET: &str = "-";
 const CACHE_DURATION: Duration = Duration::from_secs(300); // 5 minutes
 
 pub struct TailscaleClient {
@@ -15,6 +16,22 @@ pub struct TailscaleClient {
 }
 
 impl TailscaleClient {
+    fn api_base() -> String {
+        std::env::var("THEGRID_TAILSCALE_API_BASE")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_string())
+    }
+
+    fn tailnet_selector() -> String {
+        std::env::var("THEGRID_TAILNET")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_TAILNET.to_string())
+    }
+
     pub fn new(api_key: impl Into<String>) -> Result<Self> {
         let mut key: String = api_key.into();
         key = key.trim().to_string();
@@ -48,7 +65,11 @@ impl TailscaleClient {
             }
         }
 
-        let url = format!("{}/tailnet/-/devices", API_BASE);
+        let url = format!(
+            "{}/tailnet/{}/devices",
+            Self::api_base(),
+            Self::tailnet_selector()
+        );
         log::debug!("GET {}", url);
 
         let resp_result = self.http
