@@ -99,10 +99,11 @@ impl AgentServer {
     pub fn spawn(self) -> Result<()> {
         let port = self.port;
         let api_key_prefix: String = self.api_key.chars().take(8).collect();
-        let addr = format!("0.0.0.0:{}", self.port);
+        // Attempt dual-stack binding [::], fallback to IPv4-only 0.0.0.0
         std::fs::create_dir_all(&self.transfers_dir)?;
-        let server = Server::http(&addr)
-            .map_err(|e| anyhow::anyhow!("Starting HTTP server on {}: {}", addr, e))?;
+        let server = Server::http(format!("[::]:{}", self.port))
+            .or_else(|_| Server::http(format!("0.0.0.0:{}", self.port)))
+            .map_err(|e| anyhow::anyhow!("Starting HTTP server on port {}: {}", self.port, e))?;
         
         // Move self into the thread — this is why we don't need Arc<Self>
         std::thread::Builder::new()
@@ -1424,7 +1425,9 @@ pub struct AgentClient {
 impl AgentClient {
     pub fn new(ip: &str, port: u16, api_key: String) -> Result<Self> {
         let http = Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
-        Ok(Self { http, api_key, base_url: format!("http://{}:{}", ip, port) })
+        // FIX: IPv6 addresses must be wrapped in brackets for URLs
+        let ip_fmt = if ip.contains(':') { format!("[{}]", ip) } else { ip.to_string() };
+        Ok(Self { http, api_key, base_url: format!("http://{}:{}", ip_fmt, port) })
     }
 
     pub fn ping(&self) -> Result<AgentPingResponse> {

@@ -37,7 +37,7 @@ use serde::Deserialize;
 
 use thegrid_core::{AppEvent, Config};
 use thegrid_core::models::*;
-use thegrid_net::{TailscaleClient, RdpLauncher, AgentClient};
+use thegrid_net::{TailscaleClient, RdpLauncher, AgentClient, AgentServer};
 use thegrid_net::rdp::RdpResolution;
 use thegrid_runtime::AppRuntime;
 
@@ -1069,6 +1069,32 @@ impl TheGridApp {
             ai_panel:            AiPanelState::default(),
             media_ingest:        crate::views::media_ingest::MediaIngestState::default(),
             shell_launch:        if launch_args.has_shell_args() { Some(launch_args) } else { None },
+        }
+    }
+
+    /// Spawns the local THE GRID agent server.
+    fn spawn_agent_server(&self) {
+        let tx = self.event_tx.clone();
+        let config_arc = self.runtime.config.clone();
+        let config = self.config.clone();
+        let transfers_dir = config.effective_transfers_dir();
+
+        let mut server = AgentServer::new(
+            config.agent_port,
+            config.api_key.clone(),
+            transfers_dir,
+            tx,
+            config_arc
+        );
+
+        if !config.api_key.trim().is_empty() {
+            if let Ok(ts_client) = TailscaleClient::new(config.api_key.clone()) {
+                server = server.with_tailscale(Arc::new(ts_client));
+            }
+        }
+
+        if let Err(e) = server.spawn() {
+            log::error!("Failed to spawn local agent: {}", e);
         }
     }
 
@@ -2224,6 +2250,10 @@ impl TheGridApp {
                     }
 
                     self.devices = devices;
+
+                    // FIX: Immediate mesh sync on connect
+                    self.sync_all_nodes();
+
                     if let Some(selected_id) = previous_selected_id {
                         self.selected_idx = self.devices.iter().position(|d| d.id == selected_id);
                     }
@@ -2276,6 +2306,10 @@ impl TheGridApp {
                     self.settings     = SettingsState::from_config(&config);
                     self.config       = config;
                     self.screen       = Screen::Dashboard;
+
+                    // FIX: Start agent server with the NEW config
+                    self.spawn_agent_server();
+
                     self.spawn_load_devices();
                     self.runtime.spawn_load_persisted_duplicate_groups();
                 }
@@ -4567,6 +4601,9 @@ impl eframe::App for TheGridApp {
                         );
                         if done {
                             if self.config.is_configured() {
+                                // FIX: Start agent on boot if already set up
+                                self.spawn_agent_server();
+
                                 // Check if shell-launch args should override the target screen
                                 let target = self.apply_shell_launch();
                                 self.screen = target.unwrap_or(Screen::Dashboard);
