@@ -147,6 +147,7 @@ impl DriveClient {
         }
     }
 
+    // GUI_HOOK: Settings → GoogleDrive panel — show "Connect" button when false, "Connected" badge + email when true.
     pub fn is_authorized(&self) -> bool {
         self.tokens.is_some()
     }
@@ -159,6 +160,7 @@ impl DriveClient {
     ///   3. Wait up to 5 minutes for the redirect.
     ///   4. Exchange the authorization code for tokens.
     ///   5. Persist the tokens to disk.
+    // GUI_HOOK: Settings → GoogleDrive panel — "Connect" button triggers this; show "Waiting for browser…" spinner for up to 5 min; on Ok emit DriveAuthorized; on Err show error toast.
     pub fn authorize(&mut self) -> Result<()> {
         let state = uuid::Uuid::new_v4().to_string();
         let auth_url = format!(
@@ -258,6 +260,7 @@ impl DriveClient {
 
     // ── Drive API ─────────────────────────────────────────────────────────────
 
+    // GUI_HOOK: Settings → GoogleDrive panel — display email address + storage quota gauge (used / limit) after connect or on panel open.
     pub fn get_about(&mut self) -> Result<DriveAbout> {
         let token = self.access_token()?;
         let resp: AboutResponse = self.http
@@ -276,6 +279,7 @@ impl DriveClient {
 
     /// Page through all Drive files and emit `DriveIndexProgress` events.
     /// Returns all file metadata collected.
+    // GUI_HOOK: Settings → GoogleDrive panel — "Sync Now" button triggers this; show live indexed-count progress bar via DriveIndexProgress; show final count on DriveIndexComplete.
     pub fn index_all_files(
         &mut self,
         event_tx: &mpsc::Sender<AppEvent>,

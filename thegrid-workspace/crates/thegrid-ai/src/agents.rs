@@ -66,17 +66,20 @@ impl Sentinel {
     }
 
     /// Signal that the user is active (call on any UI interaction).
+    // GUI_HOOK: App-wide — called on every mouse/key event to reset the AFK timer; resets tint to GREEN.
     pub fn user_active(&self) {
         *self.last_active.lock().unwrap() = Instant::now();
         self.transition_to(SecurityStance::Active);
     }
 
     /// Force AFK tactical lock immediately (used by GUI idle detector).
+    // GUI_HOOK: App-wide — shows AFK lock overlay, tints UI AMBER, blurs sensitive panels.
     pub fn lock_afk(&self) {
         self.transition_to(SecurityStance::AfkTacticalLock);
     }
 
     /// Trigger a high-value-target lock (call before destructive operations).
+    // GUI_HOOK: App-wide — shows HVT confirmation modal with action_description; tints UI RED.
     pub fn request_hvt_lock(&self, action_description: String) {
         self.transition_to(SecurityStance::HighValueTarget { action_description });
     }
@@ -155,6 +158,7 @@ impl Librarian {
     /// - `peer_clients`: map of device_id → AgentClient for each reachable peer.
     ///
     /// Emits `AppEvent::LibrarianSearchResult` on completion.
+    // GUI_HOOK: GlobalSearch → ResultsPanel — triggered by search bar submit; shows per-peer result rows with device badges and score indicators.
     pub fn search_distributed(
         &self,
         query: String,
@@ -192,6 +196,7 @@ impl Librarian {
 
     /// Optionally expand a terse query into a more semantic form using local inference.
     /// Returns the original query if inference is unavailable.
+    // GUI_HOOK: GlobalSearch → SearchBar — show "Expanding query…" spinner while inference runs; replace input text with expanded form on completion.
     pub fn expand_query(&self, query: &str) -> String {
         let Some(inf) = &self.inference else {
             return query.to_string();
@@ -265,6 +270,7 @@ impl Courier {
     ///
     /// The transfer runs in a background thread and emits `CourierProgress`,
     /// `CourierComplete`, or `CourierFailed` events.
+    // GUI_HOOK: Transfers → ActiveTransfersList — adds a new row with progress bar; updates bytes_done live via CourierProgress; removes row (or moves to history) on Complete/Failed.
     pub fn send(
         self: &Arc<Self>,
         file_path: std::path::PathBuf,
@@ -301,11 +307,7 @@ impl Courier {
 
         self.transfers.lock().unwrap().insert(transfer_id.clone(), transfer.clone());
 
-        let event_tx  = self.event_tx.clone();
-        let transfers = Arc::clone(&Arc::new(Mutex::new(
-            self.transfers.lock().unwrap().clone()
-        )));
-
+        let event_tx = self.event_tx.clone();
         let tid = transfer_id.clone();
         std::thread::Builder::new()
             .name(format!("agent-courier-{}", &transfer_id[..12]))
@@ -375,6 +377,30 @@ impl Courier {
                                 bytes_total: total_bytes,
                                 peer_device: peer_device.clone(),
                             });
+                        }
+                        Ok(r) if r.status().as_u16() == 409 => {
+                            // Server has a partial upload at a different offset — seek file and resume.
+                            #[derive(serde::Deserialize)]
+                            struct OffsetReply { expected_offset: Option<u64> }
+                            if let Ok(body) = r.json::<OffsetReply>() {
+                                if let Some(expected) = body.expected_offset {
+                                    use std::io::Seek;
+                                    if let Err(e) = file.seek(std::io::SeekFrom::Start(expected)) {
+                                        emit(&event_tx, AppEvent::CourierFailed {
+                                            transfer_id: tid,
+                                            error: format!("Seek to resume offset {} failed: {}", expected, e),
+                                        });
+                                        return;
+                                    }
+                                    offset = expected;
+                                    continue;
+                                }
+                            }
+                            emit(&event_tx, AppEvent::CourierFailed {
+                                transfer_id: tid,
+                                error: format!("Peer returned 409 at offset {} with no expected_offset", offset),
+                            });
+                            return;
                         }
                         Ok(r) => {
                             emit(&event_tx, AppEvent::CourierFailed {
