@@ -47,7 +47,6 @@ use crate::views::dashboard::{
 };
 use crate::views::search::SearchPanelState;
 use crate::views::setup::SetupState;
-use crate::views::media_ingest::MediaResizePreset;
 use crate::views::timeline::TimelineState;
 use crate::views::terminal::TerminalView;
 
@@ -570,7 +569,35 @@ pub struct NodeCrosscheckSummary {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub enum CommandAction {
+    SendToNode { file_path: PathBuf, target_device: String },
+    OpenRdp    { device_id: String },
+    SyncIndex,
+    KillProcess { pid: u32 },
+}
+
+#[derive(Debug, Clone)]
+pub enum CommandResult {
+    FileResult(FileSearchResult),
+    ActionResult { label: String, action: CommandAction },
+}
+
+#[derive(Default)]
+pub struct CommandPaletteState {
+    pub open:    bool,
+    pub input:   String,
+    pub results: Vec<CommandResult>,
+    pub selected: usize,
+}
+
 pub struct TheGridApp {
+    // ── Phase 4: Symbiosis & Security ──────────────────────────────────────
+    ai_processing: bool,
+    stance: SecurityStance,
+    last_activity: std::time::Instant,
+    command_palette: CommandPaletteState,
+
     // ── State machine ─────────────────────────────────────────────────────────
     screen:      Screen,
     nav_history: Vec<Screen>,
@@ -639,6 +666,7 @@ pub struct TheGridApp {
     semantic_loading:   bool,
     startup_services_dispatched: bool,
     startup_services_ready: bool,
+    boot_completion_started_at: Option<std::time::Instant>,
     startup_status: String,
     embedding_progress: (usize, usize),
     hashing_progress:   (usize, usize),
@@ -726,6 +754,10 @@ pub struct TheGridApp {
 
     // ── Media Ingest / Culling ────────────────────────────────────────────────
     media_ingest:      crate::views::media_ingest::MediaIngestState,
+
+    // ── A5: Tool Health ───────────────────────────────────────────────────────
+    tool_health:       Option<thegrid_core::ToolHealthReport>,
+    tool_health_open:  bool,
 
     // ── Shell-launch args (processed once on first frame) ─────────────────────
     shell_launch:      Option<crate::cli::LaunchArgs>,
@@ -1024,6 +1056,7 @@ impl TheGridApp {
             semantic_loading:  true,
             startup_services_dispatched: false,
             startup_services_ready: false,
+            boot_completion_started_at: None,
             startup_status: "Preparing startup...".to_string(),
             embedding_progress: (0, 0),
             hashing_progress:   (0, 0),
@@ -1068,7 +1101,15 @@ impl TheGridApp {
             project_add:         ProjectAddState::default(),
             ai_panel:            AiPanelState::default(),
             media_ingest:        crate::views::media_ingest::MediaIngestState::default(),
+            tool_health:         None,
+            tool_health_open:    false,
             shell_launch:        if launch_args.has_shell_args() { Some(launch_args) } else { None },
+
+            // --- Phase 4: Symbiosis & Security ---
+            ai_processing: false,
+            stance: SecurityStance::default(),
+            last_activity: std::time::Instant::now(),
+            command_palette: CommandPaletteState::default(),
         }
     }
 
@@ -1528,6 +1569,7 @@ impl TheGridApp {
 
     #[allow(dead_code)]
     fn spawn_fm_delete(&self, ip: String, _device_id: String, paths: Vec<String>) {
+        self.runtime.request_high_value_lock("delete files");
         let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
         let tx = self.event_tx.clone();
@@ -1551,6 +1593,7 @@ impl TheGridApp {
     }
 
     fn spawn_fm_rename(&self, ip: String, _device_id: String, old_path: String, new_name: String) {
+        self.runtime.request_high_value_lock("rename file");
         let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
         let tx = self.event_tx.clone();
@@ -1566,6 +1609,7 @@ impl TheGridApp {
     }
 
     fn spawn_fm_move(&self, ip: String, _device_id: String, paths: Vec<String>, dest_dir: PathBuf) {
+        self.runtime.request_high_value_lock("move files");
         let port = self.config.agent_port;
         let api_key = self.config.api_key.clone();
         let tx = self.event_tx.clone();
@@ -1757,6 +1801,7 @@ impl TheGridApp {
     }
 
     fn spawn_rich_dedup_delete(&mut self, files: Vec<FileSearchResult>) {
+        self.runtime.request_high_value_lock("dedup delete files");
         let db        = Arc::clone(&self.runtime.db);
         let tx        = self.event_tx.clone();
         let local_dev = self.config.device_name.clone();
@@ -1802,6 +1847,7 @@ impl TheGridApp {
     }
 
     fn spawn_delete_duplicate_files(&mut self, files: Vec<(i64, std::path::PathBuf, String)>, filter: DuplicateScanFilter) {
+        self.runtime.request_high_value_lock("delete duplicate files");
         let db = Arc::clone(&self.runtime.db);
         let runtime = Arc::clone(&self.runtime);
         let tx = self.event_tx.clone();
@@ -2658,8 +2704,13 @@ impl TheGridApp {
                     self.runtime.spawn_idle_work();
                 }
                 
-                AppEvent::UserIdle(_) => {
-                    // Could pause indexing here if needed
+                AppEvent::UserIdle(idle) => {
+                    self.runtime.set_user_idle(idle);
+                    if idle {
+                        self.push_toast(Toast::info("User idle detected: Sentinel AFK lock engaged"));
+                    } else {
+                        self.push_toast(Toast::info("User active: Sentinel returned to Active stance"));
+                    }
                 }
                 AppEvent::IndexUpdated { paths_updated } => {
                     if paths_updated > 0 {
@@ -2710,6 +2761,67 @@ impl TheGridApp {
                     rev.pick_flag = pick_flag;
                     rev.color_label = color_label;
                     self.media_ingest.sort_dirty = true;
+                }
+
+                AppEvent::MediaJobQueued { job_id, kind, total_items } => {
+                    self.media_ingest.media_jobs.push(crate::views::media_ingest::MediaJobUiEntry {
+                        job_id,
+                        kind,
+                        status: "queued".to_string(),
+                        done: 0,
+                        total: total_items,
+                        current_file: None,
+                    });
+                    self.push_toast(Toast::info("Media job queued"));
+                }
+
+                AppEvent::MediaJobStarted { job_id } => {
+                    if let Some(job) = self.media_ingest.media_jobs.iter_mut().find(|j| j.job_id == job_id) {
+                        job.status = "running".to_string();
+                    }
+                }
+
+                AppEvent::MediaJobProgress { job_id, done, total, current_file } => {
+                    if let Some(job) = self.media_ingest.media_jobs.iter_mut().find(|j| j.job_id == job_id) {
+                        job.status = "running".to_string();
+                        job.done = done;
+                        job.total = total;
+                        job.current_file = Some(current_file);
+                    }
+                }
+
+                AppEvent::MediaJobComplete { job_id, outputs } => {
+                    if let Some(job) = self.media_ingest.media_jobs.iter_mut().find(|j| j.job_id == job_id) {
+                        job.status = "done".to_string();
+                        job.done = job.total;
+                        job.current_file = None;
+                    }
+                    self.push_toast(Toast::ok(format!("Media job complete: {} output(s)", outputs.len())));
+                }
+
+                AppEvent::MediaJobFailed { job_id, error } => {
+                    if let Some(job) = self.media_ingest.media_jobs.iter_mut().find(|j| j.job_id == job_id) {
+                        job.status = "failed".to_string();
+                        job.current_file = Some(error.clone());
+                    }
+                    self.push_toast(Toast::err(format!("Media job failed: {}", error)));
+                }
+
+                // ── A5: Tool Health ───────────────────────────────────────────
+                AppEvent::ToolHealthUpdated(report) => {
+                    
+                    let tier = report.tier;
+                    let missing = report.missing_hints().len();
+                    if missing > 0 {
+                        self.push_toast(Toast::info(format!(
+                            "Tool health: {} — {} tool(s) missing. Click the tier badge for details.",
+                            report.tier.label(),
+                            missing,
+                        )));
+                    } else {
+                        log::info!("[ToolHealth] All tools present — {}", tier.label());
+                    }
+                    self.tool_health = Some(report);
                 }
 
                 AppEvent::DuplicatesFound(groups) => {
@@ -3297,6 +3409,92 @@ impl TheGridApp {
                     log::info!("[AI] Agent worker activated with model={}", model);
                 }
 
+                // ── Phase 4: Symbiosis & Security ──────────────────────────────
+                AppEvent::SecurityStanceChanged(stance) => {
+                    self.stance = stance;
+                    self.push_toast(Toast::info(format!("Security Stance: {:?}", self.stance)));
+                }
+
+                AppEvent::AgentAlert { agent, level, message } => {
+                    match level.as_str() {
+                        "critical" => self.push_toast(Toast::err(format!("[{}] {}", agent, message))),
+                        "warn" => self.push_toast(Toast::info(format!("[{}] {}", agent, message))),
+                        _ => self.push_toast(Toast::info(format!("[{}] {}", agent, message))),
+                    }
+                }
+
+                AppEvent::LibrarianSearchResult { query, results, peer_results } => {
+                    let peer_count = peer_results.len();
+                    self.set_status(format!(
+                        "Librarian search '{}': local {} hits, {} peer node(s)",
+                        query,
+                        results.len(),
+                        peer_count
+                    ));
+                }
+
+                AppEvent::CourierProgress { transfer_id: _, file_name, bytes_done, bytes_total, peer_device } => {
+                    let pct = if bytes_total == 0 {
+                        0.0
+                    } else {
+                        (bytes_done as f32 / bytes_total as f32) * 100.0
+                    };
+                    self.set_status(format!(
+                        "Courier {} -> {}: {:.1}%",
+                        file_name,
+                        peer_device,
+                        pct
+                    ));
+                }
+
+                AppEvent::CourierComplete { transfer_id: _, file_name, peer_device } => {
+                    self.push_toast(Toast::ok(format!(
+                        "Courier transfer complete: {} -> {}",
+                        file_name,
+                        peer_device
+                    )));
+                }
+
+                AppEvent::CourierFailed { transfer_id: _, error } => {
+                    self.push_toast(Toast::err(format!("Courier transfer failed: {}", error)));
+                }
+
+                AppEvent::FabricIntentInterpreted { raw_input, intent } => {
+                    self.push_toast(Toast::ok(format!("Intent: {}", intent.intent)));
+                    log::info!("[Symbiosis] Intent interpreted: {:?} from input: {}", intent, raw_input);
+
+                    // Dispatch to Ruflo Swarm
+                    let tx = self.event_tx.clone();
+                    let swarm_url = self.config.ruflo_swarm_url.clone();
+                    let ruflo_path = self.config.ruflo_path.clone();
+                    let client = thegrid_ai::symbiosis::SwarmClient::new(&swarm_url, ruflo_path);
+
+                    std::thread::spawn(move || {
+                        match client.dispatch_task(&intent) {
+                            Ok(task_id) => {
+                                let _ = tx.send(AppEvent::RufloTaskAccepted { task_id, intent });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(AppEvent::RufloTaskFailed { task_id: "unknown".into(), error: e.to_string() });
+                            }
+                        }
+                    });
+                }
+                AppEvent::FabricFailed(error) => {
+                    self.push_toast(Toast::err(format!("Fabric failed: {}", error)));
+                    log::error!("[Symbiosis] Fabric failed: {}", error);
+                }
+
+                AppEvent::RufloTaskAccepted { task_id, intent } => {
+                    self.push_toast(Toast::ok(format!("Swarm task accepted: {}", task_id)));
+                    self.set_status(format!("Task {} in progress: {}", task_id, intent.intent));
+                }
+
+                AppEvent::RufloTaskFailed { task_id, error } => {
+                    self.push_toast(Toast::err(format!("Swarm task {} failed: {}", task_id, error)));
+                    log::error!("[Symbiosis] Ruflo task {} failed: {}", task_id, error);
+                }
+
                 _ => {}
             }
         }
@@ -3394,94 +3592,6 @@ impl TheGridApp {
             } else {
                 let _ = tx.send(AppEvent::FilePreviewLoaded { file_id: file.id, content: String::new(), kind });
             }
-        });
-    }
-
-    fn spawn_media_resize(
-        &mut self,
-        files: Vec<thegrid_core::models::FileSearchResult>,
-        preset: MediaResizePreset,
-        replace_original: bool,
-    ) {
-        if files.is_empty() {
-            self.push_toast(Toast::info("No files selected for resize."));
-            return;
-        }
-
-        let count = files.len();
-        let mode = if replace_original { "replace" } else { "copy" };
-        self.set_status(format!(
-            "Resize started: {} files [{} / {}]",
-            count,
-            preset.label(),
-            mode
-        ));
-
-        let tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            let mut ok = 0usize;
-            let mut skipped = 0usize;
-            let mut failed = 0usize;
-
-            for file in files {
-                let ext = file.ext.clone().unwrap_or_default().to_lowercase();
-                if !is_resizable_ext(&ext) {
-                    skipped += 1;
-                    continue;
-                }
-
-                let bytes = match std::fs::read(&file.path) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        failed += 1;
-                        continue;
-                    }
-                };
-
-                let img = match image::load_from_memory(&bytes) {
-                    Ok(i) => i,
-                    Err(_) => {
-                        failed += 1;
-                        continue;
-                    }
-                };
-
-                let resized = resize_for_preset(img, preset);
-                let target = if replace_original {
-                    file.path.clone()
-                } else {
-                    resize_copy_path(&file.path, preset.suffix(), &ext)
-                };
-
-                let save_result = if ext == "jpg" || ext == "jpeg" {
-                    let mut out = std::io::BufWriter::new(match std::fs::File::create(&target) {
-                        Ok(f) => f,
-                        Err(_) => {
-                            failed += 1;
-                            continue;
-                        }
-                    });
-                    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
-                    encoder.encode_image(&resized)
-                } else {
-                    resized.save(&target)
-                };
-
-                if save_result.is_ok() {
-                    ok += 1;
-                } else {
-                    failed += 1;
-                }
-            }
-
-            let _ = tx.send(AppEvent::Status(format!(
-                "Resize done [{} / {}]: {} ok, {} skipped, {} failed",
-                preset.label(),
-                mode,
-                ok,
-                skipped,
-                failed
-            )));
         });
     }
 
@@ -3919,7 +4029,7 @@ impl TheGridApp {
         }
     }
 
-    fn render_statusbar(&self, ctx: &Context) {
+    fn render_statusbar(&mut self, ctx: &Context) {
         egui::TopBottomPanel::bottom("statusbar")
             .exact_height(24.0)
             .frame(egui::Frame::none()
@@ -3954,9 +4064,25 @@ impl TheGridApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(14.0);
                         ui.label(RichText::new(&self.status_msg).color(Colors::TEXT_DIM).size(9.0));
+
+                        // ── A5: Tool Health badge ──────────────────────────
+                        if let Some(report) = &self.tool_health {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("|").color(Colors::BORDER).size(9.0));
+                            ui.add_space(4.0);
+                            let clicked = crate::views::tool_health::render_tool_health_badge(ui, report);
+                            if clicked { self.tool_health_open = !self.tool_health_open; }
+                        }
                     });
                 });
             });
+
+        // Tool health modal (rendered over everything)
+        if self.tool_health_open {
+            if let Some(report) = self.tool_health.clone() {
+                crate::views::tool_health::render_tool_health_modal(ctx, &mut self.tool_health_open, &report);
+            }
+        }
     }
 
     fn render_toasts(&mut self, ctx: &Context) {
@@ -4025,6 +4151,37 @@ impl TheGridApp {
         if actions.update_node {
             self.push_toast(Toast::info(format!("Triggering update on {}...", ip)));
             self.spawn_trigger_remote_update(ip.to_string(), device_id.to_string());
+        }
+
+        if actions.open_local_projects {
+            let path = self.config.effective_transfers_dir();
+            #[cfg(target_os = "windows")]
+            let _ = std::process::Command::new("explorer.exe").arg(&path).spawn();
+            #[cfg(not(target_os = "windows"))]
+            let _ = std::process::Command::new("open").arg(&path).spawn();
+            self.push_toast(Toast::info("Opening local projects folder..."));
+        }
+
+        if actions.open_local_logs {
+            let log_path = std::env::current_dir().unwrap_or_default().join("thegrid.log");
+            if log_path.exists() {
+                #[cfg(target_os = "windows")]
+                let _ = std::process::Command::new("cmd").args(&["/C", "start", "", log_path.to_str().unwrap()]).spawn();
+                #[cfg(not(target_os = "windows"))]
+                let _ = std::process::Command::new("open").arg(&log_path).spawn();
+                self.push_toast(Toast::info("Opening system logs..."));
+            } else {
+                self.push_toast(Toast::info("Log file not found on disk."));
+            }
+        }
+
+        if actions.export_database {
+            // Surprise: Actually trigger a config and state backup
+            if let Err(e) = self.config.save() {
+                self.push_toast(Toast::err(format!("Backup failed: {}", e)));
+            } else {
+                self.push_toast(Toast::ok("Local state exported to config.json"));
+            }
         }
 
         if actions.load_clipboard {
@@ -4282,6 +4439,93 @@ impl TheGridApp {
 
     }
 
+    fn render_command_palette(&mut self, ctx: &egui::Context) {
+        if !self.command_palette.open { return; }
+
+        egui::Area::new(egui::Id::new("command_palette_area"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 100.0))
+            .show(ctx, |ui| {
+                let frame = egui::Frame::none()
+                    .fill(Colors::BG_PANEL)
+                    .stroke(egui::Stroke::new(1.0, Colors::GREEN_DIM))
+                    .inner_margin(egui::Margin::same(12.0));
+
+                frame.show(ui, |ui| {
+                    ui.set_width(600.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("⬢").color(Colors::GREEN).size(20.0));
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.command_palette.input)
+                                .hint_text("Search files or ask the swarm (Ctrl+K)...")
+                                .font(egui::FontId::new(14.0, egui::FontFamily::Monospace))
+                                .desired_width(f32::INFINITY)
+                                .frame(false)
+                        );
+                        response.request_focus();
+
+                        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            let input = self.command_palette.input.clone();
+                            if !input.trim().is_empty() {
+                                self.dispatch_palette_command(input);
+                                self.command_palette.open = false;
+                            }
+                        }
+
+                        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.command_palette.open = false;
+                        }
+                    });
+
+                    if !self.command_palette.results.is_empty() {
+                        ui.add(egui::Separator::default().spacing(10.0));
+                        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                            for (i, result) in self.command_palette.results.iter().enumerate() {
+                                let selected = i == self.command_palette.selected;
+                                let _bg = if selected { Color32::from_rgb(0, 30, 10) } else { Color32::TRANSPARENT };
+                                
+                                ui.group(|ui| {
+                                    ui.set_width(ui.available_width());
+                                    match result {
+                                        CommandResult::FileResult(f) => {
+                                            ui.label(format!("FILE: {}", f.name));
+                                        }
+                                        CommandResult::ActionResult { label, .. } => {
+                                            ui.label(format!("ACTION: {}", label));
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+            });
+    }
+
+    fn dispatch_palette_command(&mut self, input: String) {
+        log::info!("[Symbiosis] Dispatching command from palette: {}", input);
+        self.push_toast(Toast::info("Swarm interpreting intent..."));
+
+        let tx = self.event_tx.clone();
+        let fabric_path  = self.config.fabric_path.clone();
+        let ai_policy    = self.config.ai_policy.clone();
+        let fabric_model = self.config.fabric_model.clone();
+        std::thread::spawn(move || {
+            match thegrid_ai::symbiosis::Interpreter::refine(
+                &input,
+                fabric_path,
+                &ai_policy,
+                fabric_model.as_deref(),
+            ) {
+                Ok(intent) => {
+                    let _ = tx.send(AppEvent::FabricIntentInterpreted { raw_input: input, intent });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::FabricFailed(e.to_string()));
+                }
+            }
+        });
+    }
     // ── Remote Terminal Spawners ─────────────────────────────────────────────
 
     fn spawn_create_terminal_session(&mut self, ip: String, device_id: String) {
@@ -4470,6 +4714,15 @@ impl eframe::App for TheGridApp {
         if mouse_back || alt_left  { self.navigate_back(); }
         if mouse_fwd  || alt_right { self.navigate_forward(); }
 
+        let ctrl_k       = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K));
+        if ctrl_k {
+            self.command_palette.open = !self.command_palette.open;
+            if self.command_palette.open {
+                self.command_palette.input.clear();
+                self.command_palette.results.clear();
+            }
+        }
+
         if ctrl_f && self.screen == Screen::Dashboard {
             self.search.open = !self.search.open;
         }
@@ -4593,13 +4846,26 @@ impl eframe::App for TheGridApp {
                     .show(ctx, |ui| {
                         self.dispatch_startup_services();
                         let elapsed = self.boot_start.elapsed().as_secs_f32();
+                        if self.startup_services_ready
+                            && elapsed >= crate::views::boot::MIN_BOOT_DURATION
+                            && self.boot_completion_started_at.is_none()
+                        {
+                            self.boot_completion_started_at = Some(std::time::Instant::now());
+                        }
+
+                        let completion_elapsed = self
+                            .boot_completion_started_at
+                            .map(|started| started.elapsed().as_secs_f32());
+
                         let done = crate::views::boot::render(
                             ui,
                             elapsed,
                             &self.startup_status,
                             self.startup_services_ready,
+                            completion_elapsed,
                         );
                         if done {
+                            self.boot_completion_started_at = None;
                             if self.config.is_configured() {
                                 // FIX: Start agent on boot if already set up
                                 self.spawn_agent_server();
@@ -4880,6 +5146,11 @@ impl eframe::App for TheGridApp {
                         .collect();
                     new_config.google_client_id     = if self.settings.google_client_id.trim().is_empty() { None } else { Some(self.settings.google_client_id.trim().to_string()) };
                     new_config.google_client_secret = if self.settings.google_client_secret.trim().is_empty() { None } else { Some(self.settings.google_client_secret.trim().to_string()) };
+                    new_config.fabric_path = if self.settings.fabric_path.trim().is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(self.settings.fabric_path.trim()))
+                    };
 
                     match new_config.save() {
                         Ok(_) => {
@@ -4994,18 +5265,22 @@ impl eframe::App for TheGridApp {
                     if self.idle_notified {
                         self.idle_notified = false;
                         log::info!("User returned from idle, pausing background tasks");
+                        let _ = self.event_tx.send(AppEvent::UserIdle(false));
                     }
                 }
 
                 if !self.idle_notified && now.duration_since(self.last_input_at).as_secs() > 600 {
                     self.idle_notified = true;
                     log::info!("System idled for 10m, requesting background tasks resume");
+                    let _ = self.event_tx.send(AppEvent::UserIdle(true));
                     let _ = self.event_tx.send(AppEvent::RequestIdleWork);
                 }
 
                 self.render_viewport_panel(ctx);
 
                 self.render_toasts(ctx);
+
+                self.render_command_palette(ctx);
 
                 // --- Phase 3: Periodic Sync ---
                 if self.mesh_sync_last_at.elapsed().as_secs() > 120 {
@@ -5224,10 +5499,14 @@ impl eframe::App for TheGridApp {
                         .inner_margin(egui::Margin::same(12.0))
                     )
                     .show(ctx, |ui| {
-                        let actions = crate::views::media_ingest::render_media_ingest(
+                        let mut actions = crate::views::media_ingest::render_media_ingest(
                             ui,
                             &mut self.media_ingest,
                         );
+
+                        // Render floating edit and audio cleanup windows (allows user interaction)
+                        crate::views::media_ingest::render_edit_window(ui.ctx(), &mut self.media_ingest, &mut actions);
+                        crate::views::media_ingest::render_audio_cleanup_window(ui.ctx(), &mut self.media_ingest, &mut actions);
 
                         // Trigger search if debounce fired or Enter pressed
                         if actions.trigger_search {
@@ -5260,7 +5539,58 @@ impl eframe::App for TheGridApp {
                                 .filter(|f| req.file_ids.contains(&f.id))
                                 .cloned()
                                 .collect();
-                            self.spawn_media_resize(selected, req.preset, req.replace_original);
+                            let preset = req.preset.suffix().to_string();
+                            let count = selected.len();
+                            match self.runtime.enqueue_media_resize_job(
+                                selected,
+                                &preset,
+                                req.replace_original,
+                                None,
+                                None,
+                            ) {
+                                Ok(job_id) => {
+                                    self.set_status(format!("Media job queued: {} ({} files)", job_id, count));
+                                }
+                                Err(e) => {
+                                    self.push_toast(Toast::err(format!("Failed to queue media job: {}", e)));
+                                }
+                            }
+                        }
+
+                        // Manual edit request from the edit panel
+                        if let Some(req) = actions.edit_request {
+                            match self.runtime.enqueue_media_edit_job(
+                                req.file.clone(),
+                                &req.ops_json,
+                                req.replace_original,
+                            ) {
+                                Ok(_job_id) => {
+                                    let mode = if req.replace_original { "replace original" } else { "save copy" };
+                                    self.set_status(format!("Edit queued: {} ({})", req.file.name, mode));
+                                    self.push_toast(Toast::info(format!("Edit job queued for {}", req.file.name)));
+                                }
+                                Err(e) => {
+                                    self.push_toast(Toast::err(format!("Failed to queue edit: {}", e)));
+                                }
+                            }
+                        }
+
+                        // Audio cleanup request
+                        if let Some(req) = actions.audio_cleanup_request {
+                            match self.runtime.enqueue_audio_cleanup_job(
+                                req.file.clone(),
+                                &req.ops_json,
+                                req.replace_original,
+                            ) {
+                                Ok(_job_id) => {
+                                    let mode = if req.replace_original { "replace original" } else { "save copy" };
+                                    self.set_status(format!("Audio cleanup queued: {} ({})", req.file.name, mode));
+                                    self.push_toast(Toast::info(format!("Audio cleanup queued for {}", req.file.name)));
+                                }
+                                Err(e) => {
+                                    self.push_toast(Toast::err(format!("Failed to queue audio cleanup: {}", e)));
+                                }
+                            }
                         }
 
                         // In Media Ingest we keep a single inline preview surface only.
@@ -5604,25 +5934,3 @@ impl TheGridApp {
     }
 }
 
-fn is_resizable_ext(ext: &str) -> bool {
-    matches!(
-        ext,
-        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tif" | "tiff"
-    )
-}
-
-fn resize_for_preset(img: image::DynamicImage, preset: MediaResizePreset) -> image::DynamicImage {
-    match preset {
-        MediaResizePreset::Print => img.resize(4961, 3508, image::imageops::FilterType::Lanczos3),
-        MediaResizePreset::Social => img.resize(1080, 1080, image::imageops::FilterType::Lanczos3),
-        MediaResizePreset::Ads => img.resize(1200, 628, image::imageops::FilterType::Lanczos3),
-        MediaResizePreset::Free => img.resize(1600, 1600, image::imageops::FilterType::Lanczos3),
-    }
-}
-
-fn resize_copy_path(path: &std::path::Path, suffix: &str, ext_hint: &str) -> std::path::PathBuf {
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or(ext_hint);
-    parent.join(format!("{}_{}_copy.{}", stem, suffix, ext))
-}

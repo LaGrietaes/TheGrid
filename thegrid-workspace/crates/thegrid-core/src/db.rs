@@ -171,6 +171,50 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_media_review_rating ON media_review(rating);
             CREATE INDEX IF NOT EXISTS idx_media_review_pick ON media_review(pick_flag);
 
+            -- ── Media Care queue (Milestone A) ─────────────────────────
+            CREATE TABLE IF NOT EXISTS media_jobs (
+                id          TEXT PRIMARY KEY,
+                kind        TEXT    NOT NULL,
+                status      TEXT    NOT NULL,
+                priority    INTEGER NOT NULL DEFAULT 5,
+                created_at  INTEGER NOT NULL,
+                started_at  INTEGER,
+                finished_at INTEGER,
+                error       TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_jobs_status_priority
+                ON media_jobs(status, priority, created_at);
+
+            CREATE TABLE IF NOT EXISTS media_job_items (
+                id           TEXT PRIMARY KEY,
+                job_id       TEXT    NOT NULL REFERENCES media_jobs(id) ON DELETE CASCADE,
+                file_id      INTEGER REFERENCES files(id) ON DELETE SET NULL,
+                input_path   TEXT    NOT NULL,
+                output_path  TEXT,
+                status       TEXT    NOT NULL,
+                step         TEXT,
+                metrics_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_job_items_job ON media_job_items(job_id);
+
+            CREATE TABLE IF NOT EXISTS media_job_ops (
+                id          TEXT PRIMARY KEY,
+                job_id      TEXT    NOT NULL REFERENCES media_jobs(id) ON DELETE CASCADE,
+                op_index    INTEGER NOT NULL,
+                op_type     TEXT    NOT NULL,
+                params_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_job_ops_job ON media_job_ops(job_id, op_index);
+
+            CREATE TABLE IF NOT EXISTS media_job_artifacts (
+                id           TEXT PRIMARY KEY,
+                job_item_id  TEXT    NOT NULL REFERENCES media_job_items(id) ON DELETE CASCADE,
+                artifact_type TEXT   NOT NULL,
+                path         TEXT    NOT NULL,
+                meta_json    TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_job_artifacts_item ON media_job_artifacts(job_item_id);
+
             CREATE TABLE IF NOT EXISTS known_devices (
                 device_id   TEXT PRIMARY KEY,
                 device_name TEXT NOT NULL,
@@ -285,6 +329,7 @@ impl Database {
     }
 
     // ── Device registry ───────────────────────────────────────────────────
+    // GUI_HOOK: Dashboard → NodeGrid — called when a device pings in; refreshes card list.
 
     pub fn upsert_device(&self, device_id: &str, device_name: &str) -> Result<()> {
         let now = unix_now();
@@ -300,6 +345,8 @@ impl Database {
     }
 
     // ── File indexing ─────────────────────────────────────────────────────
+    // GUI_HOOK: Dashboard → IndexProgress widget — each call increments scan_progress;
+    // drives the progress bar and files/sec rate display.
 
     pub fn index_file(
         &self,
@@ -397,6 +444,8 @@ impl Database {
         Ok(())
     }
 
+    // GUI_HOOK: MediaCare → Gallery — triggers thumbnail re-render with AI tags overlay;
+    // quality_score, focus_score, in_focus badge updated in-place on the card.
     pub fn update_ai_metadata(&self, id: i64, metadata_json: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE files SET ai_metadata = ?1 WHERE id = ?2",
@@ -405,6 +454,8 @@ impl Database {
         Ok(())
     }
 
+    // GUI_HOOK: CleanUp → DuplicateGroups panel — populates the full group list on load;
+    // total wasted bytes = sum of (size * (file_count - 1)) across groups, shown in header.
     pub fn get_duplicate_groups(&self) -> Result<Vec<(String, u64, Vec<FileSearchResult>)>> {
         // Single query: self-join to find only hashes that appear more than once,
         // then fetch all matching file rows in one pass. Holds the lock for one
@@ -447,6 +498,8 @@ impl Database {
 
     /// Cross-device duplicate stats for a specific machine vector.
     /// Uses cached mesh index data, so peers do not need to be online.
+    // GUI_HOOK: Dashboard → NodeGrid card → duplicate badge (groups, files, bytes wasted);
+    // NodeDetail → DuplicatesTab — detailed cross-device duplication breakdown.
     pub fn crosscheck_duplicates_for_device(&self, target_device_id: &str) -> Result<(u64, u64, u64, u64)> {
         let mut stmt = self.conn.prepare(
             "SELECT hash, size,
@@ -506,6 +559,8 @@ impl Database {
     }
 
     // ── Phase 2: Rules & Smart Filters ────────────────────────────────────
+    // GUI_HOOK: Settings → RulesPanel — CRUD for glob/regex auto-tagging rules;
+    // changes take effect on next watcher event or manual re-scan.
 
     pub fn add_rule(&self, name: &str, pattern: &str, project: Option<&str>, tag: Option<&str>) -> Result<i64> {
         self.conn.execute(
@@ -560,6 +615,8 @@ impl Database {
         Ok(())
     }
 
+    // GUI_HOOK: MediaCare → ReviewPanel — called when user clicks star rating, pick/reject button,
+    // or color label; immediately persists and updates the visible card state.
     pub fn set_media_review(
         &self,
         file_id: i64,
@@ -759,6 +816,8 @@ impl Database {
     }
 
     // ── Phase 4: Semantic AI ──────────────────────────────────────────────
+    // GUI_HOOK: Dashboard → AIQueue indicator — shows pending embedding / hash / media-AI counts
+    // as background-worker badges. Each count_* method feeds its own badge.
 
     pub fn get_files_needing_embedding(&self, limit: usize) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
@@ -794,6 +853,8 @@ impl Database {
     }
 
     /// Returns (total_files, total_size_bytes, device_count) for the storage overview command.
+    // GUI_HOOK: Dashboard → StorageOverview widget — total files count, total indexed bytes,
+    // device count. Shown as three stat tiles in the top summary bar.
     pub fn get_storage_stats(&self) -> Result<(u64, u64, u64)> {
         let total_files: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM files", [], |r| r.get(0),
@@ -1206,6 +1267,8 @@ impl Database {
     }
 
     // ── Search ────────────────────────────────────────────────────────────
+    // GUI_HOOK: GlobalSearch → ResultsPanel and FileManager → SearchBar — FTS5 results
+    // populate the main results list. device_filter enables per-node scoped search.
 
     pub fn search_fts(
         &self,
@@ -1274,6 +1337,9 @@ impl Database {
         Ok(results)
     }
 
+    // GUI_HOOK: MediaCare → Gallery filter bar — drives the AI-filter sidebar (focus toggle,
+    // quality/focus sliders, camera/lens pickers, ISO/aperture/focal range inputs, date range,
+    // GPS toggle, star rating filter, pick-flag filter). Any change re-runs this query.
     pub fn search_fts_with_media_filters(
         &self,
         query: &str,
@@ -1535,6 +1601,8 @@ impl Database {
     }
 
     // ── Temporal View ─────────────────────────────────────────────────────
+    // GUI_HOOK: Timeline → ActivityFeed — recently modified/created/deleted files across
+    // the mesh, shown as a scrollable chronological feed with device badges.
 
     pub fn get_recent_files(
         &self,
@@ -1930,6 +1998,178 @@ impl Database {
             "SELECT COUNT(*) FROM embedding_queue", [], |r| r.get(0)
         )?;
         Ok(n.max(0) as usize)
+    }
+
+    // ── Media job queue (Milestone A) ───────────────────────────────────
+
+    pub fn enqueue_media_resize_job(
+        &self,
+        job_id: &str,
+        preset: &str,
+        replace_original: bool,
+        manual_width: Option<u32>,
+        manual_height: Option<u32>,
+        items: &[(i64, PathBuf)],
+    ) -> Result<()> {
+        let now = unix_now();
+        self.conn.execute(
+            "INSERT INTO media_jobs (id, kind, status, priority, created_at)
+             VALUES (?1, 'image_resize', 'queued', 5, ?2)",
+            params![job_id, now],
+        )?;
+
+        self.conn.execute(
+            "INSERT INTO media_job_ops (id, job_id, op_index, op_type, params_json)
+             VALUES (?1, ?2, 0, 'image_resize', ?3)",
+            params![
+                format!("{}-op0", job_id),
+                job_id,
+                serde_json::json!({
+                    "preset": preset,
+                    "replace_original": replace_original,
+                    "manual_width": manual_width,
+                    "manual_height": manual_height
+                }).to_string()
+            ],
+        )?;
+
+        let tx = self.conn.unchecked_transaction()?;
+        for (idx, (file_id, path)) in items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO media_job_items (id, job_id, file_id, input_path, status, step)
+                 VALUES (?1, ?2, ?3, ?4, 'queued', 'pending')",
+                params![
+                    format!("{}-item-{}", job_id, idx),
+                    job_id,
+                    file_id,
+                    path.to_string_lossy().to_string()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn claim_next_media_job(&self) -> Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind FROM media_jobs
+             WHERE status = 'queued'
+             ORDER BY priority ASC, created_at ASC
+             LIMIT 1",
+        )?;
+        let job = stmt
+            .query_row([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .optional()?;
+
+        if let Some((job_id, kind)) = job {
+            self.conn.execute(
+                "UPDATE media_jobs SET status='running', started_at=?2 WHERE id=?1",
+                params![job_id, unix_now()],
+            )?;
+            Ok(Some((job_id, kind)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_media_job_items(&self, job_id: &str) -> Result<Vec<(String, i64, PathBuf)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, COALESCE(file_id, -1), input_path
+             FROM media_job_items WHERE job_id=?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![job_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                PathBuf::from(r.get::<_, String>(2)?),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn set_media_job_item_done(&self, item_id: &str, output_path: &Path, metrics_json: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE media_job_items
+             SET status='done', step='resized', output_path=?2, metrics_json=?3
+             WHERE id=?1",
+            params![item_id, output_path.to_string_lossy().to_string(), metrics_json],
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue a manual image edit job (crop, rotate, flip, colour adjustments).
+    /// `ops_json` is a serialised `Vec<ImageEditOp>` (see runtime::edit_ops).
+    pub fn enqueue_media_edit_job(
+        &self,
+        job_id: &str,
+        replace_original: bool,
+        ops_json: &str,
+        items: &[(i64, PathBuf)],
+    ) -> Result<()> {
+        let now = unix_now();
+        self.conn.execute(
+            "INSERT INTO media_jobs (id, kind, status, priority, created_at)
+             VALUES (?1, 'image_edit', 'queued', 3, ?2)",
+            params![job_id, now],
+        )?;
+        self.conn.execute(
+            "INSERT INTO media_job_ops (id, job_id, op_index, op_type, params_json)
+             VALUES (?1, ?2, 0, 'image_edit', ?3)",
+            params![
+                format!("{}-op0", job_id),
+                job_id,
+                serde_json::json!({
+                    "replace_original": replace_original,
+                    "ops": serde_json::from_str::<serde_json::Value>(ops_json)
+                              .unwrap_or(serde_json::Value::Array(vec![]))
+                }).to_string()
+            ],
+        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        for (idx, (file_id, path)) in items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO media_job_items (id, job_id, file_id, input_path, status, step)
+                 VALUES (?1, ?2, ?3, ?4, 'queued', 'pending')",
+                params![
+                    format!("{}-item-{}", job_id, idx),
+                    job_id,
+                    file_id,
+                    path.to_string_lossy().to_string()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_media_job_item_failed(&self, item_id: &str, err: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE media_job_items
+             SET status='failed', step='error', metrics_json=?2
+             WHERE id=?1",
+            params![item_id, serde_json::json!({"error": err}).to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_media_job(&self, job_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE media_jobs SET status='done', finished_at=?2 WHERE id=?1",
+            params![job_id, unix_now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_media_job(&self, job_id: &str, err: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE media_jobs SET status='failed', error=?2, finished_at=?3 WHERE id=?1",
+            params![job_id, err, unix_now()],
+        )?;
+        Ok(())
     }
 
     // ── Indexing audit log ────────────────────────────────────────────────

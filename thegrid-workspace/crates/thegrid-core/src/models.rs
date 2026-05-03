@@ -2,6 +2,34 @@ use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 
+// GUI_HOOK: App-wide — drives global UI tint (GREEN=Active, AMBER=AfkTacticalLock, RED=HighValueTarget).
+// Active: normal UI. AfkTacticalLock: blur sensitive panels + show unlock overlay.
+// HighValueTarget: show confirmation modal with action_description before proceeding.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SecurityStance {
+    /// Authenticated, keys in RAM, full access
+    Active,
+    /// Inactivity timeout — keys purged, UI blurred
+    AfkTacticalLock,
+    /// Destructive action pending — requires secondary auth
+    HighValueTarget { action_description: String },
+}
+
+impl Default for SecurityStance {
+    fn default() -> Self {
+        Self::Active
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct FabricIntent {
+    pub intent: String,
+    pub target_files: Option<String>,
+    pub destination_node: Option<String>,
+    pub action_type: String,
+    pub urgency: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DetectionSource {
@@ -130,6 +158,8 @@ pub struct SyncDelta {
 }
 
 /// A device on the user's Tailscale mesh network.
+// GUI_HOOK: Dashboard → NodeGrid — one card per device: display_name(), primary_ip(), os badge,
+// is_likely_online() → Online/Offline dot, last_seen timestamp, authorized badge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TailscaleDevice {
     pub id: String,
@@ -253,6 +283,9 @@ pub struct AgentPingResponse {
     pub version: String,
 }
 
+// GUI_HOOK: FileManager / GlobalSearch → ResultsPanel — one row per result: name, display_path(),
+// size, ext badge, device_name chip, modified timestamp, rank indicator. ai_metadata parsed
+// on-demand for preview tooltips.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileSearchResult {
     pub id: i64,
@@ -352,6 +385,10 @@ pub struct DriveBufferManifest {
     pub entries: Vec<DriveBufferEntry>,
 }
 
+// GUI_HOOK: NodeDetail → HardwareTab — CPU gauge (cpu_pct, cpu_freq_ghz, per-core bars),
+// RAM gauge (ram_pct(), modules list), Disk gauge (disk_pct()), GPU section (gpu_devices,
+// gpu_pct, gpu_mem used/total, is_rtx badge), net rx/tx rates, top_processes list,
+// ai_status + ai_tokens_per_sec indicator. Also feeds Dashboard → NodeGrid card mini-bars.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NodeTelemetry {
     pub device_type: String,
@@ -469,6 +506,9 @@ impl NodeTelemetry {
     }
 }
 
+// GUI_HOOK: Dashboard → IndexProgress widget — scanning spinner when scanning=true,
+// progress bar (scan_progress/scan_total), ETA badge (scan_eta_secs), files/sec rate
+// (smoothed_files_per_sec), type_counts pie/bar chart. total_files feeds StorageOverview.
 #[derive(Debug, Clone, Default)]
 pub struct IndexStats {
     pub total_files: u64,
@@ -499,6 +539,9 @@ impl IndexStats {
     }
 }
 
+// GUI_HOOK: Timeline → ActivityFeed — one row per entry: event_kind.glyph() + label(),
+// name, device_name chip, size, modified timestamp. Color-coded by kind (green=Created,
+// yellow=Modified, red=Deleted). Also feeds Dashboard → RecentActivity mini-list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalEntry {
     pub file_id:     i64,
@@ -537,6 +580,8 @@ impl TemporalEventKind {
     }
 }
 
+// GUI_HOOK: Settings → Rules panel — one row per rule: name, pattern (editable), project/tag
+// chips, is_active toggle. "Add Rule" button calls db.add_rule(); trash icon calls db.delete_rule().
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRule {
     pub id: i64,
@@ -621,6 +666,9 @@ impl std::fmt::Display for ComputeTaskType {
     }
 }
 
+// GUI_HOOK: NodeDetail → ComputeTab — show gpu_available badge, gpu_models list, gpu_vram_mb,
+// cpu_cores, ram_available_mb, max_parallel_tasks, supported_task_types chips.
+// Also feeds Compute → MeshLoad panel peer capability summary.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ComputeCapabilities {
     pub gpu_available: bool,
@@ -688,6 +736,8 @@ pub struct ComputeStatus {
 }
 
 /// In-memory record of an active borrow relationship between two devices.
+// GUI_HOOK: Compute → ActiveSessions list — one row: borrower → provider, task_type badge,
+// task_id, elapsed time (started_at). Feeds DeviceDisplayState::ComputeBorrowing/Providing.
 #[derive(Debug, Clone)]
 pub struct ComputeSession {
     pub borrower_device_id: String,
@@ -702,6 +752,9 @@ pub struct ComputeSession {
 /// Derived state for GUI device card rendering.
 /// Precedence (highest → lowest): Error > ComputeBorrowing > ComputeProviding >
 /// Indexing > Syncing > Busy > Online > Offline.
+// GUI_HOOK: Dashboard → NodeGrid card — status dot color and label() badge.
+// Error: red dot + error tooltip. ComputeBorrowing/Providing: purple dot + task type.
+// Indexing: blue animated dot. Syncing: cyan animated dot. Online: green. Offline: grey.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DeviceDisplayState {
     #[default]
@@ -803,6 +856,9 @@ pub struct SourceSummary {
     pub source_type: SourceType,
 }
 
+// GUI_HOOK: CleanUp → DuplicateGroups panel — one card per group: hash prefix, size badge,
+// file_count / source_count, sources chips (device names), files list with keep/delete toggles,
+// suggested_anchor highlighted as "KEEP" candidate. Bulk "Delete Duplicates" button triggers HVT lock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateGroup {
     pub hash: String,
@@ -851,6 +907,8 @@ pub struct DriveFileMetadata {
     pub is_shared_drive: bool,
 }
 
+// GUI_HOOK: Settings → GoogleDrive panel — show email, storage gauge (storage_used / storage_limit),
+// formatted as "X GB of Y GB used". storage_limit=None means unlimited (G Suite / Workspace).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DriveAbout {
     pub email: String,
