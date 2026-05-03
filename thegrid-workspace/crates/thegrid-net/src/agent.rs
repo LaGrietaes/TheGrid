@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use tiny_http::{Server, Response, Request};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(windows)]
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
@@ -641,6 +641,86 @@ impl AgentServer {
 
             req.respond(Response::from_string(r#"{"ok":true}"#)
                 .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+            )?;
+            return Ok(());
+        }
+
+        // VerteX chunked upload (resumable)
+        // PUT /vertex/upload
+        // Headers:
+        //   X-VerteX-TransferId
+        //   X-VerteX-FileName
+        //   X-VerteX-Offset
+        //   X-VerteX-Total
+        if method == "POST" && url == "/vertex/upload" {
+            if !self.capability_enabled("file_access") {
+                Self::respond_capability_forbidden(req, "file_access")?;
+                return Ok(());
+            }
+
+            let header_val = |name: &str| -> Option<String> {
+                let ascii_name = AsciiStr::from_ascii(name).ok()?;
+                req.headers().iter()
+                    .find(|h| h.field.as_str().eq_ignore_ascii_case(ascii_name))
+                    .map(|h| h.value.as_str().to_string())
+            };
+
+            let transfer_id = header_val("X-VerteX-TransferId").unwrap_or_default();
+            let file_name_raw = header_val("X-VerteX-FileName").unwrap_or_else(|| "upload.bin".to_string());
+            let offset = header_val("X-VerteX-Offset").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let total = header_val("X-VerteX-Total").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+
+            if transfer_id.trim().is_empty() {
+                req.respond(Response::from_string(r#"{"error":"missing transfer id"}"#).with_status_code(400))?;
+                return Ok(());
+            }
+
+            let safe_file_name = std::path::Path::new(&file_name_raw)
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "upload.bin".to_string());
+
+            let vertex_dir = self.transfers_dir.join(".vertex");
+            std::fs::create_dir_all(&vertex_dir)?;
+            let part_path = vertex_dir.join(format!("{}.part", transfer_id));
+
+            let expected_offset = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+            if offset != expected_offset {
+                let body = format!(r#"{{"ok":false,"expected_offset":{}}}"#, expected_offset);
+                req.respond(
+                    Response::from_string(body)
+                        .with_status_code(409)
+                        .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
+                )?;
+                return Ok(());
+            }
+
+            let mut chunk = Vec::new();
+            req.as_reader().read_to_end(&mut chunk)?;
+
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&part_path)?;
+            f.seek(SeekFrom::Start(offset))?;
+            f.write_all(&chunk)?;
+            f.flush()?;
+
+            let received = offset + chunk.len() as u64;
+            if total > 0 && received >= total {
+                let final_path = self.transfers_dir.join(&safe_file_name);
+                std::fs::rename(&part_path, &final_path)?;
+                let _ = self.event_tx.send(AppEvent::FileReceived {
+                    name: safe_file_name.clone(),
+                    size: received,
+                });
+            }
+
+            let body = format!(r#"{{"ok":true,"received":{}}}"#, received);
+            req.respond(
+                Response::from_string(body)
+                    .with_header(tiny_http::Header::from_bytes(b"Content-Type", b"application/json").unwrap())
             )?;
             return Ok(());
         }
@@ -1445,16 +1525,15 @@ impl AgentClient {
         Ok(r)
     }
 
+    // GUI_HOOK: Called by FileManager / transfer panel to list files in the remote node's transfers dir.
     pub fn list_files(&self) -> Result<Vec<RemoteFile>> {
-        #[derive(serde::Deserialize)]
-        struct Resp { files: Vec<RemoteFile> }
         let url = format!("{}/filelist", self.base_url);
         let resp = self.http.get(&url).header("X-Grid-Key", &self.api_key).send()?;
         if !resp.status().is_success() {
             return Err(Self::handle_error(resp));
         }
-        let r: Resp = resp.json()?;
-        Ok(r.files)
+        // Server returns a raw JSON array — deserialize directly, not as {files:[...]}.
+        resp.json::<Vec<RemoteFile>>().context("Parsing filelist response")
     }
 
 
@@ -1522,6 +1601,7 @@ impl AgentClient {
         Ok(())
     }
 
+    // GUI_HOOK: Dashboard → ClipboardWidget → "Send" button
     pub fn send_clipboard(&self, content: &str, sender: &str) -> Result<()> {
         let url = format!("{}/clipboard", self.base_url);
         let body = serde_json::json!({ "content": content, "sender": sender });
@@ -1532,6 +1612,7 @@ impl AgentClient {
         Ok(())
     }
 
+    // GUI_HOOK: Terminal screen → "Connect" button — store returned session_id; begin polling get_terminal_output()
     pub fn create_terminal_session(&self) -> Result<String> {
         let url = format!("{}/v1/terminal/session", self.base_url);
         let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).send()?;
@@ -1563,6 +1644,7 @@ impl AgentClient {
         Ok(bytes)
     }
 
+    // GUI_HOOK: Dashboard → NodeCard → telemetry band — poll every 5s when card is expanded
     pub fn get_telemetry(&self) -> Result<NodeTelemetry> {
         let url = format!("{}/telemetry", self.base_url);
         log::info!("Client: fetching telemetry from {}", url);
@@ -1625,6 +1707,7 @@ impl AgentClient {
         Ok(dest_file)
     }
 
+    // GUI_HOOK: NodeCard → "Enable RDP" button (Windows nodes only); show spinner; result → RdpEnabled/RdpFailed
     pub fn enable_rdp(&self) -> Result<()> {
         let url = format!("{}/v1/rdp/enable", self.base_url);
         let resp = self.http.post(&url).header("X-Grid-Key", &self.api_key).send().context("Requesting RDP enablement")?;
@@ -1732,6 +1815,7 @@ impl AgentClient {
         Ok(())
     }
 
+    // GUI_HOOK: NodeCard → SettingsModal → "Save" button — push config change to remote node
     pub fn update_config(&self, device_type: Option<String>, model: Option<String>, url: Option<String>, api_key: Option<String>) -> Result<()> {
         let endpoint = format!("{}/v1/config", self.base_url);
         let body = serde_json::json!({
@@ -1752,6 +1836,7 @@ impl AgentClient {
         Ok(())
     }
 
+    // GUI_HOOK: NodeCard → "Restart Node" button (confirm dialog first via request_high_value_lock)
     /// POST /v1/restart — asks the remote node to restart and re-read config from disk.
     pub fn restart_node(&self) -> Result<()> {
         let endpoint = format!("{}/v1/restart", self.base_url);
@@ -1767,6 +1852,7 @@ impl AgentClient {
         Ok(())
     }
 
+    // GUI_HOOK: NodeCard → "Update" button — show "Updating…" spinner; dismiss on RemoteUpdateStarted
     /// POST /v1/update — triggers a git pull + rebuild on the remote node.
     /// Returns immediately; the node runs the update script in the background.
     pub fn trigger_update(&self) -> Result<()> {
@@ -1797,6 +1883,12 @@ impl AgentClient {
         }
 
         anyhow::anyhow!("Request failed with status {}: {}", status, body)
+    }
+}
+
+impl thegrid_ai::agents::PeerSearchClient for AgentClient {
+    fn semantic_search(&self, query: &str, k: usize) -> Result<Vec<(i64, f32)>> {
+        self.remote_search(query, k)
     }
 }
 

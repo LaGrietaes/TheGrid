@@ -15,7 +15,266 @@ use thegrid_core::{
 };
 use thegrid_net::{AgentClient, AgentServer, DriveClient, TailscaleClient, TermuxAgent, WolSentry};
 use thegrid_ai::{SemanticSearch, EmbeddingProvider, AiNodeDetector};
+use thegrid_ai::agents::{Librarian, PeerSearchClient, Sentinel};
+use thegrid_ai::inference::build_inference_provider;
 use crate::ComputeRouter;
+
+// ── A5: Tool Health Probe ─────────────────────────────────────────────────────
+
+use thegrid_core::tool_health::{CapabilityTier, ToolHealthReport, ToolStatus};
+
+/// Resolve tool path: check env-var override first, then PATH.
+fn resolve_tool(env_var: &str, exe_stem: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(env_var) {
+        let pb = PathBuf::from(p);
+        if pb.is_file() { return Some(pb); }
+    }
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            for suffix in &["", ".exe", ".cmd"] {
+                let candidate = dir.join(format!("{}{}", exe_stem, suffix));
+                if candidate.is_file() { return Some(candidate); }
+            }
+        }
+    }
+    None
+}
+
+fn probe_version(path: &std::path::Path) -> Result<String, String> {
+    let out = Command::new(path).arg("--version").output().map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line: String = text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("unknown")
+        .chars().take(72).collect();
+    Ok(line)
+}
+
+fn probe_one(env_var: &str, exe_stem: &str, missing_hint: &'static str) -> ToolStatus {
+    match resolve_tool(env_var, exe_stem) {
+        None => ToolStatus::Missing { hint: missing_hint.to_string() },
+        Some(path) => match probe_version(&path) {
+            Ok(version) => ToolStatus::Ok { version, path },
+            Err(message) => ToolStatus::Error { message },
+        },
+    }
+}
+
+/// Probe all external tools and derive the capability tier.
+pub fn probe_tool_health(
+    gyroflow_override: Option<&std::path::Path>,
+    fabric_override: Option<&std::path::Path>,
+) -> ToolHealthReport {
+    let ffmpeg = probe_one(
+        "THEGRID_FFMPEG", "ffmpeg",
+        "Install ffmpeg and add it to PATH, or set THEGRID_FFMPEG=/path/to/ffmpeg. \
+         Required for video/audio transforms and inline preview.",
+    );
+    let ffprobe = probe_one(
+        "THEGRID_FFPROBE", "ffprobe",
+        "Install ffprobe (ships with ffmpeg) and add it to PATH, or set THEGRID_FFPROBE. \
+         Required for media metadata and duration detection.",
+    );
+    let gyroflow = if let Some(p) = gyroflow_override.filter(|p| p.is_file()) {
+        match probe_version(p) {
+            Ok(version) => ToolStatus::Ok { version, path: p.to_path_buf() },
+            Err(message) => ToolStatus::Error { message },
+        }
+    } else {
+        probe_one("THEGRID_GYROFLOW", "gyroflow",
+            "Install Gyroflow and set THEGRID_GYROFLOW or configure gyroflow_path \
+             in settings. Required for gyro stabilization (Tier 4).")
+    };
+    let ollama = probe_one(
+        "THEGRID_OLLAMA", "ollama",
+        "Install Ollama (https://ollama.com) for local AI transcription and visual \
+         analysis. Required for Tier 3 features.",
+    );
+    let fabric = if let Some(p) = fabric_override.filter(|p| p.is_file()) {
+        match probe_version(p) {
+            Ok(version) => ToolStatus::Ok { version, path: p.to_path_buf() },
+            Err(message) => ToolStatus::Error { message },
+        }
+    } else {
+        probe_one("THEGRID_FABRIC", "fabric",
+            "Install Fabric (https://github.com/danielmiessler/fabric) and add it to PATH, \
+             or set THEGRID_FABRIC env var, or configure fabric_path in Settings. \
+             Required for Symbiosis / Command Palette AI interpretation.")
+    };
+
+    let tier = match (ffmpeg.is_ok() && ffprobe.is_ok(), ollama.is_ok(), gyroflow.is_ok()) {
+        (false, _, _) => CapabilityTier::T0Image,
+        (true, false, _) => CapabilityTier::T1Ffmpeg,
+        (true, true, false) => CapabilityTier::T3Transcription,
+        (true, true, true) => CapabilityTier::T4Gyroflow,
+    };
+
+    ToolHealthReport {
+        probed_at: std::time::SystemTime::now(),
+        ffmpeg, ffprobe, gyroflow, ollama, fabric, tier,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A6: Audio Cleanup Operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+
+fn cut_silence_ffmpeg(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    threshold_db: i32,
+    min_duration_ms: u32,
+) -> Result<(), String> {
+    let ffmpeg = resolve_tool("THEGRID_FFMPEG", "ffmpeg")
+        .ok_or_else(|| "ffmpeg not found".to_string())?;
+    let filter = format!(
+        "silenceremove=start_periods=1:stop_periods=1:start_threshold={}dB:stop_threshold={}dB:detection=peak:duration={}",
+        threshold_db, threshold_db, min_duration_ms as f32 / 1000.0
+    );
+    let status = Command::new(ffmpeg)
+        .arg("-i").arg(input)
+        .arg("-af").arg(&filter)
+        .arg("-y").arg(output)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !status.status.success() {
+        Err(format!("silenceremove: {}", String::from_utf8_lossy(&status.stderr)))
+    } else {
+        Ok(())
+    }
+}
+
+fn denoise_ffmpeg(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    strength: f32,
+) -> Result<(), String> {
+    let ffmpeg = resolve_tool("THEGRID_FFMPEG", "ffmpeg")
+        .ok_or_else(|| "ffmpeg not found".to_string())?;
+    let strength = strength.clamp(0.0, 1.0);
+    let m = 0.002 + (strength * 0.008);
+    let filter = format!("anlmdn=m={}:s=0.0000002", m);
+    let status = Command::new(ffmpeg)
+        .arg("-i").arg(input)
+        .arg("-af").arg(&filter)
+        .arg("-y").arg(output)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !status.status.success() {
+        Err(format!("denoise: {}", String::from_utf8_lossy(&status.stderr)))
+    } else {
+        Ok(())
+    }
+}
+
+fn normalize_loudness_ffmpeg(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    target_lufs: i32,
+) -> Result<(), String> {
+    let ffmpeg = resolve_tool("THEGRID_FFMPEG", "ffmpeg")
+        .ok_or_else(|| "ffmpeg not found".to_string())?;
+    let target_lufs = target_lufs.clamp(-30, 0);
+    let filter = format!("loudnorm=I={}:TP=-1.5:LRA=11", target_lufs);
+    let status = Command::new(ffmpeg)
+        .arg("-i").arg(input)
+        .arg("-af").arg(&filter)
+        .arg("-y").arg(output)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !status.status.success() {
+        Err(format!("normalize: {}", String::from_utf8_lossy(&status.stderr)))
+    } else {
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn apply_edit_ops(
+    mut img: image::DynamicImage,
+    ops: &[serde_json::Value],
+) -> image::DynamicImage {
+    use image::GenericImageView;
+    for op in ops {
+        let op_type = op.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match op_type {
+            "crop" => {
+                let (iw, ih) = img.dimensions();
+                let x  = op.get("x").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let y  = op.get("y").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let w  = op.get("w").and_then(|v| v.as_u64()).unwrap_or(iw as u64) as u32;
+                let h  = op.get("h").and_then(|v| v.as_u64()).unwrap_or(ih as u64) as u32;
+                let x  = x.min(iw.saturating_sub(1));
+                let y  = y.min(ih.saturating_sub(1));
+                let w  = w.min(iw - x).max(1);
+                let h  = h.min(ih - y).max(1);
+                img = img.crop_imm(x, y, w, h);
+            }
+            "rotate" => {
+                let degrees = op.get("degrees").and_then(|v| v.as_i64()).unwrap_or(0);
+                img = match ((degrees % 360) + 360) % 360 {
+                    90  => img.rotate90(),
+                    180 => img.rotate180(),
+                    270 => img.rotate270(),
+                    _   => img,
+                };
+            }
+            "flip" => {
+                let axis = op.get("axis").and_then(|v| v.as_str()).unwrap_or("h");
+                img = if axis == "h" { img.fliph() } else { img.flipv() };
+            }
+            "brightness" => {
+                let delta = op.get("delta").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                img = img.brighten(delta);
+            }
+            "contrast" => {
+                let factor = op.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                img = img.adjust_contrast(factor);
+            }
+            "hue_rotate" => {
+                let degrees = op.get("degrees").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                img = img.huerotate(degrees);
+            }
+            "sharpen" => {
+                let sigma = op.get("sigma").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let threshold = op.get("threshold").and_then(|v| v.as_i64()).unwrap_or(3) as i32;
+                img = img.unsharpen(sigma, threshold);
+            }
+            _ => {}
+        }
+    }
+    img
+}
+
+fn is_resizable_ext(ext: &str) -> bool {
+    matches!(ext, "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tif" | "tiff")
+}
+
+fn resize_for_preset(
+    img: image::DynamicImage,
+    preset: &str,
+    manual_size: Option<(u32, u32)>,
+) -> image::DynamicImage {
+    if let Some((w, h)) = manual_size {
+        return img.resize(w.max(1), h.max(1), image::imageops::FilterType::Lanczos3);
+    }
+
+    match preset {
+        "print" => img.resize(4961, 3508, image::imageops::FilterType::Lanczos3),
+        "social" => img.resize(1080, 1080, image::imageops::FilterType::Lanczos3),
+        "ads" => img.resize(1200, 628, image::imageops::FilterType::Lanczos3),
+        _ => img.resize(1600, 1600, image::imageops::FilterType::Lanczos3), // free/default
+    }
+}
+
+fn resize_copy_path(path: &std::path::Path, suffix: &str, ext_hint: &str) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or(ext_hint);
+    parent.join(format!("{}_{}_copy.{}", stem, suffix, ext))
+}
 
 fn apply_automation_rules_for_file(
     db: &Database,
@@ -128,12 +387,15 @@ pub struct AppRuntime {
     pub hash_worker_running: Arc<AtomicBool>,
     pub embedding_worker_running: Arc<AtomicBool>,
     pub media_worker_running: Arc<AtomicBool>,
+    pub media_job_worker_running: Arc<AtomicBool>,
     pub ui_priority_mode: Arc<AtomicBool>,
     pub sync_health: Arc<Mutex<std::collections::HashMap<String, SyncHealthMetrics>>>,
 
     // Compute delegation
     pub tailscale_peers: Arc<Mutex<Vec<TailscaleDevice>>>,
     pub compute_router: Arc<ComputeRouter>,
+    pub sentinel: Arc<Sentinel>,
+    pub librarian: Arc<Librarian>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -488,6 +750,30 @@ impl AppRuntime {
         let is_ai_node = ai_node_detector.is_ai_node();
 
         let config_arc = Arc::new(Mutex::new(config));
+        let inference = {
+            let cfg = config_arc.lock().unwrap();
+            build_inference_provider(
+                &cfg.ai_policy,
+                cfg.ai_provider_url.as_deref(),
+                cfg.ai_model.as_deref(),
+                cfg.google_gemini_api_key.as_deref(),
+                &cfg.google_gemini_model,
+                cfg.claude_api_key.as_deref(),
+                &cfg.claude_model,
+            )
+        };
+        let sentinel = Sentinel::new(
+            Arc::clone(&config_arc),
+            event_tx.clone(),
+            inference.clone(),
+        );
+        Sentinel::spawn(Arc::clone(&sentinel));
+        let librarian = Librarian::new(
+            Arc::clone(&config_arc),
+            event_tx.clone(),
+            inference,
+        );
+
         let compute_router = Arc::new(ComputeRouter::new(
             Arc::clone(&config_arc),
             event_tx.clone(),
@@ -508,10 +794,13 @@ impl AppRuntime {
             hash_worker_running: Arc::new(AtomicBool::new(false)),
             embedding_worker_running: Arc::new(AtomicBool::new(false)),
             media_worker_running: Arc::new(AtomicBool::new(false)),
+            media_job_worker_running: Arc::new(AtomicBool::new(false)),
             ui_priority_mode: Arc::new(AtomicBool::new(false)),
             sync_health: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tailscale_peers: Arc::new(Mutex::new(Vec::new())),
             compute_router,
+            sentinel,
+            librarian,
         };
 
         Ok(runtime)
@@ -528,6 +817,459 @@ impl AppRuntime {
     /// Background workers reduce batch sizes and parallelism to keep the app responsive.
     pub fn set_ui_priority_mode(&self, enabled: bool) {
         self.ui_priority_mode.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Called by GUI input loop when user activity changes.
+    // GUI_HOOK: App update() loop — call with idle=true after N minutes of no mouse/keyboard input
+    pub fn set_user_idle(&self, idle: bool) {
+        if idle {
+            self.sentinel.lock_afk();
+        } else {
+            self.sentinel.user_active();
+        }
+    }
+
+    // GUI_HOOK: Any destructive action (bulk delete, overwrite original) — call before showing confirm dialog
+    /// Request a high-value-target stance before destructive operations.
+    pub fn request_high_value_lock(&self, action_description: impl Into<String>) {
+        self.sentinel.request_hvt_lock(action_description.into());
+    }
+
+    // GUI_HOOK: MediaCare → ImageEditor → "Apply" button — calls this with ops_json from editor state
+    /// Queue a manual image edit job (crop, rotate, flip, colour adjustments, sharpen).
+    /// `ops_json` is the JSON array produced by `MediaEditState::build_ops_json()`.
+    pub fn enqueue_media_edit_job(
+        &self,
+        file: thegrid_core::models::FileSearchResult,
+        ops_json: &str,
+        replace_original: bool,
+    ) -> Result<String> {
+        let job_id = format!("edit-{}", uuid::Uuid::new_v4());
+        let items = vec![(file.id, file.path.clone())];
+        let total_items = items.len();
+
+        {
+            let db = self.db.lock().unwrap();
+            db.enqueue_media_edit_job(&job_id, replace_original, ops_json, &items)?;
+        }
+
+        let _ = self.event_tx.send(AppEvent::MediaJobQueued {
+            job_id: job_id.clone(),
+            kind: "image_edit".to_string(),
+            total_items,
+        });
+
+        self.spawn_media_job_worker();
+        Ok(job_id)
+    }
+
+    // GUI_HOOK: MediaCare → AudioCleanup panel → "Process" button
+    /// Queue an audio cleanup job (silence cut, denoise, loudness normalize).
+    /// `ops_json` is produced by `AudioCleanupState::build_ops_json()`.
+    pub fn enqueue_audio_cleanup_job(
+        &self,
+        file: thegrid_core::models::FileSearchResult,
+        ops_json: &str,
+        replace_original: bool,
+    ) -> Result<String> {
+        let job_id = format!("audio-cleanup-{}", uuid::Uuid::new_v4());
+        let items = vec![(file.id, file.path.clone())];
+        let total_items = items.len();
+
+        {
+            let db = self.db.lock().unwrap();
+            db.enqueue_media_edit_job(&job_id, replace_original, ops_json, &items)?;
+        }
+
+        let _ = self.event_tx.send(AppEvent::MediaJobQueued {
+            job_id: job_id.clone(),
+            kind: "audio_cleanup".to_string(),
+            total_items,
+        });
+
+        self.spawn_media_job_worker();
+        Ok(job_id)
+    }
+
+    // GUI_HOOK: MediaCare → ResizePanel → "Resize" button (preset or custom dimensions)
+    /// Queue a Media Care resize job and ensure the worker is running.
+    pub fn enqueue_media_resize_job(
+        &self,
+        files: Vec<thegrid_core::models::FileSearchResult>,
+        preset: &str,
+        replace_original: bool,
+        manual_width: Option<u32>,
+        manual_height: Option<u32>,
+    ) -> Result<String> {
+        let job_id = format!("media-{}", uuid::Uuid::new_v4());
+        let items: Vec<(i64, PathBuf)> = files.into_iter().map(|f| (f.id, f.path)).collect();
+        let total_items = items.len();
+
+        {
+            let db = self.db.lock().unwrap();
+            db.enqueue_media_resize_job(
+                &job_id,
+                preset,
+                replace_original,
+                manual_width,
+                manual_height,
+                &items,
+            )?;
+        }
+
+        let _ = self.event_tx.send(AppEvent::MediaJobQueued {
+            job_id: job_id.clone(),
+            kind: "image_resize".to_string(),
+            total_items,
+        });
+
+        self.spawn_media_job_worker();
+        Ok(job_id)
+    }
+
+    /// Background worker for queued media jobs.
+    pub fn spawn_media_job_worker(&self) {
+        if self
+            .media_job_worker_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let db = Arc::clone(&self.db);
+        let tx = self.event_tx.clone();
+        let running = Arc::clone(&self.media_job_worker_running);
+
+        std::thread::spawn(move || {
+            loop {
+                let next_job = {
+                    let guard = db.lock().unwrap();
+                    guard.claim_next_media_job()
+                };
+
+                let Some((job_id, kind)) = next_job.ok().flatten() else {
+                    break;
+                };
+
+                let _ = tx.send(AppEvent::MediaJobStarted { job_id: job_id.clone() });
+
+                if kind != "image_resize" && kind != "image_edit" && kind != "audio_cleanup" {
+                    if let Ok(guard) = db.lock() {
+                        let _ = guard.fail_media_job(&job_id, "unsupported_media_job_kind");
+                    }
+                    let _ = tx.send(AppEvent::MediaJobFailed {
+                        job_id: job_id.clone(),
+                        error: "Unsupported media job kind".to_string(),
+                    });
+                    continue;
+                }
+
+                // ── image_edit branch ──────────────────────────────────────
+                if kind == "image_edit" {
+                    let (items, params_json) = {
+                        let guard = db.lock().unwrap();
+                        let items = guard.get_media_job_items(&job_id).unwrap_or_default();
+                        let params: Option<String> = guard.conn.query_row(
+                            "SELECT params_json FROM media_job_ops WHERE job_id=?1 ORDER BY op_index ASC LIMIT 1",
+                            params![job_id.clone()],
+                            |r| r.get(0),
+                        ).ok();
+                        (items, params)
+                    };
+
+                    let mut replace_original = false;
+                    let mut ops: Vec<serde_json::Value> = Vec::new();
+                    if let Some(params) = params_json {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&params) {
+                            replace_original = v.get("replace_original").and_then(|x| x.as_bool()).unwrap_or(false);
+                            if let Some(arr) = v.get("ops").and_then(|x| x.as_array()) {
+                                ops = arr.clone();
+                            }
+                        }
+                    }
+
+                    let total = items.len();
+                    let mut done = 0usize;
+                    let mut outputs = Vec::new();
+
+                    for (item_id, _file_id, path) in items {
+                        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+                        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+                        let result = (|| -> Result<PathBuf> {
+                            let bytes = std::fs::read(&path)?;
+                            let img = image::load_from_memory(&bytes)?;
+                            let edited = apply_edit_ops(img, &ops);
+                            let target = if replace_original {
+                                path.clone()
+                            } else {
+                                resize_copy_path(&path, "edited", &ext)
+                            };
+                            if ext == "jpg" || ext == "jpeg" {
+                                let mut out = std::io::BufWriter::new(std::fs::File::create(&target)?);
+                                let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 95);
+                                enc.encode_image(&edited)?;
+                            } else {
+                                edited.save(&target)?;
+                            }
+                            Ok(target)
+                        })();
+
+                        match result {
+                            Ok(target) => {
+                                outputs.push(target.to_string_lossy().to_string());
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.set_media_job_item_done(&item_id, &target, None);
+                                }
+                            }
+                            Err(e) => {
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.set_media_job_item_failed(&item_id, &e.to_string());
+                                }
+                            }
+                        }
+
+                        done += 1;
+                        let _ = tx.send(AppEvent::MediaJobProgress {
+                            job_id: job_id.clone(), done, total, current_file: file_name,
+                        });
+                    }
+
+                    if let Ok(guard) = db.lock() { let _ = guard.complete_media_job(&job_id); }
+                    let _ = tx.send(AppEvent::MediaJobComplete { job_id, outputs });
+                    continue;
+                }
+
+                // ── audio_cleanup branch ──────────────────────────────────────
+                if kind == "audio_cleanup" {
+                    let (items, params_json) = {
+                        let guard = db.lock().unwrap();
+                        let items = guard.get_media_job_items(&job_id).unwrap_or_default();
+                        let params: Option<String> = guard.conn.query_row(
+                            "SELECT params_json FROM media_job_ops WHERE job_id=?1 ORDER BY op_index ASC LIMIT 1",
+                            params![job_id.clone()],
+                            |r| r.get(0),
+                        ).ok();
+                        (items, params)
+                    };
+
+                    let mut replace_original = false;
+                    let mut cut_silence_enabled = false;
+                    let mut cut_silence_threshold_db = -40i32;
+                    let mut cut_silence_min_duration_ms = 100u32;
+                    let mut denoise_enabled = false;
+                    let mut denoise_strength = 0.5f32;
+                    let mut normalize_enabled = false;
+                    let mut normalize_lufs = -16i32;
+
+                    if let Some(params) = params_json {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&params) {
+                            replace_original = v.get("replace_original").and_then(|x| x.as_bool()).unwrap_or(false);
+                            if let Some(ops_arr) = v.get("ops").and_then(|x| x.as_array()) {
+                                for op in ops_arr {
+                                    match op.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                                        "cut_silence" => {
+                                            cut_silence_enabled = true;
+                                            cut_silence_threshold_db = op.get("threshold_db").and_then(|x| x.as_i64()).unwrap_or(-40) as i32;
+                                            cut_silence_min_duration_ms = op.get("min_duration_ms").and_then(|x| x.as_u64()).unwrap_or(100) as u32;
+                                        }
+                                        "denoise" => {
+                                            denoise_enabled = true;
+                                            denoise_strength = op.get("strength").and_then(|x| x.as_f64()).unwrap_or(0.5) as f32;
+                                        }
+                                        "normalize" => {
+                                            normalize_enabled = true;
+                                            normalize_lufs = op.get("loudness_lufs").and_then(|x| x.as_i64()).unwrap_or(-16) as i32;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let total = items.len();
+                    let mut done = 0usize;
+                    let mut outputs = Vec::new();
+
+                    for (item_id, _file_id, path) in items {
+                        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+                        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+                        let result = (|| -> Result<PathBuf> {
+                            let mut current = path.clone();
+                            let temp_dir = std::env::temp_dir();
+
+                            // Chain operations: each output becomes the next input
+                            if cut_silence_enabled {
+                                let temp_output = temp_dir.join(format!("tg_silence_cut_{}.wav", uuid::Uuid::new_v4()));
+                                cut_silence_ffmpeg(&current, &temp_output, cut_silence_threshold_db, cut_silence_min_duration_ms)
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+                                let _ = std::fs::remove_file(&current);
+                                current = temp_output;
+                            }
+
+                            if denoise_enabled {
+                                let temp_output = temp_dir.join(format!("tg_denoise_{}.wav", uuid::Uuid::new_v4()));
+                                denoise_ffmpeg(&current, &temp_output, denoise_strength)
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+                                if cut_silence_enabled { let _ = std::fs::remove_file(&current); }
+                                current = temp_output;
+                            }
+
+                            if normalize_enabled {
+                                let temp_output = temp_dir.join(format!("tg_normalize_{}", path.file_name().unwrap_or_default().to_string_lossy()));
+                                normalize_loudness_ffmpeg(&current, &temp_output, normalize_lufs)
+                                    .map_err(|e| anyhow::anyhow!(e))?;
+                                if denoise_enabled || cut_silence_enabled { let _ = std::fs::remove_file(&current); }
+                                current = temp_output;
+                            }
+
+                            // Move final output to target location
+                            let target = if replace_original {
+                                path.clone()
+                            } else {
+                                resize_copy_path(&path, "cleaned", &ext)
+                            };
+
+                            std::fs::rename(&current, &target)?;
+                            Ok(target)
+                        })();
+
+                        match result {
+                            Ok(target) => {
+                                outputs.push(target.to_string_lossy().to_string());
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.set_media_job_item_done(&item_id, &target, None);
+                                }
+                            }
+                            Err(e) => {
+                                if let Ok(guard) = db.lock() {
+                                    let _ = guard.set_media_job_item_failed(&item_id, &e.to_string());
+                                }
+                            }
+                        }
+
+                        done += 1;
+                        let _ = tx.send(AppEvent::MediaJobProgress {
+                            job_id: job_id.clone(), done, total, current_file: file_name,
+                        });
+                    }
+
+                    if let Ok(guard) = db.lock() { let _ = guard.complete_media_job(&job_id); }
+                    let _ = tx.send(AppEvent::MediaJobComplete { job_id, outputs });
+                    continue;
+                }
+
+                let (items, params_json) = {
+                    let guard = db.lock().unwrap();
+                    let items = guard.get_media_job_items(&job_id).unwrap_or_default();
+                    let params: Option<String> = guard.conn.query_row(
+                        "SELECT params_json FROM media_job_ops WHERE job_id=?1 ORDER BY op_index ASC LIMIT 1",
+                        params![job_id.clone()],
+                        |r| r.get(0),
+                    ).ok();
+                    (items, params)
+                };
+
+                let mut preset = "free".to_string();
+                let mut replace_original = false;
+                let mut manual_size: Option<(u32, u32)> = None;
+                if let Some(params) = params_json {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&params) {
+                        preset = v.get("preset").and_then(|x| x.as_str()).unwrap_or("free").to_string();
+                        replace_original = v.get("replace_original").and_then(|x| x.as_bool()).unwrap_or(false);
+                        let mw = v.get("manual_width").and_then(|x| x.as_u64()).map(|n| n as u32);
+                        let mh = v.get("manual_height").and_then(|x| x.as_u64()).map(|n| n as u32);
+                        if let (Some(w), Some(h)) = (mw, mh) {
+                            manual_size = Some((w, h));
+                        }
+                    }
+                }
+
+                let total = items.len();
+                let mut done = 0usize;
+                let mut outputs = Vec::new();
+
+                for (item_id, _file_id, path) in items {
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or_default()
+                        .to_lowercase();
+
+                    let file_name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+
+                    if !is_resizable_ext(&ext) {
+                        if let Ok(guard) = db.lock() {
+                            let _ = guard.set_media_job_item_failed(&item_id, "unsupported_extension");
+                        }
+                        done += 1;
+                        let _ = tx.send(AppEvent::MediaJobProgress {
+                            job_id: job_id.clone(),
+                            done,
+                            total,
+                            current_file: file_name,
+                        });
+                        continue;
+                    }
+
+                    let result = (|| -> Result<PathBuf> {
+                        let bytes = std::fs::read(&path)?;
+                        let img = image::load_from_memory(&bytes)?;
+                        let resized = resize_for_preset(img, &preset, manual_size);
+                        let target = if replace_original {
+                            path.clone()
+                        } else {
+                            resize_copy_path(&path, &preset, &ext)
+                        };
+
+                        if ext == "jpg" || ext == "jpeg" {
+                            let mut out = std::io::BufWriter::new(std::fs::File::create(&target)?);
+                            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+                            encoder.encode_image(&resized)?;
+                        } else {
+                            resized.save(&target)?;
+                        }
+                        Ok(target)
+                    })();
+
+                    match result {
+                        Ok(target) => {
+                            outputs.push(target.to_string_lossy().to_string());
+                            if let Ok(guard) = db.lock() {
+                                let _ = guard.set_media_job_item_done(&item_id, &target, None);
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(guard) = db.lock() {
+                                let _ = guard.set_media_job_item_failed(&item_id, &e.to_string());
+                            }
+                        }
+                    }
+
+                    done += 1;
+                    let _ = tx.send(AppEvent::MediaJobProgress {
+                        job_id: job_id.clone(),
+                        done,
+                        total,
+                        current_file: file_name,
+                    });
+                }
+
+                if let Ok(guard) = db.lock() {
+                    let _ = guard.complete_media_job(&job_id);
+                }
+                let _ = tx.send(AppEvent::MediaJobComplete { job_id, outputs });
+            }
+
+            running.store(false, Ordering::SeqCst);
+        });
     }
 
     /// Periodically re-fetch Tailscale devices in the background so that
@@ -670,6 +1412,13 @@ impl AppRuntime {
         self.spawn_peer_refresh_loop();
         self.spawn_hashing_worker();
 
+        // Critical Path MVP: Trigger initial indexing scan for watch paths if they exist
+        let watch_paths = c.watch_paths.clone();
+        if !watch_paths.is_empty() {
+            log::info!("[Runtime] Triggering initial scan for {} watch paths", watch_paths.len());
+            self.spawn_index_directories(watch_paths, c.device_name.clone(), c.device_name.clone());
+        }
+
         let shutdown_handle = server.shutdown_handle();
         match server.spawn() {
             Ok(()) => {
@@ -687,6 +1436,9 @@ impl AppRuntime {
         }
 
         let _ = self.event_tx.send(AppEvent::Status("startup_services_ready".to_string()));
+
+        // A5: probe external tools after other services start — non-blocking.
+        self.spawn_tool_health_check();
     }
 
     pub fn restart_services(&self) {
@@ -716,6 +1468,7 @@ impl AppRuntime {
 
     // --- Task Spawners (Migrated from app.rs) ---
 
+    // GUI_HOOK: Dashboard → NodeGrid — call on startup and on "Refresh" button press
     pub fn spawn_load_devices(&self) {
         let api_key = self.config.lock().unwrap().api_key.clone();
         let tx = self.event_tx.clone();
@@ -728,6 +1481,23 @@ impl AppRuntime {
         });
     }
 
+    // ── A5: Tool Health Probe ─────────────────────────────────────────────────
+
+    /// Runs tool discovery in a background thread and emits `ToolHealthUpdated`.
+    /// Checks ffmpeg, ffprobe, gyroflow, ollama, and fabric without blocking the UI.
+    pub fn spawn_tool_health_check(&self) {
+        let tx = self.event_tx.clone();
+        let (gyroflow_path, fabric_path) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.gyroflow_path.clone(), cfg.fabric_path.clone())
+        };
+        std::thread::spawn(move || {
+            let report = probe_tool_health(gyroflow_path.as_deref(), fabric_path.as_deref());
+            let _ = tx.send(AppEvent::ToolHealthUpdated(report));
+        });
+    }
+
+    // GUI_HOOK: NodeCard → ping button; also fires automatically after DevicesLoaded
     pub fn spawn_ping(&self, ip: String, manual: bool) {
         let (port, api_key) = {
             let cfg = self.config.lock().unwrap();
@@ -776,6 +1546,7 @@ impl AppRuntime {
         });
     }
 
+    // GUI_HOOK: FileManager → "Browse transfers" button on NodeCard detail panel
     pub fn spawn_list_remote_files(&self, ip: String) {
         let (port, api_key) = {
             let cfg = self.config.lock().unwrap();
@@ -790,6 +1561,7 @@ impl AppRuntime {
         });
     }
 
+    // GUI_HOOK: FileManager → TransferQueue — called when user drops file or clicks "Send"
     pub fn spawn_send_file(&self, ip: String, path: PathBuf, queue_idx: usize) {
         let (port, api_key) = {
             let cfg = self.config.lock().unwrap();
@@ -805,6 +1577,7 @@ impl AppRuntime {
         });
     }
 
+    // GUI_HOOK: FileManager → RemoteFileList → "Download" button on file row
     pub fn spawn_download_file(&self, ip: String, filename: String) {
         let (port, api_key, dest_dir) = {
             let cfg = self.config.lock().unwrap();
@@ -819,6 +1592,7 @@ impl AppRuntime {
         });
     }
 
+    // GUI_HOOK: FileManager → DirectoryBrowser — called on folder click or breadcrumb navigation
     pub fn spawn_browse_remote_directory(&self, ip: String, device_id: String, path: PathBuf) {
         let (port, api_key) = {
             let cfg = self.config.lock().unwrap();
@@ -833,6 +1607,8 @@ impl AppRuntime {
         });
     }
 
+    // GUI_HOOK: Settings → WatchPaths — called when user adds a new watch path
+    // GUI_HOOK: StatusBar → shows IndexProgress while running
     pub fn spawn_index_directory(&self, path: PathBuf, device_id: String, device_name: String) {
         let db = Arc::clone(&self.db);
         let config = Arc::clone(&self.config);
@@ -2282,10 +3058,13 @@ impl AppRuntime {
         let tx       = self.event_tx.clone();
         let semantic_search  = self.semantic_search.clone();
         let remote_ai = self.remote_ai_nodes.clone();
+        let peers = Arc::clone(&self.tailscale_peers);
+        let librarian = Arc::clone(&self.librarian);
         let (api_key, port) = {
             let cfg = self.config.lock().unwrap();
             (cfg.api_key.clone(), cfg.agent_port)
         };
+        let local_device_id = self.config.lock().unwrap().device_name.clone();
         let limit = limit.clamp(1, 500);
 
         std::thread::spawn(move || {
@@ -2293,6 +3072,7 @@ impl AppRuntime {
             let effective_query = clean_query;
             let force_filtered_search = media_filters.any();
             let mut results = vec![];
+            let mut local_semantic_hits: Vec<(i64, f32)> = Vec::new();
             
             if semantic_enabled && !force_filtered_search {
                 let has_local = {
@@ -2304,6 +3084,7 @@ impl AppRuntime {
                     if let Ok(mut lock) = semantic_search.lock() {
                         if let Some(engine) = &mut *lock {
                             if let Ok(hits) = engine.search(&effective_query, limit) {
+                                local_semantic_hits = hits.clone();
                                 let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
                                 results = db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default();
                             }
@@ -2317,7 +3098,7 @@ impl AppRuntime {
                     };
 
                     if let Some(ip) = remote_node {
-                        if let Ok(client) = AgentClient::new(&ip, port, api_key) {
+                        if let Ok(client) = AgentClient::new(&ip, port, api_key.clone()) {
                             if let Ok(hits) = client.remote_search(&effective_query, limit) {
                                 let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
                                 results = db.lock().ok().and_then(|guard| guard.get_files_by_ids(&ids).ok()).unwrap_or_default();
@@ -2357,6 +3138,27 @@ impl AppRuntime {
             }
 
             let _ = tx.send(AppEvent::SearchResults(results));
+
+            if semantic_enabled {
+                if local_semantic_hits.is_empty() {
+                    local_semantic_hits = Vec::new();
+                }
+
+                let mut peer_clients: std::collections::HashMap<String, Arc<dyn PeerSearchClient>> = std::collections::HashMap::new();
+                let peer_snapshot = peers.lock().map(|v| v.clone()).unwrap_or_default();
+                for d in peer_snapshot {
+                    if d.id == local_device_id {
+                        continue;
+                    }
+                    if let Some(ip) = d.primary_ip() {
+                        if let Ok(client) = AgentClient::new(ip, port, api_key.clone()) {
+                            peer_clients.insert(d.id.clone(), Arc::new(client));
+                        }
+                    }
+                }
+
+                librarian.search_distributed(effective_query, local_semantic_hits, peer_clients, limit);
+            }
         });
     }
 
